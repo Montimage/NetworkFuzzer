@@ -1,0 +1,11 @@
+<beginning>
+<!-- Property 20: Increase the length of PDU by 100 -->
+<property property_id="20" type_property="FORWARD" 
+     description="Modify DICOM's PDU length" 
+     if_satisfied="#update(dicom.pdu_len, (dicom.pdu_len.1 + 100))">
+    <event description="Got DICOM packet"
+           boolean_expression="(dicom.pdu_len > 10)"/>
+</property>
+
+</beginning>
+

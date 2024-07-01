@@ -1,0 +1,30 @@
+mmt-5greplay: 5Greplay v0.0.8-86f2074 using DPI v1.7.10 (35f0ad71) is running on pid 5185
+mmt-5greplay: Overridden value of configuration parameter 'forward.nb-copies' by '20'
+mmt-5greplay: Overridden value of configuration parameter 'forward.default' by '0'
+mmt-5greplay: MMT-5Greplay 0.0.8 (86f2074 - Jun 27 2024 09:51:42) is verifying 1 rules having 1 proto.atts using the main thread
+mmt-5greplay: Registered attribute to extract: 701.2
+mmt-5greplay: Analyzing pcap file pcap/only-dicom.pcapng
+Going to update the value of attribute 2, new value : 229 (e5)
+DEBUG /home/lethycia/Desktop/5Greplay/src/forward/forward_packet.c:290: DICOM: update the value of attribute 2, new value : 229 (e5)
+attribute id: 2, attribute offset: 68, attribute data len: 4
+Going to update the value of attribute 2, new value : 193 (c1)
+DEBUG /home/lethycia/Desktop/5Greplay/src/forward/forward_packet.c:290: DICOM: update the value of attribute 2, new value : 193 (c1)
+attribute id: 2, attribute offset: 68, attribute data len: 4
+Going to update the value of attribute 2, new value : 152 (98)
+DEBUG /home/lethycia/Desktop/5Greplay/src/forward/forward_packet.c:290: DICOM: update the value of attribute 2, new value : 152 (98)
+attribute id: 2, attribute offset: 68, attribute data len: 4
+        1186 packets received
+        1186 messages received
+           3 alerts generated
+mmt-5greplay: Number of packets being successfully forwarded: 23720, dropped: 0
+Number of packets being successfully forwarded: 23720, dropped: 0
+hex_string: 000000e5
+hex_string_len: 8 (length: 8)
+Converted string: 
+Successfully modified!!!hex_string: 000000c1
+hex_string_len: 8 (length: 8)
+Converted string: 
+Successfully modified!!!hex_string: 00000098
+hex_string_len: 8 (length: 8)
+Converted string: 
+Successfully modified!!! - rule 20 generated 3 verdicts

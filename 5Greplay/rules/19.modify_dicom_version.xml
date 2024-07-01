@@ -1,0 +1,15 @@
+<beginning>
+
+<property  value="THEN" property_id="19" type_property="FORWARD" 
+        description="Modify DICOM version" 
+        if_satisfied="#update(dicom.proto_version, (dicom.proto_version.1 + 3))">
+
+    <event description="Identify a DICOM Assoc Request packet" 
+        boolean_expression="(dicom.pdu_type == 1)"/>
+    <event description="Identify a DICOM Assoc Accept packet"
+        boolean_expression="(dicom.pdu_type == 2)"/>
+
+</property>
+
+</beginning>
+
