@@ -1,0 +1,56 @@
+title: NetworkFuzzer
+email: contact@montimage.com
+description: >-
+  NetworkFuzzer is a tool for modifying and replaying network traffic in realtime
+
+baseurl: "/"
+url: "https://5greplay.org" # change it after with real site
+author: "Montimage EURL"
+github_username: montimage
+#google_analytics: UA-207152640-1
+
+theme: minima
+
+# Build settings
+markdown: kramdown
+
+header_pages:
+  - readme.md
+  - about.md
+  - github.md
+
+show_excerpts: true
+
+defaults:
+  - scope:
+      path: "" # an empty string here means all files in the project
+      type: pages
+    values:
+      layout: page
+  # _posts
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+  # _docs
+  - scope:
+      path: ""
+      type: docs
+    values:
+      layout: post
+
+plugins:
+  - jekyll-coffeescript
+  - jekyll-commonmark-ghpages
+  - jekyll-gist
+  #- jekyll-github-metadata
+  - jekyll-paginate
+  - jekyll-relative-links
+  - jekyll-optional-front-matter
+  - jekyll-readme-index
+  - jekyll-default-layout
+  - jekyll-titles-from-headings
+  - jekyll-feed
+  - jekyll-seo-tag
+  - jekyll-redirect-from

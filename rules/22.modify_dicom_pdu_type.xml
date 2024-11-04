@@ -1,0 +1,31 @@
+<beginning>
+<!-- Property 22: Modify the type to a random invalid value -->
+<embedded_functions><![CDATA[
+//initialize random seed when loading this rule file
+void on_load(){
+	srand(time(NULL)); 
+}
+
+int em_random(int max, int min){
+	return (rand() % (max-min) + min);
+}
+#define random em_random
+
+static void em_modify_dicom_pdu_type(
+     const rule_info_t *rule, int verdict, uint64_t timestamp, 
+     uint64_t counter, const mmt_array_t * const trace ){
+     int new_val = random(15, 8);
+     int is_string = 0;
+     // replace_dicom_attribute(PROTO_DICOM, DICOM_PDU_TYPE, &new_val, is_string); 
+     replace_dicom_attribute(701, 1, &new_val, is_string);
+     forward_packet();
+}
+]]></embedded_functions>
+<property property_id="22" type_property="FORWARD" 
+     description="Modify DICOM's PDU type"  
+        if_satisfied="em_modify_dicom_pdu_type">
+    <event description="Got DICOM packet that is not assoc rq" 
+        boolean_expression="(dicom.pdu_type != 1)"/>
+
+</property>
+</beginning>
