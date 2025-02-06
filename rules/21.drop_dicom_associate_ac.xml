@@ -1,0 +1,8 @@
+<beginning>
+<!-- Drop the connection acceptance packet -->
+<property value="COMPUTE" property_id="21" type_property="FORWARD" 
+    description="Drop DICOM connection acceptation packet" if_satisfied="#drop()">
+    <event description="registration request"
+           boolean_expression="(dicom.pdu_type == 2)"/>
+</property>
+</beginning>

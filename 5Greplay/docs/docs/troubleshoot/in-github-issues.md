@@ -1,1 +1,0 @@
-For any other problems, please do not hesite to refer [issue tracker](https://github.com/Montimage/5GReplay/issues) on github.
