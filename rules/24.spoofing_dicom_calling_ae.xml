@@ -5,7 +5,7 @@
       const rule_info_t *rule, int verdict, uint64_t timestamp, 
       uint64_t counter, const mmt_array_t * const trace ){
         const char *new_val = "CALLING";
-	// replace_dicom_attribute(701, 5, new_val, 1);
+        replace_dicom_attribute(701, 5, new_val, 1);
         //replace_dicom_attribute(PROTO_DICOM, DICOM_CALLING_AE_TITLE, new_val, 1);
         forward_packet();
     }
