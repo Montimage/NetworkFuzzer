@@ -29,7 +29,7 @@ inject_proto_context_t* inject_proto_alloc( const config_t *config ){
 		case FORWARD_PACKET_PROTO_HTTP2:
 			context->http2 = inject_http2_alloc(target, conf->nb_copies );
 			break;
-		
+
 		case FORWARD_PACKET_PROTO_TCP:
 			context->tcp = inject_tcp_alloc(target, conf->nb_copies );
 			break;
@@ -79,7 +79,7 @@ static inline int _get_http2_data_offset( const ipacket_t *ipacket ){
 	if( index == -1 )
 		return -1;
 	//offset of sctp in packet
-	return get_packet_offset_at_index(ipacket, index) ; 
+	return get_packet_offset_at_index(ipacket, index) ;
 }
 
 static inline int _get_tcp_data_offset( const ipacket_t *ipacket ){
@@ -88,7 +88,7 @@ static inline int _get_tcp_data_offset( const ipacket_t *ipacket ){
 	if( index == -1 )
 		return -1;
 	//offset of tcp in packet
-	return get_packet_offset_at_index(ipacket, index) + 20 ; 
+	return get_packet_offset_at_index(ipacket, index) + 32; //32 bytes of TCP header (TODO: better approach?)
 }
 
 
@@ -120,8 +120,7 @@ int inject_proto_send_packet( inject_proto_context_t *context, const ipacket_t *
 			ret += inject_http2_send_packet(context->http2, packet_data + offset, packet_size-offset);
 		}
 	}
-
-		if( context->tcp ){
+	if( context->tcp ){
 		offset = _get_tcp_data_offset( ipacket );
 		if( offset >= 0 ){
 			DEBUG("Packet_id %"PRIu64" TCP_DATA offset: %d", ipacket->packet_id, offset );
