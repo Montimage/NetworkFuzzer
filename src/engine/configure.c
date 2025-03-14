@@ -287,6 +287,8 @@ static inline forward_packet_conf_t *_parse_forward_packet( cfg_t *cfg ){
 				ret->targets[i].protocol = FORWARD_PACKET_PROTO_HTTP2;
 			else if( IS_EQUAL_STRINGS(str, "TCP") )
 				ret->targets[i].protocol = FORWARD_PACKET_PROTO_TCP;
+			else if( IS_EQUAL_STRINGS(str, "DICOM") )
+				ret->targets[i].protocol = FORWARD_PACKET_PROTO_DICOM;
 
 			else
 				ABORT("Does not support yet the protocol: %s", str);

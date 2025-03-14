@@ -15,6 +15,7 @@
 #include "inject_udp.h"
 #include "inject_http2.h"
 #include "inject_tcp.h"
+#include "inject_dicom.h"
 #include <mmt_core.h>
 
 
@@ -23,6 +24,7 @@ typedef struct inject_proto_context_struct {
 	inject_udp_context_t  *udp;
 	inject_http2_context_t  *http2;
 	inject_tcp_context_t  *tcp;
+	inject_dicom_context_t *dicom;
 
 } inject_proto_context_t;
 

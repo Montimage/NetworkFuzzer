@@ -34,6 +34,10 @@ inject_proto_context_t* inject_proto_alloc( const config_t *config ){
 			context->tcp = inject_tcp_alloc(target, conf->nb_copies );
 			break;
 
+		case FORWARD_PACKET_PROTO_DICOM:
+			context->dicom = inject_dicom_alloc(target, conf->nb_copies );
+			break;
+
 		default:
 			ABORT("Does not support forwarding using a protocol to %s:%d", target->host, target->port );
 		}
@@ -91,6 +95,14 @@ static inline int _get_tcp_data_offset( const ipacket_t *ipacket ){
 	return get_packet_offset_at_index(ipacket, index) + 32; //32 bytes of TCP header (TODO: better approach?)
 }
 
+static inline int _get_dicom_data_offset( const ipacket_t *ipacket ){
+	int index = get_protocol_index_by_id( ipacket, PROTO_TCP );
+	//not found DICOM
+	if( index == -1 )
+		return -1;
+	//offset of dicom in packet
+	return get_packet_offset_at_index(ipacket, index) + 32; //32 bytes of DICOM header (TODO: better approach?)
+}
 
 int inject_proto_send_packet( inject_proto_context_t *context, const ipacket_t *ipacket, const uint8_t *packet_data, uint16_t packet_size ){
 	int offset;
@@ -127,6 +139,13 @@ int inject_proto_send_packet( inject_proto_context_t *context, const ipacket_t *
 			ret += inject_tcp_send_packet(context->tcp, packet_data + offset, packet_size - offset);
 		}
 	}
+	if( context->dicom ){
+		offset = _get_dicom_data_offset( ipacket );
+		if( offset >= 0 ){
+			DEBUG("Packet_id %"PRIu64" DICOM_DATA offset: %d", ipacket->packet_id, offset );
+			ret += inject_dicom_send_packet(context->dicom, packet_data + offset, packet_size - offset);
+		}
+	}
 
 	if( ret == 0 )
 		return INJECT_PROTO_NO_AVAIL;
@@ -140,5 +159,6 @@ void inject_proto_release( inject_proto_context_t *context ){
 	inject_udp_release(context->udp);
 	inject_http2_release(context->http2);
 	inject_tcp_release(context->tcp);
+	inject_dicom_release(context->dicom);
 	mmt_mem_free( context );
 }
