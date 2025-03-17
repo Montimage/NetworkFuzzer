@@ -2,7 +2,7 @@ import os
 import argparse
 from pydicom import dcmread
 from pydicom.uid import JPEGBaseline, ImplicitVRLittleEndian, ExplicitVRLittleEndian
-from pynetdicom import AE, StoragePresentationContexts, QueryRetrievePresentationContexts
+from pynetdicom import AE, StoragePresentationContexts, QueryRetrievePresentationContexts, evt
 from pynetdicom.sop_class import (
     CTImageStorage,
     MRImageStorage,
@@ -11,9 +11,12 @@ from pynetdicom.sop_class import (
     ComputedRadiographyImageStorage,
     Verification,
     PatientRootQueryRetrieveInformationModelFind,
-    PatientRootQueryRetrieveInformationModelGet
+    PatientRootQueryRetrieveInformationModelMove
 )
 from pydicom.dataset import Dataset
+
+# Global variable to track received datasets
+received_datasets = []
 
 def add_storage_presentation_contexts(ae):
     """Add presentation contexts for common DICOM storage SOP classes."""
@@ -222,32 +225,144 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
     else:
         print("[-] Failed to connect to the PACS server.")
 
+def handle_store(event):
+    """Handle a C-STORE request."""
+    global received_datasets
+    received_datasets.append(event.dataset)
+    return 0x0000
+
 def send_c_get(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
-    """Retrieve images from PACS using C-GET."""
-    ae.add_requested_context(PatientRootQueryRetrieveInformationModelGet)
+    """Retrieve images from PACS using C-MOVE (previously C-GET)."""
+    global received_datasets
+    received_datasets = []  # Reset the global list
+
+    print(f"\n[*] Preparing C-MOVE request for StudyInstanceUID: {study_uid}")
+
+    # Ensure output directory exists
+    if not os.path.exists(output_folder):
+        print(f"[*] Creating output directory: {output_folder}")
+        os.makedirs(output_folder)
+
+    # Configure the AE as a Storage SCP (to receive the images)
+    print("[*] Configuring Storage SCP")
+    handlers = [(evt.EVT_C_STORE, handle_store)]
+
+    # Define supported SOP Classes with transfer syntaxes
+    storage_sop_classes = [
+        CTImageStorage,
+        MRImageStorage,
+        XRayAngiographicImageStorage,
+        SecondaryCaptureImageStorage,
+        ComputedRadiographyImageStorage
+    ]
+
+    # Get local IP address (use the same network interface that can reach the PACS)
+    import socket
+    local_ip = None
+    try:
+        # Create a socket to determine the local IP address
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((pacs_ip, pacs_port))
+        local_ip = s.getsockname()[0]
+        s.close()
+        print(f"[*] Detected local IP: {local_ip}")
+    except Exception as e:
+        print(f"[-] Error determining local IP: {str(e)}")
+        local_ip = '192.168.126.104'  # Use the IP from server config
+        print(f"[*] Using configured IP: {local_ip}")
+
+    # Start listening for incoming associations
+    print(f"[*] Starting Storage SCP on {local_ip}:4242")
+    scp = AE(ae_title='MODALITY')
+
+    # Add supported contexts with all transfer syntaxes
+    for sop_class in storage_sop_classes:
+        scp.add_supported_context(sop_class, [ImplicitVRLittleEndian, ExplicitVRLittleEndian, JPEGBaseline])
+
+    try:
+        scp.start_server((local_ip, 4242), block=False, evt_handlers=handlers)
+        print("[+] Storage SCP started successfully")
+    except Exception as e:
+        print(f"[-] Error starting Storage SCP: {str(e)}")
+        print("    Note: Make sure port 4242 is not in use and you have necessary permissions")
+        return
+
+    # Add required presentation contexts for C-MOVE
+    print("[*] Adding required presentation contexts")
+    ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
+    add_storage_presentation_contexts(ae)  # Add storage contexts as well
+
+    # Create association
+    print(f"[*] Attempting to connect to {pacs_ae_title} at {pacs_ip}:{pacs_port}")
     assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
 
     if assoc.is_established:
-        print("Connected. Sending C-GET...")
+        print("[+] Connected. Sending C-MOVE request...")
+
+        # Create the query dataset
         query = Dataset()
-        query.QueryRetrieveLevel = "PATIENT" #"STUDY"
+        query.QueryRetrieveLevel = "STUDY"
         query.StudyInstanceUID = study_uid
 
-        # Add the appropriate context for the SOP class (CTImageStorage, etc.)
-        ae.add_requested_context(Verification)
-        responses = assoc.send_c_get(query, PatientRootQueryRetrieveInformationModelGet)
+        # Send C-MOVE request
+        try:
+            print(f"[*] Requesting C-MOVE to AE Title 'MODALITY' at {local_ip}:4242")
+            # Use our own AE Title as the move destination
+            responses = assoc.send_c_move(query, 'MODALITY', PatientRootQueryRetrieveInformationModelMove)
+            images_moved = 0
 
-        for status, dataset in responses:
-            if status and dataset:
-                filename = f"{output_folder}/{dataset.SOPInstanceUID}.dcm"
-                dataset.save_as(filename)
-                print(f"Retrieved and saved: {filename}")
-            else:
-                print("C-GET failed or was not acknowledged.")
+            print("\n[*] Processing responses...")
+            print("-" * 80)
 
+            for status, identifier in responses:
+                if status:
+                    if status.Status == 0xFF00:  # Pending
+                        print(f"[*] C-MOVE operation in progress...")
+                    elif status.Status == 0x0000:  # Success
+                        print("\n[+] C-MOVE completed successfully")
+                        # Process received datasets
+                        for dataset in received_datasets:
+                            images_moved += 1
+                            series_num = getattr(dataset, 'SeriesNumber', '000')
+                            instance_num = getattr(dataset, 'InstanceNumber', '000')
+                            sop_instance_uid = getattr(dataset, 'SOPInstanceUID', 'unknown')
+                            filename = f"{output_folder}/Series{series_num}_Instance{instance_num}_{sop_instance_uid}.dcm"
+
+                            try:
+                                dataset.save_as(filename)
+                                print(f"[+] Saved image {images_moved}:")
+                                print(f"    Series Number: {series_num}")
+                                print(f"    Instance Number: {instance_num}")
+                                print(f"    Saved as: {filename}")
+                            except Exception as e:
+                                print(f"[-] Error saving file {filename}: {str(e)}")
+                        print(f"\n[+] Total images retrieved: {images_moved}")
+                    else:
+                        print(f"\n[-] C-MOVE failed with status: {hex(status.Status)}")
+                        if status.Status == 0xA801:
+                            print("    Error: Move destination unknown (AE Title not recognized)")
+                            print(f"    Note: Server expects MODALITY at {local_ip}:4242")
+                        elif status.Status == 0xA900:
+                            print("    Error: Identifier does not match SOP Class")
+                        elif status.Status == 0xC000:
+                            print("    Error: Unable to process query")
+                            print(f"    Note: Check if PACS server can reach us at {local_ip}:4242")
+                else:
+                    print("\n[-] C-MOVE response received without status")
+
+            print("-" * 80)
+
+        except Exception as e:
+            print(f"[-] Error during C-MOVE operation: {str(e)}")
+
+        print("[*] Releasing association")
         assoc.release()
     else:
-        print("Failed to connect to the PACS server.")
+        print("[-] Failed to connect to the PACS server.")
+
+    # Stop the Storage SCP
+    print("[*] Stopping Storage SCP")
+    scp.shutdown()
 
 def main():
     parser = argparse.ArgumentParser(description="DICOM Simulator for Various Requests")
@@ -276,7 +391,7 @@ def main():
     elif args.action == 'find':
         ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
     elif args.action == 'retrieve':
-        ae.add_requested_context(PatientRootQueryRetrieveInformationModelGet)
+        ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
         add_storage_presentation_contexts(ae)
 
     if args.action == 'connect':
