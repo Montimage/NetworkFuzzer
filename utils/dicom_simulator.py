@@ -139,8 +139,8 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
         query.PatientID = ""
         print("[*] Searching for all patients")
     elif query_level == "STUDY":
-        # For study level, we don't use StudyInstanceUID as a search field
-        # Instead use date range and other attributes that are more appropriate
+        # For study level, explicitly request all relevant fields
+        query.StudyInstanceUID = ""
         query.StudyDate = ""
         query.StudyTime = ""
         query.AccessionNumber = ""
@@ -148,6 +148,8 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
         query.StudyDescription = ""
         query.PatientName = ""
         query.PatientID = ""
+        query.NumberOfStudyRelatedSeries = ""
+        query.NumberOfStudyRelatedInstances = ""
         print("[*] Searching for all studies")
     elif query_level == "SERIES":
         query.StudyInstanceUID = ""
@@ -196,6 +198,10 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
                                 if elem.name != "Query/Retrieve Level":
                                     value = str(elem.value) if elem.value is not None else "None"
                                     print(f"{elem.name:<{max_key_length}}: {value}")
+
+                        # For STUDY level, highlight the StudyInstanceUID as it's needed for C-GET
+                        if query_level == "STUDY" and hasattr(identifier, 'StudyInstanceUID'):
+                            print("\n[*] StudyInstanceUID for C-GET: " + identifier.StudyInstanceUID)
 
                 elif status.Status == 0x0000:  # Success
                     print("\n[+] C-FIND completed successfully")
