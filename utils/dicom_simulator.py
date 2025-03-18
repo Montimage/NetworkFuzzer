@@ -2,9 +2,10 @@ import os
 import argparse
 import signal
 import threading
+import datetime
 from pydicom import dcmread
 from pydicom.uid import JPEGBaseline, ImplicitVRLittleEndian, ExplicitVRLittleEndian
-from pynetdicom import AE, StoragePresentationContexts, QueryRetrievePresentationContexts, evt
+from pynetdicom import AE, StoragePresentationContexts, QueryRetrievePresentationContexts, evt, debug_logger
 from pynetdicom.sop_class import (
     CTImageStorage,
     MRImageStorage,
@@ -19,6 +20,7 @@ from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelMove
 )
 from pydicom.dataset import Dataset
+import logging
 
 # Global variables
 received_datasets = []
@@ -834,6 +836,178 @@ def send_all_studies_move(ae, pacs_ip, pacs_port, pacs_ae_title, output_folder):
     print("=" * 50)
     print("[*] All-studies move operation completed")
 
+def handle_association_events(event):
+    """Handle DICOM association events for detailed logging and analysis."""
+    # Check event type by directly comparing the event with evt constants, not using event.event_type
+    if event.event == evt.EVT_ESTABLISHED:
+        assoc = event.assoc
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+        print(f"\n===== Association Established at {timestamp} =====")
+        print(f"Local AE Title: {assoc.ae.ae_title}")
+        print(f"Remote AE Title: {assoc.remote['ae_title']}")
+        print(f"Remote Address: {assoc.remote['address']}:{assoc.remote['port']}")
+        # Safely get the association ID - this can sometimes fail if active_associations isn't populated yet
+        try:
+            if assoc.ae.active_associations:
+                print(f"Association ID: {assoc.ae.active_associations[0].association_id}")
+            else:
+                print(f"Association ID: Unknown (no active associations list)")
+        except (IndexError, AttributeError):
+            print(f"Association ID: Unknown (error accessing association data)")
+
+        # Safely check for implementation class UID and version
+        try:
+            if 'implementation_class_uid' in assoc.remote:
+                print(f"Implementation Class UID: {assoc.remote['implementation_class_uid']}")
+            else:
+                print("Implementation Class UID: Not provided")
+
+            if 'implementation_version_name' in assoc.remote:
+                print(f"Implementation Version: {assoc.remote['implementation_version_name']}")
+            else:
+                print("Implementation Version: Not provided")
+        except Exception as e:
+            print(f"Implementation information unavailable: {str(e)}")
+
+        print("\n----- Negotiated Presentation Contexts -----")
+        for context in assoc.accepted_contexts:
+            print(f"\nContext ID: {context.context_id}")
+            print(f"Abstract Syntax: {context.abstract_syntax} ({context.abstract_syntax.name if hasattr(context.abstract_syntax, 'name') else 'Unknown'})")
+            print(f"Transfer Syntax: {context.transfer_syntax} ({context.transfer_syntax.name if hasattr(context.transfer_syntax, 'name') else 'Unknown'})")
+            print(f"Result: {'Accepted' if context.result == 0 else 'Rejected'}")
+
+        print("\n----- Extended Negotiation Information -----")
+        if assoc.acceptor.extended_negotiation:
+            for item in assoc.acceptor.extended_negotiation:
+                print(f"SOP Class: {item.sop_class_uid}")
+                print(f"App Info: {item.app_info}")
+        else:
+            print("No extended negotiation")
+
+        print("\n----- User Identity Negotiation -----")
+        if assoc.acceptor.user_identity:
+            print(f"User Identity Type: {assoc.acceptor.user_identity.user_identity_type}")
+            print(f"Response Requested: {'Yes' if assoc.acceptor.user_identity.positive_response_requested else 'No'}")
+            print(f"Response Primary Field: {assoc.acceptor.user_identity.primary}")
+            if assoc.acceptor.user_identity.secondary:
+                print(f"Response Secondary Field: {assoc.acceptor.user_identity.secondary}")
+        else:
+            print("No user identity negotiation")
+
+        print("\n----- Association Capabilities -----")
+        print(f"Maximum PDU Length: {assoc.acceptor.maximum_length}")
+        # Safely handle asynchronous operations which might be a tuple
+        try:
+            if hasattr(assoc.acceptor, 'asynchronous_operations'):
+                async_ops = assoc.acceptor.asynchronous_operations
+                if isinstance(async_ops, tuple) and len(async_ops) >= 2:
+                    print(f"Asynchronous Operations Window (Invoked): {async_ops[0]}")
+                    print(f"Asynchronous Operations Window (Performed): {async_ops[1]}")
+                elif hasattr(async_ops, 'maximum_number_invoked') and hasattr(async_ops, 'maximum_number_performed'):
+                    print(f"Asynchronous Operations Window (Invoked): {async_ops.maximum_number_invoked}")
+                    print(f"Asynchronous Operations Window (Performed): {async_ops.maximum_number_performed}")
+                else:
+                    print(f"Asynchronous Operations Window: {async_ops}")
+            else:
+                print("Asynchronous Operations Window: Not negotiated")
+        except Exception as e:
+            print(f"Asynchronous Operations Window: Error retrieving information - {str(e)}")
+        print("================================================\n")
+
+    elif event.event == evt.EVT_REJECTED:
+        print("\n===== Association Rejected =====")
+        print(f"Rejection Source: {event.reject_source}")
+        print(f"Rejection Reason: {event.reject_reason}")
+        print("================================\n")
+
+    elif event.event == evt.EVT_RELEASED:
+        print("\n===== Association Released =====")
+        print(f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}")
+        print("================================\n")
+
+    elif event.event == evt.EVT_ABORTED:
+        print("\n===== Association Aborted =====")
+        print(f"Abort Source: {'Remote' if event.source == 'remote' else 'Local'}")
+        print(f"Abort Reason: {event.reason}")
+        print("===============================\n")
+
+    return 0x0000  # Success
+
+def analyze_association_negotiation(ae, pacs_ip, pacs_port, pacs_ae_title, verbose=False, output_file=None):
+    """Analyze the association negotiation process with PACS."""
+    global current_association
+
+    # Set up logging if verbose mode is enabled
+    if verbose:
+        debug_logger()
+
+    # If output file is specified, set up file logging
+    if output_file:
+        file_handler = logging.FileHandler(output_file)
+        file_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logging.getLogger('pynetdicom').addHandler(file_handler)
+
+    print("\n[*] Analyzing Association Negotiation")
+    print(f"[*] Preparing to connect to {pacs_ae_title} at {pacs_ip}:{pacs_port}")
+
+    # Add event handlers for association events
+    handlers = [
+        (evt.EVT_ESTABLISHED, handle_association_events),
+        (evt.EVT_REJECTED, handle_association_events),
+        (evt.EVT_RELEASED, handle_association_events),
+        (evt.EVT_ABORTED, handle_association_events)
+    ]
+
+    # Add extensive presentation contexts to test negotiation
+    # Add verification context
+    ae.add_requested_context(Verification)
+
+    # Add standard query/retrieve contexts
+    ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
+    ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
+    ae.add_requested_context(PatientRootQueryRetrieveInformationModelGet)
+    ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
+    ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+
+    # Add storage contexts
+    add_storage_presentation_contexts(ae)
+
+    # Print requested contexts
+    print("\n[*] Requested Presentation Contexts:")
+    for i, context in enumerate(ae.requested_contexts):
+        print(f"{i+1}. {context.abstract_syntax.name if hasattr(context.abstract_syntax, 'name') else context.abstract_syntax}")
+        for ts in context.transfer_syntax:
+            print(f"   - {ts.name if hasattr(ts, 'name') else ts}")
+
+    # Establish association
+    print(f"\n[*] Attempting to establish association with {pacs_ae_title}...")
+    current_association = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title, evt_handlers=handlers)
+
+    if current_association.is_established:
+        print("\n[+] Association established successfully")
+        print("[*] Detailed negotiation information has been logged")
+
+        # Print a summary of accepted contexts
+        print("\n[*] Summary of Accepted Presentation Contexts:")
+        for i, context in enumerate(current_association.accepted_contexts):
+            abstract_name = context.abstract_syntax.name if hasattr(context.abstract_syntax, 'name') else context.abstract_syntax
+            transfer_name = context.transfer_syntax.name if hasattr(context.transfer_syntax, 'name') else context.transfer_syntax
+            print(f"{i+1}. {abstract_name}")
+            print(f"   - Using transfer syntax: {transfer_name}")
+
+        # Release the association
+        print("\n[*] Releasing association")
+        current_association.release()
+    else:
+        print("\n[-] Association establishment failed")
+
+    print("\n[*] Association negotiation analysis complete")
+    if output_file:
+        print(f"[*] Detailed log saved to: {output_file}")
+
 def main():
     # Reset global variables at start
     global current_association, operation_cancelled, current_query_model
@@ -845,7 +1019,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description="DICOM Simulator for Various Requests")
-    parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'move-all', 'disconnect'],
+    parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'move-all', 'disconnect', 'analyze-negotiation'],
                         help="Action to perform")
     parser.add_argument("--dicom_folder", default="DICOM_images", help="Folder with DICOM files (for store)")
     parser.add_argument("--pacs_ip", required=True, help="PACS server IP address")
@@ -857,6 +1031,8 @@ def main():
                         help="Specify the query level for C-FIND (default is 'PATIENT')")
     parser.add_argument("--retrieve_method", choices=["get", "move"], default="move",
                         help="Specify the retrieval method (C-GET or C-MOVE)")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output for debugging")
+    parser.add_argument("--log_file", help="Output file for detailed logging (for analyze-negotiation)")
     args = parser.parse_args()
 
     # Configure the Application Entity
@@ -910,6 +1086,10 @@ def main():
         print("[*] WARNING: This operation will retrieve ALL studies from the PACS server.")
         print("[*] This may take a long time and use significant disk space.")
         send_all_studies_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.output_folder)
+    elif args.action == 'analyze-negotiation':
+        print("[*] Starting Association Negotiation Analysis")
+        analyze_association_negotiation(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title,
+                                       verbose=args.verbose, output_file=args.log_file)
     elif args.action == 'disconnect':
         print("Disconnecting (simulated).")
 
