@@ -1,5 +1,7 @@
 import os
 import argparse
+import signal
+import threading
 from pydicom import dcmread
 from pydicom.uid import JPEGBaseline, ImplicitVRLittleEndian, ExplicitVRLittleEndian
 from pynetdicom import AE, StoragePresentationContexts, QueryRetrievePresentationContexts, evt
@@ -16,8 +18,71 @@ from pynetdicom.sop_class import (
 )
 from pydicom.dataset import Dataset
 
-# Global variable to track received datasets
+# Global variables
 received_datasets = []
+current_association = None
+operation_cancelled = False
+current_query_model = None
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C by initiating a C-CANCEL request."""
+    global operation_cancelled
+    print("\n[*] Cancellation requested. Sending C-CANCEL...")
+    operation_cancelled = True
+
+    if current_association and current_association.is_established:
+        try:
+            if current_query_model:
+                # Different behavior based on the query model
+                if current_query_model == PatientRootQueryRetrieveInformationModelFind:
+                    print("[*] Sending C-CANCEL for C-FIND operation...")
+                    # For C-FIND, use message ID 1 (standard)
+                    current_association.send_c_cancel(msg_id=1, query_model=current_query_model)
+                    print(f"[+] C-CANCEL request sent for query model: {current_query_model.name}")
+                    # Don't release the association immediately - let the main function handle it
+                    # This ensures that we can see the cancel status in the responses
+
+                elif current_query_model == PatientRootQueryRetrieveInformationModelMove:
+                    # For C-MOVE, send C-CANCEL and release association
+                    current_association.send_c_cancel(msg_id=1, query_model=current_query_model)
+                    print(f"[+] C-CANCEL request sent for query model: {current_query_model.name}")
+
+                    # Note: For C-MOVE, this will only cancel the move request itself
+                    # The actual data transfer happens over a separate association initiated by the server
+                    print("[*] Note: For C-MOVE, this cancels only the move request.")
+                    print("[*] Any images already in transit may still be received.")
+
+                    print("[*] Releasing association")
+                    current_association.release()
+
+                elif current_query_model == PatientRootQueryRetrieveInformationModelGet:
+                    # For C-GET, send C-CANCEL and release association
+                    current_association.send_c_cancel(msg_id=1, query_model=current_query_model)
+                    print(f"[+] C-CANCEL request sent for query model: {current_query_model.name}")
+                    print("[*] Releasing association")
+                    current_association.release()
+
+                else:
+                    # For any other operation type
+                    current_association.send_c_cancel(msg_id=1, query_model=current_query_model)
+                    print(f"[+] C-CANCEL request sent for query model: {current_query_model.name}")
+                    print("[*] Releasing association")
+                    current_association.release()
+            else:
+                print("[-] Unable to send C-CANCEL: No active query model")
+                # Still release the association if we have one
+                if current_association and current_association.is_established:
+                    print("[*] Releasing association")
+                    current_association.release()
+        except Exception as e:
+            print(f"[-] Error during C-CANCEL: {str(e)}")
+            # Always try to release the association if there was an error
+            if current_association and current_association.is_established:
+                try:
+                    current_association.release()
+                    print("[*] Association released after error")
+                except:
+                    print("[-] Failed to release association after error")
 
 def add_storage_presentation_contexts(ae):
     """Add presentation contexts for common DICOM storage SOP classes."""
@@ -130,6 +195,9 @@ def send_c_store(ae, dicom_folder, pacs_ip, pacs_port, pacs_ae_title):
 
 def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
     """Send a C-FIND request with dynamic query level."""
+    global current_association, operation_cancelled, current_query_model
+    operation_cancelled = False
+    current_query_model = PatientRootQueryRetrieveInformationModelFind
     print(f"\n[*] Preparing C-FIND query at {query_level} level")
 
     # Set the query level and build the query dataset
@@ -174,69 +242,106 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
 
     # Create an association to the PACS server
     print(f"[*] Attempting to connect to {pacs_ae_title} at {pacs_ip}:{pacs_port}")
-    assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+    current_association = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
 
-    if assoc.is_established:
+    if current_association.is_established:
         print(f"[+] Connected. Sending C-FIND for {query_level.lower()}...")
         print("-" * 80)
 
-        # Send the C-FIND request to the PACS server
-        responses = assoc.send_c_find(query, PatientRootQueryRetrieveInformationModelFind)
-        response_count = 0
+        try:
+            # Flag to track if the operation was aborted
+            aborted = False
 
-        for status, identifier in responses:
-            if status:
-                if status.Status == 0xFF00:  # Pending
-                    response_count += 1
-                    if identifier:
-                        print(f"\n{query_level} Result #{response_count}:")
-                        print("=" * 40)
+            # Send the C-FIND request to the PACS server
+            responses = current_association.send_c_find(query, PatientRootQueryRetrieveInformationModelFind)
+            response_count = 0
 
-                        # Get max length for formatting
-                        max_key_length = max(len(elem.name) for elem in identifier if elem.value != "")
+            for status, identifier in responses:
+                # Check if cancellation was requested
+                if operation_cancelled:
+                    print("\n[*] Operation cancelled by user")
+                    aborted = True
+                    break
 
-                        # Print each attribute in a formatted way
-                        for elem in identifier:
-                            if elem.value != "":
-                                # Skip Query/Retrieve Level in the output as it's redundant
-                                if elem.name != "Query/Retrieve Level":
-                                    value = str(elem.value) if elem.value is not None else "None"
-                                    print(f"{elem.name:<{max_key_length}}: {value}")
+                if status:
+                    if status.Status == 0xFF00:  # Pending
+                        response_count += 1
+                        if identifier:
+                            print(f"\n{query_level} Result #{response_count}:")
+                            print("=" * 40)
 
-                        # For STUDY level, highlight the StudyInstanceUID as it's needed for C-GET
-                        if query_level == "STUDY" and hasattr(identifier, 'StudyInstanceUID'):
-                            print("\n[*] StudyInstanceUID for C-GET: " + identifier.StudyInstanceUID)
+                            # Get max length for formatting
+                            max_key_length = max(len(elem.name) for elem in identifier if elem.value != "")
 
-                elif status.Status == 0x0000:  # Success
-                    print("\n[+] C-FIND completed successfully")
-                    if response_count == 0:
-                        print("    No matching results found")
-                    else:
-                        print(f"    Total results found: {response_count}")
+                            # Print each attribute in a formatted way
+                            for elem in identifier:
+                                if elem.value != "":
+                                    # Skip Query/Retrieve Level in the output as it's redundant
+                                    if elem.name != "Query/Retrieve Level":
+                                        value = str(elem.value) if elem.value is not None else "None"
+                                        print(f"{elem.name:<{max_key_length}}: {value}")
+
+                            # For STUDY level, highlight the StudyInstanceUID as it's needed for C-GET
+                            if query_level == "STUDY" and hasattr(identifier, 'StudyInstanceUID'):
+                                print("\n[*] StudyInstanceUID for retrieve: " + identifier.StudyInstanceUID)
+
+                    elif status.Status == 0x0000 and not aborted:  # Success (only if not aborted)
+                        print("\n[+] C-FIND completed successfully")
+                        if response_count == 0:
+                            print("    No matching results found")
+                        else:
+                            print(f"    Total results found: {response_count}")
+                    elif status.Status != 0x0000 and not aborted:
+                        print(f"\n[-] C-FIND failed with status: {hex(status.Status)}")
+                        if status.Status == 0xC000:
+                            print("    Error: Unable to process query (possibly invalid query parameters)")
+                        elif status.Status == 0xFE00:
+                            print("    Error: Operation cancelled")
                 else:
-                    print(f"\n[-] C-FIND failed with status: {hex(status.Status)}")
-                    if status.Status == 0xC000:
-                        print("    Error: Unable to process query (possibly invalid query parameters)")
-            else:
-                print("\n[-] C-FIND response received without status")
+                    if not aborted:
+                        print("\n[-] C-FIND response received without status")
 
-        print("-" * 80)
-        print("[*] Releasing association")
-        assoc.release()
+        except Exception as e:
+            print(f"[-] Error during C-FIND operation: {str(e)}")
+        finally:
+            # Check if association is still established - it may have been released by the signal handler
+            if current_association and current_association.is_established:
+                if not operation_cancelled:  # Only release if not cancelled (signal handler does it otherwise)
+                    print("-" * 80)
+                    print("[*] Releasing association")
+                    current_association.release()
+
+            if operation_cancelled:
+                print("[+] C-FIND operation was terminated by C-CANCEL")
     else:
         print("[-] Failed to connect to the PACS server.")
 
 def handle_store(event):
     """Handle a C-STORE request."""
-    global received_datasets
+    global received_datasets, operation_cancelled
+
+    # Add the dataset to our received list regardless of cancellation
     received_datasets.append(event.dataset)
+
+    # Print a brief status if not cancelled
+    if not operation_cancelled:
+        # Get some basic info from the dataset
+        modality = getattr(event.dataset, 'Modality', 'Unknown')
+        instance_num = getattr(event.dataset, 'InstanceNumber', '?')
+
+        # Print a compact notification
+        print(f"\r[+] Received: {modality} #{instance_num}", end="")
+
+    # Always return success to the sender
     return 0x0000
 
 # TODO: C-GET failed with status: 0xa702 - the server doesn't support C-GET for this SOP Class
 def send_c_get(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
     """Retrieve images from PACS using C-GET."""
-    global received_datasets
+    global received_datasets, current_association, operation_cancelled, current_query_model
     received_datasets = []
+    operation_cancelled = False
+    current_query_model = PatientRootQueryRetrieveInformationModelGet
 
     print(f"\n[*] Preparing C-GET request for StudyInstanceUID: {study_uid}")
 
@@ -276,15 +381,15 @@ def send_c_get(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
 
     # Create association and send C-GET request
     print(f"[*] Attempting to establish association with {pacs_ae_title}")
-    assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
-    if not assoc.is_established:
+    current_association = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+    if not current_association.is_established:
         print("[-] Failed to establish association")
         scp.shutdown()
         return
 
     print("[+] Association established")
     print("[*] Checking accepted presentation contexts:")
-    for cx in assoc.accepted_contexts:
+    for cx in current_association.accepted_contexts:
         print(f"    - {cx.abstract_syntax.name}")
 
     # Prepare and send C-GET request
@@ -294,9 +399,13 @@ def send_c_get(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
 
     try:
         print("[*] Sending C-GET request...")
-        responses = assoc.send_c_get(query, PatientRootQueryRetrieveInformationModelGet)
+        responses = current_association.send_c_get(query, PatientRootQueryRetrieveInformationModelGet)
 
         for status, identifier in responses:
+            if operation_cancelled:
+                print("\n[*] Operation cancelled by user")
+                break
+
             if not status:
                 print("[-] Received empty status")
                 continue
@@ -335,15 +444,23 @@ def send_c_get(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
     except Exception as e:
         print(f"[-] Error during C-GET operation: {str(e)}")
     finally:
-        print("[*] Releasing association")
-        assoc.release()
+        if not operation_cancelled:  # Only release if not cancelled
+            print("[*] Releasing association")
+            current_association.release()
         print("[*] Stopping Storage SCP")
         scp.shutdown()
 
 def send_c_move(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
     """Retrieve images from PACS using C-MOVE."""
-    global received_datasets
+    global received_datasets, current_association, operation_cancelled, current_query_model
     received_datasets = []
+    operation_cancelled = False
+    current_query_model = PatientRootQueryRetrieveInformationModelMove
+
+    print("\n[*] Preparing C-MOVE request for StudyInstanceUID: " + study_uid)
+    print("[*] Note: C-MOVE operations work by instructing the PACS server to")
+    print("[*] send images to our DICOM Storage SCP. If you cancel, only the")
+    print("[*] initial request is cancelled, but images may continue to arrive.")
 
     # Ensure output directory exists
     os.makedirs(output_folder, exist_ok=True)
@@ -362,7 +479,9 @@ def send_c_move(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder)
 
     # Start Storage SCP
     try:
+        print("[*] Starting Storage SCP on port 4242")
         scp.start_server(('', 4242), block=False, evt_handlers=handlers)
+        print("[+] Storage SCP started successfully")
     except Exception as e:
         print(f"[-] Error starting Storage SCP: {str(e)}")
         return
@@ -372,11 +491,14 @@ def send_c_move(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder)
     add_storage_presentation_contexts(ae)
 
     # Create association and send C-MOVE request
-    assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
-    if not assoc.is_established:
+    print(f"[*] Connecting to {pacs_ae_title} at {pacs_ip}:{pacs_port}")
+    current_association = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+    if not current_association.is_established:
         print("[-] Failed to connect to PACS server")
         scp.shutdown()
         return
+
+    print("[+] Association established. Sending C-MOVE request...")
 
     # Prepare and send C-MOVE request
     query = Dataset()
@@ -384,39 +506,81 @@ def send_c_move(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder)
     query.StudyInstanceUID = study_uid
 
     try:
-        responses = assoc.send_c_move(query, 'MODALITY', PatientRootQueryRetrieveInformationModelMove)
+        responses = current_association.send_c_move(query, 'MODALITY', PatientRootQueryRetrieveInformationModelMove)
+        move_in_progress = False
+        files_received = 0
 
         for status, identifier in responses:
+            if operation_cancelled and not move_in_progress:
+                print("\n[*] Operation cancelled by user")
+                break
+
             if not status:
                 continue
 
             if status.Status == 0xFF00:  # Pending
-                continue
+                move_in_progress = True
+                print("[*] C-MOVE operation in progress...")
+                # Print a dot to show progress without cluttering the console
+                print(".", end="", flush=True)
             elif status.Status == 0x0000:  # Success
-                # Save received datasets
+                print("\n[+] C-MOVE request completed successfully")
+
+                # Continue to receive and save datasets even if the operation was cancelled
+                # Process all datasets that were received
                 for i, dataset in enumerate(received_datasets, 1):
+                    if operation_cancelled and i > files_received:
+                        # Only save files that arrived before cancellation
+                        print(f"[*] Skipping {len(received_datasets) - files_received} files received after cancellation")
+                        break
+
                     series_num = getattr(dataset, 'SeriesNumber', '000')
                     instance_num = getattr(dataset, 'InstanceNumber', '000')
                     sop_uid = getattr(dataset, 'SOPInstanceUID', f'unknown_{i}')
 
                     filename = f"{output_folder}/Series{series_num}_Instance{instance_num}_{sop_uid}.dcm"
                     dataset.save_as(filename)
+                    files_received += 1
                     print(f"[+] Saved image {i}:")
                     print(f"    Series Number: {series_num}")
                     print(f"    Instance Number: {instance_num}")
                     print(f"    Saved as: {filename}")
 
-                print(f"\n[+] Total images retrieved: {len(received_datasets)}")
+                print(f"\n[+] Total images retrieved: {files_received}")
+                if files_received < len(received_datasets):
+                    print(f"[*] Note: {len(received_datasets) - files_received} images were received after cancellation and not saved")
             else:
-                print(f"[-] C-MOVE failed with status: {hex(status.Status)}")
+                print(f"\n[-] C-MOVE failed with status: {hex(status.Status)}")
+                if status.Status == 0xA701:
+                    print("    Error: Refused - Out of Resources")
+                elif status.Status == 0xA702:
+                    print("    Error: Failed - Unable to perform sub-operations")
+                elif status.Status == 0xA900:
+                    print("    Error: Failed - Identifier does not match SOP Class")
+                elif status.Status == 0xC000:
+                    print("    Error: Failed - Unable to process")
 
     except Exception as e:
-        print(f"[-] Error during C-MOVE operation: {str(e)}")
+        print(f"\n[-] Error during C-MOVE operation: {str(e)}")
     finally:
-        assoc.release()
+        if not operation_cancelled:
+            print("[*] Releasing association")
+            if current_association.is_established:
+                current_association.release()
+
+        print("[*] Stopping Storage SCP")
         scp.shutdown()
 
 def main():
+    # Reset global variables at start
+    global current_association, operation_cancelled, current_query_model
+    current_association = None
+    operation_cancelled = False
+    current_query_model = None
+
+    # Register signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+
     parser = argparse.ArgumentParser(description="DICOM Simulator for Various Requests")
     parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'disconnect'],
                         help="Action to perform")
@@ -453,10 +617,10 @@ def main():
 
     if args.action == 'connect':
         print("Trying to establish association...")
-        assoc = ae.associate(args.pacs_ip, args.pacs_port, ae_title=args.pacs_ae_title)
-        if assoc.is_established:
+        current_association = ae.associate(args.pacs_ip, args.pacs_port, ae_title=args.pacs_ae_title)
+        if current_association.is_established:
             print("Association established.")
-            assoc.release()
+            current_association.release()
         else:
             print("Failed to establish association.")
     elif args.action == 'echo':
@@ -465,14 +629,17 @@ def main():
         print("[*] Starting C-STORE operation")
         send_c_store(ae, args.dicom_folder, args.pacs_ip, args.pacs_port, args.pacs_ae_title)
     elif args.action == 'find':
+        print("[*] Starting C-FIND operation (press Ctrl+C to send C-CANCEL)")
         send_c_find(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, query_level=args.query_level)
     elif args.action == 'retrieve':
         if not args.study_uid:
             print("Error: --study_uid is required for retrieval.")
             return
         if args.retrieve_method == "get":
+            print("[*] Starting C-GET operation (press Ctrl+C to send C-CANCEL)")
             send_c_get(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
         else:
+            print("[*] Starting C-MOVE operation (press Ctrl+C to send C-CANCEL)")
             send_c_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
     elif args.action == 'disconnect':
         print("Disconnecting (simulated).")
