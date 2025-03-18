@@ -14,7 +14,9 @@ from pynetdicom.sop_class import (
     Verification,
     PatientRootQueryRetrieveInformationModelFind,
     PatientRootQueryRetrieveInformationModelMove,
-    PatientRootQueryRetrieveInformationModelGet
+    PatientRootQueryRetrieveInformationModelGet,
+    StudyRootQueryRetrieveInformationModelFind,
+    StudyRootQueryRetrieveInformationModelMove
 )
 from pydicom.dataset import Dataset
 
@@ -571,6 +573,267 @@ def send_c_move(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder)
         print("[*] Stopping Storage SCP")
         scp.shutdown()
 
+def send_all_studies_move(ae, pacs_ip, pacs_port, pacs_ae_title, output_folder):
+    """Retrieve ALL images from PACS using C-MOVE by first querying for all studies."""
+    global received_datasets, current_association, operation_cancelled, current_query_model
+
+    print("\n[*] Preparing to move ALL studies from PACS")
+    print("[*] This will first query for all studies, then retrieve each one")
+
+    # Step 1: Find all studies in the PACS
+    print("\n[*] STEP 1: Finding all studies in the PACS")
+    study_uids = []
+
+    # Explicitly add the presentation context for C-FIND
+    ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
+
+    # Build study-level query
+    query = Dataset()
+    query.QueryRetrieveLevel = "STUDY"
+    query.StudyInstanceUID = ""
+    query.PatientName = ""
+    query.PatientID = ""
+    query.StudyDate = ""
+    query.StudyDescription = ""
+    query.SpecificCharacterSet = "ISO_IR 100"
+
+    # Variables to track which model worked for C-FIND
+    using_study_root = False
+    find_successful = False
+
+    # Create an association for the C-FIND
+    print(f"[*] Attempting to connect to {pacs_ae_title} at {pacs_ip}:{pacs_port}")
+    find_assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+
+    if not find_assoc.is_established:
+        print("[-] Failed to connect to PACS server for study query")
+        return
+
+    # Check if the necessary presentation context was accepted
+    find_context_accepted = False
+    for context in find_assoc.accepted_contexts:
+        if context.abstract_syntax == PatientRootQueryRetrieveInformationModelFind:
+            find_context_accepted = True
+            break
+
+    if not find_context_accepted:
+        print("[-] The PACS server did not accept the presentation context for Patient Root Query C-FIND")
+        print("[*] Trying with Study Root Query/Retrieve Information Model instead...")
+        find_assoc.release()
+
+        # Try with Study Root instead
+        ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
+
+        find_assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+        if not find_assoc.is_established:
+            print("[-] Failed to connect to PACS server for study query")
+            return
+
+        try:
+            # Perform the C-FIND to get all studies with Study Root model
+            print("[*] Querying for all studies using Study Root Information Model...")
+            responses = find_assoc.send_c_find(query, StudyRootQueryRetrieveInformationModelFind)
+            for status, identifier in responses:
+                if status and status.Status == 0xFF00:  # Pending
+                    if identifier and hasattr(identifier, 'StudyInstanceUID'):
+                        study_uids.append(identifier.StudyInstanceUID)
+                        patient_name = getattr(identifier, 'PatientName', 'Unknown')
+                        study_date = getattr(identifier, 'StudyDate', 'Unknown')
+                        study_desc = getattr(identifier, 'StudyDescription', 'Unknown')
+                        print(f"[+] Found Study: {identifier.StudyInstanceUID}")
+                        print(f"    Patient: {patient_name}")
+                        print(f"    Date: {study_date}")
+                        print(f"    Description: {study_desc}")
+                        print("-" * 40)
+            using_study_root = True
+            find_successful = True
+        except Exception as e:
+            print(f"[-] Error during study query with Study Root model: {str(e)}")
+        finally:
+            print("[*] Releasing find association")
+            find_assoc.release()
+    else:
+        try:
+            # Perform the C-FIND to get all studies with Patient Root model
+            print("[*] Querying for all studies using Patient Root Information Model...")
+            responses = find_assoc.send_c_find(query, PatientRootQueryRetrieveInformationModelFind)
+            for status, identifier in responses:
+                if status and status.Status == 0xFF00:  # Pending
+                    if identifier and hasattr(identifier, 'StudyInstanceUID'):
+                        study_uids.append(identifier.StudyInstanceUID)
+                        patient_name = getattr(identifier, 'PatientName', 'Unknown')
+                        study_date = getattr(identifier, 'StudyDate', 'Unknown')
+                        study_desc = getattr(identifier, 'StudyDescription', 'Unknown')
+                        print(f"[+] Found Study: {identifier.StudyInstanceUID}")
+                        print(f"    Patient: {patient_name}")
+                        print(f"    Date: {study_date}")
+                        print(f"    Description: {study_desc}")
+                        print("-" * 40)
+            using_study_root = False
+            find_successful = True
+        except Exception as e:
+            print(f"[-] Error during study query: {str(e)}")
+        finally:
+            print("[*] Releasing find association")
+            find_assoc.release()
+
+    if not study_uids:
+        print("[-] No studies found in PACS")
+        return
+
+    # Ask for confirmation before proceeding
+    print(f"[*] Found {len(study_uids)} studies. Proceeding to move all images.")
+    print("[*] This operation may take a long time depending on the number of studies.")
+
+    # Step 2: Move each study one by one
+    print("\n[*] STEP 2: Moving all studies")
+
+    # Ensure output directory exists
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Configure Storage SCP for receiving images
+    handlers = [(evt.EVT_C_STORE, handle_store)]
+    scp = AE(ae_title='MODALITY')
+
+    # Add storage contexts
+    storage_sop_classes = [
+        CTImageStorage, MRImageStorage, XRayAngiographicImageStorage,
+        SecondaryCaptureImageStorage, ComputedRadiographyImageStorage
+    ]
+    for sop_class in storage_sop_classes:
+        scp.add_supported_context(sop_class)
+
+    # Start Storage SCP
+    try:
+        print("[*] Starting Storage SCP on port 4242")
+        scp.start_server(('', 4242), block=False, evt_handlers=handlers)
+        print("[+] Storage SCP started successfully")
+    except Exception as e:
+        print(f"[-] Error starting Storage SCP: {str(e)}")
+        return
+
+    # Add C-MOVE context based on which model worked for C-FIND
+    if using_study_root:
+        print("[*] Using Study Root Query/Retrieve Information Model for C-MOVE")
+        ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+        move_model = StudyRootQueryRetrieveInformationModelMove
+    else:
+        print("[*] Using Patient Root Query/Retrieve Information Model for C-MOVE")
+        ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
+        move_model = PatientRootQueryRetrieveInformationModelMove
+
+    add_storage_presentation_contexts(ae)
+
+    # Track total stats
+    total_images_moved = 0
+    total_studies_moved = 0
+    failed_studies = []
+
+    # Process each study
+    for i, study_uid in enumerate(study_uids, 1):
+        print(f"\n[*] Processing study {i}/{len(study_uids)}: {study_uid}")
+
+        # Reset for this study
+        received_datasets = []
+        operation_cancelled = False
+        current_query_model = move_model
+
+        # Create a study-specific folder
+        study_folder = f"{output_folder}/Study_{study_uid.replace('.', '_')}"
+        os.makedirs(study_folder, exist_ok=True)
+
+        # Create association for C-MOVE
+        current_association = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+        if not current_association.is_established:
+            print(f"[-] Failed to connect to PACS server for study {study_uid}")
+            failed_studies.append(study_uid)
+            continue
+
+        # Check if the necessary presentation context was accepted for C-MOVE
+        move_context_accepted = False
+        for context in current_association.accepted_contexts:
+            if context.abstract_syntax == move_model:
+                move_context_accepted = True
+                break
+
+        if not move_context_accepted:
+            print(f"[-] The PACS server did not accept the presentation context for C-MOVE for study {study_uid}")
+            current_association.release()
+            failed_studies.append(study_uid)
+            continue
+
+        # Prepare and send C-MOVE request
+        query = Dataset()
+        query.QueryRetrieveLevel = "STUDY"
+        query.StudyInstanceUID = study_uid
+
+        try:
+            # Perform the actual C-MOVE
+            responses = current_association.send_c_move(query, 'MODALITY', move_model)
+            move_in_progress = False
+            files_received = 0
+
+            for status, identifier in responses:
+                if operation_cancelled:
+                    print("\n[*] Operation cancelled by user")
+                    failed_studies.append(study_uid)
+                    break
+
+                if not status:
+                    continue
+
+                if status.Status == 0xFF00:  # Pending
+                    move_in_progress = True
+                    print("[*] Move in progress...", end="", flush=True)
+                elif status.Status == 0x0000:  # Success
+                    print("\n[+] Study move completed successfully")
+
+                    # Save the received datasets
+                    for j, dataset in enumerate(received_datasets, 1):
+                        series_num = getattr(dataset, 'SeriesNumber', '000')
+                        instance_num = getattr(dataset, 'InstanceNumber', '000')
+                        sop_uid = getattr(dataset, 'SOPInstanceUID', f'unknown_{j}')
+
+                        filename = f"{study_folder}/Series{series_num}_Instance{instance_num}_{sop_uid}.dcm"
+                        dataset.save_as(filename)
+                        files_received += 1
+
+                    print(f"[+] Saved {files_received} images for study {study_uid}")
+                    total_images_moved += files_received
+                    total_studies_moved += 1
+                else:
+                    print(f"\n[-] C-MOVE failed with status: {hex(status.Status)}")
+                    failed_studies.append(study_uid)
+
+        except Exception as e:
+            print(f"[-] Error during C-MOVE for study {study_uid}: {str(e)}")
+            failed_studies.append(study_uid)
+        finally:
+            if current_association.is_established:
+                current_association.release()
+                print(f"[*] Released association for study {study_uid}")
+
+        # Check if user wants to cancel the entire operation
+        if operation_cancelled:
+            print("[*] Entire operation cancelled by user")
+            break
+
+    # Final cleanup
+    print("[*] Stopping Storage SCP")
+    scp.shutdown()
+
+    # Summary
+    print("\n" + "=" * 50)
+    print(f"[*] OPERATION SUMMARY")
+    print(f"[+] Total studies processed: {total_studies_moved}/{len(study_uids)}")
+    print(f"[+] Total images retrieved: {total_images_moved}")
+    if failed_studies:
+        print(f"[-] Failed studies: {len(failed_studies)}")
+        for uid in failed_studies:
+            print(f"    - {uid}")
+    print("=" * 50)
+    print("[*] All-studies move operation completed")
+
 def main():
     # Reset global variables at start
     global current_association, operation_cancelled, current_query_model
@@ -582,13 +845,13 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description="DICOM Simulator for Various Requests")
-    parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'disconnect'],
+    parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'move-all', 'disconnect'],
                         help="Action to perform")
     parser.add_argument("--dicom_folder", default="DICOM_images", help="Folder with DICOM files (for store)")
     parser.add_argument("--pacs_ip", required=True, help="PACS server IP address")
     parser.add_argument("--pacs_port", type=int, required=True, help="PACS server port")
     parser.add_argument("--pacs_ae_title", required=True, help="PACS AE title")
-    parser.add_argument("--study_uid", help="StudyInstanceUID for retrieve")
+    parser.add_argument("--study_uid", help="StudyInstanceUID for retrieve (optional for move-all)")
     parser.add_argument("--output_folder", default="retrieved_images", help="Folder to save retrieved images")
     parser.add_argument("--query_level", choices=["PATIENT", "STUDY", "SERIES", "IMAGE"], default="PATIENT",
                         help="Specify the query level for C-FIND (default is 'PATIENT')")
@@ -608,7 +871,7 @@ def main():
         add_storage_presentation_contexts(ae)
     elif args.action == 'find':
         ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
-    elif args.action == 'retrieve':
+    elif args.action in ['retrieve', 'move-all']:
         if args.retrieve_method == "get":
             ae.add_requested_context(PatientRootQueryRetrieveInformationModelGet)
         else:
@@ -624,6 +887,7 @@ def main():
         else:
             print("Failed to establish association.")
     elif args.action == 'echo':
+        print("[*] Starting C-ECHO operation (press Ctrl+C to attempt cancellation, though C-ECHO operations usually complete too quickly to cancel)")
         send_c_echo(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title)
     elif args.action == 'store':
         print("[*] Starting C-STORE operation")
@@ -641,6 +905,11 @@ def main():
         else:
             print("[*] Starting C-MOVE operation (press Ctrl+C to send C-CANCEL)")
             send_c_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
+    elif args.action == 'move-all':
+        print("[*] Starting MOVE ALL STUDIES operation (press Ctrl+C to send C-CANCEL)")
+        print("[*] WARNING: This operation will retrieve ALL studies from the PACS server.")
+        print("[*] This may take a long time and use significant disk space.")
+        send_all_studies_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.output_folder)
     elif args.action == 'disconnect':
         print("Disconnecting (simulated).")
 
