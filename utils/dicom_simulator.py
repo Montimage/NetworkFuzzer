@@ -11,7 +11,8 @@ from pynetdicom.sop_class import (
     ComputedRadiographyImageStorage,
     Verification,
     PatientRootQueryRetrieveInformationModelFind,
-    PatientRootQueryRetrieveInformationModelMove
+    PatientRootQueryRetrieveInformationModelMove,
+    PatientRootQueryRetrieveInformationModelGet
 )
 from pydicom.dataset import Dataset
 
@@ -231,7 +232,115 @@ def handle_store(event):
     received_datasets.append(event.dataset)
     return 0x0000
 
+# TODO: C-GET failed with status: 0xa702 - the server doesn't support C-GET for this SOP Class
 def send_c_get(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
+    """Retrieve images from PACS using C-GET."""
+    global received_datasets
+    received_datasets = []
+
+    print(f"\n[*] Preparing C-GET request for StudyInstanceUID: {study_uid}")
+
+    # Ensure output directory exists
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Configure Storage SCP
+    print("[*] Configuring Storage SCP")
+    handlers = [(evt.EVT_C_STORE, handle_store)]
+    scp = AE(ae_title='MODALITY')
+
+    # Add storage contexts with all transfer syntaxes
+    storage_sop_classes = [
+        CTImageStorage, MRImageStorage, XRayAngiographicImageStorage,
+        SecondaryCaptureImageStorage, ComputedRadiographyImageStorage
+    ]
+    transfer_syntaxes = [ImplicitVRLittleEndian, ExplicitVRLittleEndian, JPEGBaseline]
+
+    print("[*] Adding storage contexts with transfer syntaxes:")
+    for sop_class in storage_sop_classes:
+        scp.add_supported_context(sop_class, transfer_syntaxes)
+        print(f"    - {sop_class.name}")
+
+    # Start Storage SCP
+    try:
+        print("[*] Starting Storage SCP on port 4242")
+        scp.start_server(('', 4242), block=False, evt_handlers=handlers)
+        print("[+] Storage SCP started successfully")
+    except Exception as e:
+        print(f"[-] Error starting Storage SCP: {str(e)}")
+        return
+
+    # Add C-GET context with all transfer syntaxes
+    print("[*] Adding C-GET presentation context")
+    ae.add_requested_context(PatientRootQueryRetrieveInformationModelGet, transfer_syntaxes)
+    add_storage_presentation_contexts(ae)
+
+    # Create association and send C-GET request
+    print(f"[*] Attempting to establish association with {pacs_ae_title}")
+    assoc = ae.associate(pacs_ip, pacs_port, ae_title=pacs_ae_title)
+    if not assoc.is_established:
+        print("[-] Failed to establish association")
+        scp.shutdown()
+        return
+
+    print("[+] Association established")
+    print("[*] Checking accepted presentation contexts:")
+    for cx in assoc.accepted_contexts:
+        print(f"    - {cx.abstract_syntax.name}")
+
+    # Prepare and send C-GET request
+    query = Dataset()
+    query.QueryRetrieveLevel = "STUDY"
+    query.StudyInstanceUID = study_uid
+
+    try:
+        print("[*] Sending C-GET request...")
+        responses = assoc.send_c_get(query, PatientRootQueryRetrieveInformationModelGet)
+
+        for status, identifier in responses:
+            if not status:
+                print("[-] Received empty status")
+                continue
+
+            if status.Status == 0xFF00:  # Pending
+                print("[*] C-GET operation in progress...")
+            elif status.Status == 0x0000:  # Success
+                # Save received datasets
+                for i, dataset in enumerate(received_datasets, 1):
+                    series_num = getattr(dataset, 'SeriesNumber', '000')
+                    instance_num = getattr(dataset, 'InstanceNumber', '000')
+                    sop_uid = getattr(dataset, 'SOPInstanceUID', f'unknown_{i}')
+
+                    filename = f"{output_folder}/Series{series_num}_Instance{instance_num}_{sop_uid}.dcm"
+                    dataset.save_as(filename)
+                    print(f"[+] Saved image {i}:")
+                    print(f"    Series Number: {series_num}")
+                    print(f"    Instance Number: {instance_num}")
+                    print(f"    Saved as: {filename}")
+
+                print(f"\n[+] Total images retrieved: {len(received_datasets)}")
+            else:
+                print(f"[-] C-GET failed with status: {hex(status.Status)}")
+                if status.Status == 0xA701:
+                    print("    Error: Refused - Out of Resources")
+                elif status.Status == 0xA702:
+                    print("    Error: Failed - Unable to perform sub-operations")
+                    print("    Note: This might indicate the server doesn't support C-GET for this SOP Class")
+                elif status.Status == 0xA900:
+                    print("    Error: Failed - Identifier does not match SOP Class")
+                elif status.Status == 0xC000:
+                    print("    Error: Failed - Unable to process")
+                if hasattr(status, 'ErrorComment'):
+                    print(f"    Server message: {status.ErrorComment}")
+
+    except Exception as e:
+        print(f"[-] Error during C-GET operation: {str(e)}")
+    finally:
+        print("[*] Releasing association")
+        assoc.release()
+        print("[*] Stopping Storage SCP")
+        scp.shutdown()
+
+def send_c_move(ae, pacs_ip, pacs_port, pacs_ae_title, study_uid, output_folder):
     """Retrieve images from PACS using C-MOVE."""
     global received_datasets
     received_datasets = []
@@ -319,6 +428,8 @@ def main():
     parser.add_argument("--output_folder", default="retrieved_images", help="Folder to save retrieved images")
     parser.add_argument("--query_level", choices=["PATIENT", "STUDY", "SERIES", "IMAGE"], default="PATIENT",
                         help="Specify the query level for C-FIND (default is 'PATIENT')")
+    parser.add_argument("--retrieve_method", choices=["get", "move"], default="move",
+                        help="Specify the retrieval method (C-GET or C-MOVE)")
     args = parser.parse_args()
 
     # Configure the Application Entity
@@ -334,7 +445,10 @@ def main():
     elif args.action == 'find':
         ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
     elif args.action == 'retrieve':
-        ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
+        if args.retrieve_method == "get":
+            ae.add_requested_context(PatientRootQueryRetrieveInformationModelGet)
+        else:
+            ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
         add_storage_presentation_contexts(ae)
 
     if args.action == 'connect':
@@ -356,7 +470,10 @@ def main():
         if not args.study_uid:
             print("Error: --study_uid is required for retrieval.")
             return
-        send_c_get(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
+        if args.retrieve_method == "get":
+            send_c_get(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
+        else:
+            send_c_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
     elif args.action == 'disconnect':
         print("Disconnecting (simulated).")
 
