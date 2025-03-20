@@ -5,6 +5,7 @@
             const rule_info_t *rule, int verdict, uint64_t timestamp,
             uint64_t counter, const mmt_array_t * const trace) {
             int is_string = 0;
+            // int new_val = 0;  // Set PDU length to 0 byte
             int new_val = 10000;  // Set PDU length to 10000 bytes
             // Replace PDU length field (attribute ID 2 in protocol 701)
             replace_dicom_attribute(701, 2, &new_val, is_string);
@@ -14,9 +15,9 @@
         // Define wrapper function or modify if_satisfied as needed
     ]]></embedded_functions>
     <property property_id="32" type_property="FORWARD"
-              description="Modify DICOM PDU length to invalid value (10000)"
-              if_satisfied="em_modify_dicom_pdu_len">
-        <event description="Got any DICOM packet"
-              boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 8))"/>
+            description="Modify DICOM PDU length to invalid value (10000)"
+            if_satisfied="em_modify_dicom_pdu_len">
+        <event description="Got any DICOM packets"
+            boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 8))"/>
     </property>
 </beginning>
