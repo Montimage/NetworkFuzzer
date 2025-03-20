@@ -1024,7 +1024,8 @@ def main():
     parser.add_argument("--dicom_folder", default="DICOM_images", help="Folder with DICOM files (for store)")
     parser.add_argument("--pacs_ip", required=True, help="PACS server IP address")
     parser.add_argument("--pacs_port", type=int, required=True, help="PACS server port")
-    parser.add_argument("--pacs_ae_title", required=True, help="PACS AE title")
+    parser.add_argument("--called_ae_title", required=True, help="Called AE title (remote/server AE title)")
+    parser.add_argument("--calling_ae_title", default="MODALITY", help="Calling AE title (local/client AE title)")
     parser.add_argument("--study_uid", help="StudyInstanceUID for retrieve (optional for move-all)")
     parser.add_argument("--output_folder", default="retrieved_images", help="Folder to save retrieved images")
     parser.add_argument("--query_level", choices=["PATIENT", "STUDY", "SERIES", "IMAGE"], default="PATIENT",
@@ -1035,8 +1036,8 @@ def main():
     parser.add_argument("--log_file", help="Output file for detailed logging (for analyze-negotiation)")
     args = parser.parse_args()
 
-    # Configure the Application Entity
-    ae = AE(ae_title='MODALITY')
+    # Configure the Application Entity with the calling AE title
+    ae = AE(ae_title=args.calling_ae_title)
 
     # Add verification context
     ae.add_requested_context(Verification)
@@ -1055,40 +1056,48 @@ def main():
         add_storage_presentation_contexts(ae)
 
     if args.action == 'connect':
-        print("Trying to establish association...")
-        current_association = ae.associate(args.pacs_ip, args.pacs_port, ae_title=args.pacs_ae_title)
+        print(f"[*] Trying to establish association...")
+        print(f"[*] Calling AE Title (local): {args.calling_ae_title}")
+        print(f"[*] Called AE Title (remote): {args.called_ae_title}")
+        current_association = ae.associate(args.pacs_ip, args.pacs_port, ae_title=args.called_ae_title)
         if current_association.is_established:
-            print("Association established.")
+            print("[+] Association established successfully.")
             current_association.release()
+            print("[*] Association released.")
         else:
-            print("Failed to establish association.")
+            print("[-] Association rejected by remote AE.")
+            print(f"[-] This could be because:")
+            print(f"    - The AE title '{args.called_ae_title}' is not recognized")
+            print(f"    - The PACS server only accepts connections from specific AE titles")
+            print(f"    - Network connectivity issues")
+            print(f"    - Invalid PACS configuration")
     elif args.action == 'echo':
         print("[*] Starting C-ECHO operation (press Ctrl+C to attempt cancellation, though C-ECHO operations usually complete too quickly to cancel)")
-        send_c_echo(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title)
+        send_c_echo(ae, args.pacs_ip, args.pacs_port, args.called_ae_title)
     elif args.action == 'store':
         print("[*] Starting C-STORE operation")
-        send_c_store(ae, args.dicom_folder, args.pacs_ip, args.pacs_port, args.pacs_ae_title)
+        send_c_store(ae, args.dicom_folder, args.pacs_ip, args.pacs_port, args.called_ae_title)
     elif args.action == 'find':
         print("[*] Starting C-FIND operation (press Ctrl+C to send C-CANCEL)")
-        send_c_find(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, query_level=args.query_level)
+        send_c_find(ae, args.pacs_ip, args.pacs_port, args.called_ae_title, query_level=args.query_level)
     elif args.action == 'retrieve':
         if not args.study_uid:
             print("Error: --study_uid is required for retrieval.")
             return
         if args.retrieve_method == "get":
             print("[*] Starting C-GET operation (press Ctrl+C to send C-CANCEL)")
-            send_c_get(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
+            send_c_get(ae, args.pacs_ip, args.pacs_port, args.called_ae_title, args.study_uid, args.output_folder)
         else:
             print("[*] Starting C-MOVE operation (press Ctrl+C to send C-CANCEL)")
-            send_c_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.study_uid, args.output_folder)
+            send_c_move(ae, args.pacs_ip, args.pacs_port, args.called_ae_title, args.study_uid, args.output_folder)
     elif args.action == 'move-all':
         print("[*] Starting MOVE ALL STUDIES operation (press Ctrl+C to send C-CANCEL)")
         print("[*] WARNING: This operation will retrieve ALL studies from the PACS server.")
         print("[*] This may take a long time and use significant disk space.")
-        send_all_studies_move(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title, args.output_folder)
+        send_all_studies_move(ae, args.pacs_ip, args.pacs_port, args.called_ae_title, args.output_folder)
     elif args.action == 'analyze-negotiation':
         print("[*] Starting Association Negotiation Analysis")
-        analyze_association_negotiation(ae, args.pacs_ip, args.pacs_port, args.pacs_ae_title,
+        analyze_association_negotiation(ae, args.pacs_ip, args.pacs_port, args.called_ae_title,
                                        verbose=args.verbose, output_file=args.log_file)
     elif args.action == 'disconnect':
         print("Disconnecting (simulated).")
