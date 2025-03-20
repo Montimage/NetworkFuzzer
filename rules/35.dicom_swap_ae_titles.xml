@@ -1,0 +1,50 @@
+<beginning>
+<!-- Property 35: Swap Called and Calling AE titles -->
+<embedded_functions><![CDATA[
+    // Buffer to store original AE titles
+    static char original_called_ae[17];   // 16 chars + null
+    static char original_calling_ae[17];  // 16 chars + null
+
+    static void em_swap_dicom_ae_titles(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+
+        // Get original Called AE Title (attribute 4)
+        int ret = get_dicom_attribute(701, 4, original_called_ae);
+        if (ret < 0) {
+            log_info("Failed to get Called AE Title");
+            forward_packet();
+            return;
+        }
+
+        // Get original Calling AE Title (attribute 5)
+        ret = get_dicom_attribute(701, 5, original_calling_ae);
+        if (ret < 0) {
+            log_info("Failed to get Calling AE Title");
+            forward_packet();
+            return;
+        }
+
+        // Log original values
+        log_info("Original Called AE: %s", original_called_ae);
+        log_info("Original Calling AE: %s", original_calling_ae);
+
+        // Now swap them
+        replace_dicom_attribute(701, 4, original_calling_ae, 1);  // Set Called AE to original Calling AE
+        replace_dicom_attribute(701, 5, original_called_ae, 1);   // Set Calling AE to original Called AE
+
+        // Log the swap
+        log_info("Swapped AE titles - New Called AE: %s, New Calling AE: %s",
+                original_calling_ae, original_called_ae);
+
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="35" type_property="FORWARD"
+        description="Test DICOM association handling by swapping Called and Calling AE titles"
+        if_satisfied="em_swap_dicom_ae_titles">
+    <event description="Got any DICOM packets"
+        boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 8))"/>
+</property>
+</beginning>

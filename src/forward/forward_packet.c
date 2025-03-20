@@ -320,7 +320,7 @@ uint32_t update_dicom_data( u_char *data, uint32_t data_size, const ipacket_t *i
 	}
 	att_offset += dicom_offset;
     fprintf(stderr, "attribute id: %d, attribute offset: %d, attribute data len: %d\n",att_id, att_offset, att_data_len);
-    
+
 	ret = int_to_ascii_string((u_char *) &data[att_offset], att_data_len * 2, new_val);
     if (ret == 1) {
       printf("Successfully modified!!!");
@@ -428,7 +428,7 @@ int mmt_replace_data_at_protocol_id( uint32_t proto_id, uint16_t data_length, co
  *   to update the parameters in sctp_sendmsg function
  *  See : https://linux.die.net/man/3/sctp_sendmsg
  * @param ppid
- * @param flags 
+ * @param flags
  * @param stream_no
  * @param timetolive
  * @return
@@ -454,7 +454,7 @@ int mmt_update_sctp_param( uint32_t ppid, uint32_t flags, uint16_t stream_no, ui
  * @param proto_id
  * @param att_id
  * @param new_val
- * @return uint32_t 1 - Successful/ 0 - Failed 
+ * @return uint32_t 1 - Successful/ 0 - Failed
  */
 uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_t *ipacket, uint32_t proto_id, uint32_t att_id, u_char *new_val) {
     uint32_t ret = 0;
@@ -567,7 +567,7 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
 
     int att_offset, att_data_len;
     if (get_dicom_attribute_info(att_id, &att_offset, &att_data_len) != 0) {
-        return -1; 
+        return -1;
     }
 
     int index = get_protocol_index_by_id(context->ipacket, proto_id);
@@ -604,4 +604,35 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
     memcpy(&context->packet_data[att_offset], ascii_string, att_data_len);
 
     return 1;
+}
+
+// Get value of a DICOM attribute from packet data
+int get_dicom_attribute(uint32_t proto_id, uint32_t att_id, char *value) {
+    forward_packet_context_t *context = _get_current_context();
+    if (context == NULL)
+        return -3;
+
+    int att_offset, att_data_len;
+    if (get_dicom_attribute_info(att_id, &att_offset, &att_data_len) != 0) {
+        return -1;
+    }
+
+    int index = get_protocol_index_by_id(context->ipacket, proto_id);
+    if (index == -1)
+        return -1; // protocol not found
+
+    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+    att_offset += dicom_offset;
+
+    // Check if it does not exceed the packet data length
+    if (att_offset + att_data_len > context->packet_size) {
+        fprintf(stderr, "Attribute offset exceeds packet data length\n");
+        return -4;
+    }
+
+    // Copy the attribute value
+    memcpy(value, &context->packet_data[att_offset], att_data_len);
+    value[att_data_len] = '\0'; // Ensure null termination for string values
+
+    return att_data_len;
 }
