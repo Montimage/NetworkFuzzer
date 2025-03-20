@@ -1,0 +1,74 @@
+<beginning>
+<!-- Property 34: Modify AE titles with invalid values (oversized or non-ASCII) -->
+<embedded_functions><![CDATA[
+    // Initialize random seed and session AE titles
+    static char oversized_ae_title[21];    // 20 chars + null
+    static char non_ascii_ae_title[17];    // 16 chars + null
+    static int is_initialized = 0;
+    //static int test_type = 0;              // for oversized
+    static int test_type = 1;              // for non-ASCII
+
+    // Generate an oversized AE Title (20 characters)
+    void initialize_oversized_ae_title() {
+        if (!is_initialized) {
+            int random_number = rand() % 90000 + 10000;  // 5-digit number
+            snprintf(oversized_ae_title, sizeof(oversized_ae_title), "TOOLONG_AE_%d", random_number);
+            is_initialized = 1;
+            log_info("Initialized oversized AE Title: %s", oversized_ae_title);
+            log_info("Length: %d bytes (exceeds 16-byte limit)", strlen(oversized_ae_title));
+        }
+    }
+
+    // Generate an AE Title with non-ASCII characters and null bytes
+    void initialize_non_ascii_ae_title() {
+        if (!is_initialized) {
+            // Create pattern with UTF-8 characters and null bytes
+            non_ascii_ae_title[0] = 0xE2;  // € (part 1)
+            non_ascii_ae_title[1] = 0x82;  // € (part 2)
+            non_ascii_ae_title[2] = 0xAC;  // € (part 3)
+            non_ascii_ae_title[3] = '_';
+            non_ascii_ae_title[4] = 0x00;  // null byte
+            non_ascii_ae_title[5] = 0xC2;  // © (part 1)
+            non_ascii_ae_title[6] = 0xA9;  // © (part 2)
+            non_ascii_ae_title[7] = '_';
+            non_ascii_ae_title[8] = 'T';
+            non_ascii_ae_title[9] = 'E';
+            non_ascii_ae_title[10] = 'S';
+            non_ascii_ae_title[11] = 'T';
+            non_ascii_ae_title[12] = 0x00;  // String terminator
+
+            is_initialized = 1;
+            log_info("Initialized non-ASCII AE Title with special characters and null bytes");
+        }
+    }
+
+    static void em_modify_dicom_ae_titles(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+
+        // Initialize based on test type
+        if (test_type == 0) {
+            initialize_oversized_ae_title();
+            // Modify AE Titles to be oversized
+            replace_dicom_attribute(701, 4, oversized_ae_title, 1);  // Called AE Title
+            replace_dicom_attribute(701, 5, oversized_ae_title, 1);  // Calling AE Title
+            log_info("Applied oversized AE Title modification");
+        } else {
+            initialize_non_ascii_ae_title();
+            // Modify AE Titles to contain non-ASCII characters
+            replace_dicom_attribute(701, 4, non_ascii_ae_title, 1);  // Called AE Title
+            replace_dicom_attribute(701, 5, non_ascii_ae_title, 1);  // Calling AE Title
+            log_info("Applied non-ASCII AE Title modification");
+        }
+
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="34" type_property="FORWARD"
+        description="Test DICOM AE title validation (oversized or non-ASCII)"
+        if_satisfied="em_modify_dicom_ae_titles">
+    <event description="Got any DICOM packets"
+        boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 8))"/>
+</property>
+</beginning>
