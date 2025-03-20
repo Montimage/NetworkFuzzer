@@ -1008,6 +1008,23 @@ def analyze_association_negotiation(ae, pacs_ip, pacs_port, pacs_ae_title, verbo
     if output_file:
         print(f"[*] Detailed log saved to: {output_file}")
 
+def simulate_abort(ae, pacs_ip, pacs_port, called_ae_title, abort_type='client'):
+    """Simulate an A-ABORT scenario."""
+    print(f"[*] Simulating A-ABORT scenario")
+    print(f"[*] Establishing association with {called_ae_title}")
+
+    # Add event handlers to capture abort
+    handlers = [(evt.EVT_ABORTED, handle_association_events)]
+
+    assoc = ae.associate(pacs_ip, pacs_port, ae_title=called_ae_title, evt_handlers=handlers)
+
+    if assoc.is_established:
+        print("[+] Association established successfully")
+        print("[*] Initiating A-ABORT")
+        assoc.abort()
+    else:
+        print("[-] Association establishment failed")
+
 def main():
     # Reset global variables at start
     global current_association, operation_cancelled, current_query_model
@@ -1019,13 +1036,16 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description="DICOM Simulator for Various Requests")
-    parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'move-all', 'disconnect', 'analyze-negotiation'],
+    parser.add_argument("action", choices=['connect', 'echo', 'store', 'find', 'retrieve', 'move-all', 'disconnect', 'analyze-negotiation', 'abort'],
                         help="Action to perform")
     parser.add_argument("--dicom_folder", default="DICOM_images", help="Folder with DICOM files (for store)")
     parser.add_argument("--pacs_ip", required=True, help="PACS server IP address")
-    parser.add_argument("--pacs_port", type=int, required=True, help="PACS server port")
-    parser.add_argument("--called_ae_title", required=True, help="Called AE title (remote/server AE title)")
-    parser.add_argument("--calling_ae_title", default="MODALITY", help="Calling AE title (local/client AE title)")
+    parser.add_argument("--pacs_port", type=int, default=4242,
+                        help="PACS server port (default: 4242)")
+    parser.add_argument("--called_ae_title", default="MyOrthanc",
+                        help="Called AE title (remote/server AE title, default: MyOrthanc)")
+    parser.add_argument("--calling_ae_title", default="MODALITY",
+                        help="Calling AE title (local/client AE title, default: MODALITY)")
     parser.add_argument("--study_uid", help="StudyInstanceUID for retrieve (optional for move-all)")
     parser.add_argument("--output_folder", default="retrieved_images", help="Folder to save retrieved images")
     parser.add_argument("--query_level", choices=["PATIENT", "STUDY", "SERIES", "IMAGE"], default="PATIENT",
@@ -1099,6 +1119,9 @@ def main():
         print("[*] Starting Association Negotiation Analysis")
         analyze_association_negotiation(ae, args.pacs_ip, args.pacs_port, args.called_ae_title,
                                        verbose=args.verbose, output_file=args.log_file)
+    elif args.action == 'abort':
+        print("[*] Starting Association Abort Simulation")
+        simulate_abort(ae, args.pacs_ip, args.pacs_port, args.called_ae_title)
     elif args.action == 'disconnect':
         print("Disconnecting (simulated).")
 
