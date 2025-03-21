@@ -1,0 +1,23 @@
+<beginning>
+<embedded_functions><![CDATA[
+    // Test with invalid PDV flags
+    static void em_invalid_pdv_flags(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        uint32_t new_flag;
+
+        new_flag = 0x99;
+        // Replace with new PDV flags
+        replace_dicom_attribute(701, 12, &new_flag, 0);
+
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="39" type_property="FORWARD"
+        description="Test DICOM PDV flags handling by setting invalid flag values"
+        if_satisfied="em_invalid_pdv_flags">
+    <event description="Got DICOM data transfer packet (P-DATA-TF)"
+        boolean_expression="(dicom.pdu_type == 4)"/>
+</property>
+</beginning>

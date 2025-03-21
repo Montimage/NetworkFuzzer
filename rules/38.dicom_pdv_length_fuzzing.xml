@@ -1,0 +1,25 @@
+<beginning>
+<embedded_functions><![CDATA[
+    static void em_modify_pdv_length(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        uint32_t new_length;
+
+        new_length = 50;
+        log_info("Negative PDV Length: Setting to 0xFFFFFFFF");
+
+        // Replace with new PDV length
+        replace_dicom_attribute(701, 10, &new_length, 0);
+
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<!-- TODO: retest this rule -->
+<property property_id="38" type_property="FORWARD"
+        description="Modify PDV length in DICOM packets with mismatched values - either too short or too long"
+        if_satisfied="em_modify_pdv_length">
+    <event description="Got DICOM data transfer packet (P-DATA-TF)"
+        boolean_expression="(dicom.pdu_type == 4)"/>
+</property>
+</beginning>
