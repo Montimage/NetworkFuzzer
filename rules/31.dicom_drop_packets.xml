@@ -1,0 +1,10 @@
+<beginning>
+<!-- Property 31: Drop DICOM packets -->
+<property value="COMPUTE" property_id="31" type_property="FORWARD"
+    description="Drop DICOM association request and accept packets" if_satisfied="#drop()">
+    <event description="DICOM packets"
+        boolean_expression="(dicom.pdu_type == 5)"/> <!-- DICOM release request packets -->
+</property>
+</beginning>
+        <!-- boolean_expression="(dicom.pdu_type == 4)"/> --> <!-- DICOM association request and accept packets -->
+        <!-- boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 3))"/> --> <!-- DICOM association request and accept packets -->
