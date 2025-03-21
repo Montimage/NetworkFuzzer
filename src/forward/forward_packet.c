@@ -314,6 +314,10 @@ uint32_t update_dicom_data( u_char *data, uint32_t data_size, const ipacket_t *i
 		att_data_len = 2;
     	att_offset = 6;
 		break;
+	case 8:
+		att_data_len = 4;
+    	att_offset = 295;
+		break;
 	default:
         fprintf(stderr, "Unsupported modify attribute: %d",att_id);
         return ret;
@@ -480,6 +484,10 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
         att_data_len = 16;
         att_offset = 26;
         break;
+	case 8:
+		att_data_len = 4;
+    	att_offset = 295;
+		break;
     default:
         fprintf(stderr, "Unsupported modify attribute: %d\n", att_id);
         return ret;
@@ -552,6 +560,10 @@ int get_dicom_attribute_info(uint32_t att_id, int *att_offset, int *att_data_len
             *att_data_len = 16;
             *att_offset = 26;
             break;
+		case 8:
+			*att_data_len = 4;
+			*att_offset = 295;
+			break;
         default:
             fprintf(stderr, "Unsupported modify attribute: %d\n", att_id);
             return -1;
