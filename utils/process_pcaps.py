@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import shutil
+import csv
 
 def process_single_pcap_cicflowmeter(pcap_path, output_path=None):
     """
@@ -14,10 +15,14 @@ def process_single_pcap_cicflowmeter(pcap_path, output_path=None):
     Returns:
         bool: True if processing was successful, False otherwise.
     """
+    # Convert to absolute paths to avoid issues
+    pcap_path = os.path.abspath(pcap_path)
+
     # Determine output CSV path
     if output_path is None:
         csv_path = os.path.splitext(pcap_path)[0] + ".csv"
     else:
+        output_path = os.path.abspath(output_path)
         if os.path.isdir(output_path):
             # If output is a directory, use the original filename with .csv extension in that directory
             filename = os.path.basename(os.path.splitext(pcap_path)[0]) + ".csv"
@@ -47,6 +52,7 @@ def process_single_pcap_cicflowmeter(pcap_path, output_path=None):
 def process_single_pcap_zeek(pcap_path, output_path=None):
     """
     Process a single .pcap file using Zeek, collecting conn.log and renaming it.
+    Also converts the conn.log to CSV format.
 
     Args:
         pcap_path (str): Path to the .pcap file.
@@ -55,21 +61,36 @@ def process_single_pcap_zeek(pcap_path, output_path=None):
     Returns:
         bool: True if processing was successful, False otherwise.
     """
+    # Convert to absolute paths to avoid issues when changing directories
+    pcap_path = os.path.abspath(pcap_path)
+
     # Create a temporary directory to store Zeek logs
     pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
     temp_dir = os.path.join(os.path.dirname(pcap_path), f"zeek_logs_{pcap_name}")
 
-    # Determine output log path
+    # Determine output paths
     if output_path is None:
         log_path = os.path.splitext(pcap_path)[0] + ".log"
+        csv_path = os.path.splitext(pcap_path)[0] + ".csv"
     else:
+        output_path = os.path.abspath(output_path)
         if os.path.isdir(output_path):
-            # If output is a directory, use the original filename with .log extension in that directory
-            filename = os.path.basename(os.path.splitext(pcap_path)[0]) + ".log"
-            log_path = os.path.join(output_path, filename)
+            # If output is a directory, use the original filename in that directory
+            filename_base = os.path.basename(os.path.splitext(pcap_path)[0])
+            log_path = os.path.join(output_path, filename_base + ".log")
+            csv_path = os.path.join(output_path, filename_base + ".csv")
         else:
-            # Use the exact output path specified
+            # Use the exact output path specified for log, and derive CSV path
             log_path = output_path
+            # If output_path has an extension, replace it with .csv, otherwise append .csv
+            output_basename = os.path.basename(output_path)
+            if '.' in output_basename and not output_path.endswith('/'):
+                # Replace the extension with .csv
+                csv_path = os.path.join(os.path.dirname(output_path),
+                                       os.path.splitext(output_basename)[0] + '.csv')
+            else:
+                # Just append .csv if no extension or if it's a directory
+                csv_path = output_path + '.csv'
 
     # Create output directory if it doesn't exist
     output_dir = os.path.dirname(log_path)
@@ -85,10 +106,11 @@ def process_single_pcap_zeek(pcap_path, output_path=None):
         original_dir = os.getcwd()
         os.chdir(temp_dir)
 
-        # Run Zeek on the pcap file
+        # Add -C flag to ignore checksums based on the warning message
         print(f"Processing with Zeek: {pcap_path}")
         subprocess.run([
             "/usr/local/zeek/bin/zeek",
+            "-C",  # Ignore checksums
             "-r", pcap_path
         ], check=True)
 
@@ -97,6 +119,37 @@ def process_single_pcap_zeek(pcap_path, output_path=None):
             # Move and rename conn.log to the output path
             shutil.copy("conn.log", log_path)
             print(f"Zeek conn.log copied to: {log_path}")
+
+            # Process the conn.log to CSV
+            print(f"Converting conn.log to CSV: {csv_path}")
+
+            # Initialize variables
+            fields = []  # Column headers
+            data_rows = []  # Rows of data
+
+            # Process the conn.log file
+            with open("conn.log", "r") as log_file:
+                for line in log_file:
+                    # Skip metadata lines starting with "#"
+                    if line.startswith("#"):
+                        # Extract column headers from the "#fields" line
+                        if line.startswith("#fields"):
+                            fields = line.strip().split("\x09")[1:]  # Skip "#fields"
+                        continue
+
+                    # Process actual data rows
+                    row = line.strip().split("\x09")
+                    data_rows.append(row)
+
+            # Write the extracted data to a CSV file
+            with open(csv_path, "w", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(fields)  # Write headers
+                writer.writerows(data_rows)  # Write rows
+
+            print(f"CSV file generated: {csv_path}")
+
+            # Clean up
             os.chdir(original_dir)
             shutil.rmtree(temp_dir)
             return True
@@ -194,12 +247,24 @@ def process_pcap_files(input_folder, output_folder=None, mode="cicflowmeter"):
 
 if __name__ == "__main__":
     # Check command line arguments
-    if len(sys.argv) < 2:
-        print("Usage:")
+    if len(sys.argv) < 2 or sys.argv[1] == "-h" or sys.argv[1] == "--help":
+        print("PCAP Processing Tool - Convert PCAP files to structured formats")
+        print("\nUsage:")
         print("  To process a directory: python process_pcaps.py -d <input_folder> [-o <output_folder>] [-m <mode>]")
         print("  To process a single file: python process_pcaps.py -f <input_file> [-o <output_file>] [-m <mode>]")
         print("  For backward compatibility: python process_pcaps.py <input_folder_or_file>")
-        print("  Modes: 'cicflowmeter' (default) or 'zeek'")
+        print("\nOptions:")
+        print("  -f <input_file>      Specify a single PCAP file to process")
+        print("  -d <input_folder>    Specify a directory containing PCAP files to process")
+        print("  -o <output>          Specify an output file or directory for results")
+        print("  -m <mode>            Specify the processing mode (default: cicflowmeter)")
+        print("  -h, --help           Show this help message and exit")
+        print("\nProcessing Modes:")
+        print("  cicflowmeter         Process PCAP files using cicflowmeter, outputs CSV files")
+        print("  zeek                 Process PCAP files using Zeek, outputs both LOG and CSV files")
+        print("\nExamples:")
+        print("  python process_pcaps.py -f capture.pcap -m zeek -o results.log")
+        print("  python process_pcaps.py -d pcap_collection/ -o output_folder/ -m cicflowmeter")
         sys.exit(1)
 
     # Parse arguments
