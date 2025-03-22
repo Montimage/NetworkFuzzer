@@ -1,0 +1,3 @@
+ts,uid,id.orig_h,id.orig_p,id.resp_h,id.resp_p,proto,service,duration,orig_bytes,resp_bytes,conn_state,local_orig,local_resp,missed_bytes,history,orig_pkts,orig_ip_bytes,resp_pkts,resp_ip_bytes,tunnel_parents,ip_proto
+1742217246.501281,CzhlJeEC281yJnfGj,192.168.126.104,44223,192.168.126.124,4242,tcp,-,0.185792,2281659,542,SF,T,T,0,ShADadFf,220,2293107,134,7518,-,6
+1742217243.680442,Cpc6LH1YozZooa9zUg,192.168.140.6,58477,192.168.126.124,22,tcp,-,0.032698,0,124,OTH,T,T,0,^dA,1,52,1,176,-,6
