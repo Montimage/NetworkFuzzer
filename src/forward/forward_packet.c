@@ -78,8 +78,10 @@ static inline bool _send_packet_to_nic( forward_packet_context_t *context ){
 	const uint8_t *data = &context->packet_data[delta];
 	const uint16_t size = context->packet_size - delta;
 	//send the packet only if it has data to send
-	if( delta >= context->packet_size )
+	if( delta >= context->packet_size ) {
+		context->nb_dropped_packets++;
 		return false;
+	}
 
 	if( context->config->is_enable ){
 		//try firstly using a real connection by using proto_injector
@@ -89,17 +91,25 @@ static inline bool _send_packet_to_nic( forward_packet_context_t *context ){
 		#endif
 		//if no protocol is available, then use default injector (libpcap/DPDK) to inject the raw packet to output NIC
 		if( ret == INJECT_PROTO_NO_AVAIL )
-			ret = inject_packet_send_packet(context->injector,  data, size);
+			ret = inject_packet_send_packet(context->injector, data, size);
 
 		if( ret > 0 ){
 			context->nb_forwarded_packets += ret;
 			_update_stat( context, ret );
+		} else {
+			// If ret <= 0, the packet injection failed
+			// This could happen if the injection was attempted but unsuccessful
+			context->nb_dropped_packets++;
+			log_write_dual(LOG_WARNING, "Failed to inject packet (proto_id = %d): %s",
+				context->ipacket->proto_hierarchy->proto_path[context->ipacket->proto_hierarchy->len - 1],
+				(ret == INJECT_PROTO_NO_AVAIL) ? "No suitable injector available" : "Injection error");
 		}
 	}
 
 	//dump to file
 	if( context->pcap_dump )
 		dump_packet_write_to_pcap_file( context->pcap_dump, data, size );
+
 	return (ret > 0);
 }
 
@@ -145,8 +155,27 @@ forward_packet_context_t* forward_packet_alloc( const config_t *config, mmt_hand
 void forward_packet_release( forward_packet_context_t *context ){
 	if( !context )
 		return;
+
+	// Get the count of rejected connections from proto_injector if available
+	size_t rejected_connections = 0;
+	if (context->proto_injector && context->proto_injector->dicom) {
+		rejected_connections = context->proto_injector->dicom->total_rejected_connections;
+	}
+
 	log_write_dual(LOG_INFO, "Number of packets being successfully forwarded: %"PRIu64", dropped: %"PRIu64,
 			context->nb_forwarded_packets, context->nb_dropped_packets );
+
+	if (rejected_connections > 0) {
+		log_write_dual(LOG_WARNING, "Number of rejected DICOM associations: %zu", rejected_connections);
+
+		// If there was a last error message, report it
+		if (context->proto_injector && context->proto_injector->dicom &&
+		    context->proto_injector->dicom->last_error_message[0] != '\0') {
+			log_write_dual(LOG_WARNING, "Last DICOM error: %s",
+			              context->proto_injector->dicom->last_error_message);
+		}
+	}
+
 	if( context->injector ){
 		inject_packet_release( context->injector );
 		context->injector = NULL;

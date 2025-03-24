@@ -107,46 +107,49 @@ static inline int _get_dicom_data_offset( const ipacket_t *ipacket ){
 int inject_proto_send_packet( inject_proto_context_t *context, const ipacket_t *ipacket, const uint8_t *packet_data, uint16_t packet_size ){
 	int offset;
 	int ret =  0, i;
+
+	printf("\n[PROTO DEBUG] === Protocol selection for packet %"PRIu64" ===\n", ipacket->packet_id);
+
 	//when SCTP injector is enable
 	if( context->sctp ){
 		offset = _get_sctp_data_offset( ipacket );
 		if( offset >= 0 ){
-			DEBUG("%"PRIu64" SCTP_DATA offset: %d", ipacket->packet_id, offset );
+			printf("[PROTO DEBUG] SCTP_DATA detected at offset: %d - using SCTP injector\n", offset);
 			ret += inject_sctp_send_packet(context->sctp, packet_data + offset, packet_size - offset);
 		}
 	}
 	if( context->udp ){
 		offset = _get_udp_data_offset( ipacket );
 		if( offset >= 0 ){
-			DEBUG("Packet_id %"PRIu64" UDP_DATA offset: %d", ipacket->packet_id, offset );
+			printf("[PROTO DEBUG] UDP_DATA detected at offset: %d - using UDP injector\n", offset);
 			ret += inject_udp_send_packet(context->udp, packet_data + offset, packet_size - offset);
 		}
 	}
 	if( context->http2 ){
 		offset = _get_http2_data_offset( ipacket );
-		//printf("%"PRIu64" HTTP2_DATA offset: %d\n", ipacket->packet_id,offset);
 		if( offset >= 0 ){
-			//printf("%"PRIu64" HTTP2_DATA offset: %d", ipacket->packet_id, offset );
-			//HTTP2 is a specific protocol which will reject the duplicated data having the same stream id
-			// we need to increase stream id each time sending one packet
+			printf("[PROTO DEBUG] HTTP2_DATA detected at offset: %d - using HTTP2 injector\n", offset);
 			ret += inject_http2_send_packet(context->http2, packet_data + offset, packet_size-offset);
 		}
 	}
 	if( context->tcp ){
 		offset = _get_tcp_data_offset( ipacket );
 		if( offset >= 0 ){
-			DEBUG("Packet_id %"PRIu64" TCP_DATA offset: %d", ipacket->packet_id, offset );
+			printf("[PROTO DEBUG] TCP_DATA detected at offset: %d - using TCP injector\n", offset);
 			ret += inject_tcp_send_packet(context->tcp, packet_data + offset, packet_size - offset);
 		}
 	}
 	if( context->dicom ){
 		offset = _get_dicom_data_offset( ipacket );
 		if( offset >= 0 ){
-			DEBUG("Packet_id %"PRIu64" DICOM_DATA offset: %d", ipacket->packet_id, offset );
+			printf("[PROTO DEBUG] DICOM_DATA detected at offset: %d - using DICOM injector\n", offset);
 			ret += inject_dicom_send_packet(context->dicom, packet_data + offset, packet_size - offset);
+		} else {
+			printf("[PROTO DEBUG] No DICOM_DATA detected - DICOM injector not used\n");
 		}
 	}
 
+	printf("[PROTO DEBUG] Protocol selection result: ret=%d\n", ret);
 	if( ret == 0 )
 		return INJECT_PROTO_NO_AVAIL;
 	return ret;
@@ -155,10 +158,35 @@ int inject_proto_send_packet( inject_proto_context_t *context, const ipacket_t *
 void inject_proto_release( inject_proto_context_t *context ){
 	if( context == NULL )
 		return;
+
+	// Track total dropped packets and rejected connections across all injectors
+	size_t total_dropped = 0;
+	size_t total_rejections = 0;
+
 	inject_sctp_release(context->sctp);
 	inject_udp_release(context->udp);
 	inject_http2_release(context->http2);
 	inject_tcp_release(context->tcp);
-	inject_dicom_release(context->dicom);
+
+	// DICOM injector has its own tracking of dropped packets and rejections
+	if (context->dicom) {
+		// The total_dropped_pkt and total_rejected_connections are reported by inject_dicom_release
+		total_dropped += context->dicom->total_dropped_pkt;
+		total_rejections += context->dicom->total_rejected_connections;
+
+		// The inject_dicom_release function will print its own summary
+		inject_dicom_release(context->dicom);
+	}
+
+	// Log the total dropped packets when more than one injector is used
+	if (context->sctp || context->udp || context->http2 || context->tcp) {
+		if (total_dropped > 0) {
+			printf("[!] Warning: A total of %zu packets were dropped across all injectors\n", total_dropped);
+		}
+		if (total_rejections > 0) {
+			printf("[!] Warning: A total of %zu connection rejections occurred across all injectors\n", total_rejections);
+		}
+	}
+
 	mmt_mem_free( context );
 }
