@@ -155,6 +155,8 @@ static inline void _clear_dicom_buffer_if_need(inject_dicom_context_t *context) 
 void _dicom_connect(inject_dicom_context_t *context) {
     int sockfd;
     struct sockaddr_in server_addr;
+    unsigned char buffer[BUFFER_SIZE];
+    ssize_t bytes_sent, bytes_received;
 
     // 1. Create a socket
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -176,7 +178,6 @@ void _dicom_connect(inject_dicom_context_t *context) {
         exit(EXIT_FAILURE);
     }
     printf("[DICOM] Successfully connected to DICOM server\n");
-
     /*
     // 4. Send A-ASSOCIATE RQ (Association Request)
     printf("Expected A-ASSOCIATE-RQ size: %lu bytes\n", sizeof(a_associate_rq));
@@ -188,7 +189,6 @@ void _dicom_connect(inject_dicom_context_t *context) {
         exit(EXIT_FAILURE);
     }
     printf("[+] A-ASSOCIATE RQ sent (%ld bytes)\n", bytes_sent);
-
     // 5. Wait for A-ASSOCIATE AC (Association Accept)
     bytes_received = recv(sockfd, buffer, BUFFER_SIZE, 0);
     if (bytes_received < 0) {
@@ -204,7 +204,6 @@ void _dicom_connect(inject_dicom_context_t *context) {
         printf("[-] Unexpected response received\n");
     }
     */
-
     // Assign socket to context client_fd
     context->client_fd = sockfd;
     context->shown_error = false;
@@ -289,9 +288,42 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
     _clear_dicom_buffer_if_need(context);
     context->total_pkt_to_send++;
 
-    // If this is a DICOM PDU, extract and log the type
+    // Debug: Print the first few bytes of the packet to diagnose PDU type issues
+    printf("[DICOM DEBUG] Packet #%zu first 8 bytes: ", context->total_pkt_to_send);
+    for (int i = 0; i < (packet_size < 8 ? packet_size : 8); i++) {
+        printf("%02X ", packet_data[i]);
+    }
+    printf("\n");
+
+    // Validate the PDU type - DICOM PDUs should start with types 01-07
     if (packet_size > 0) {
         uint8_t pdu_type = packet_data[0];
+        const char *pdu_type_str = "Unknown";
+
+        // If PDU type is outside valid range (01-07), this might not be a valid DICOM PDU
+        if (pdu_type < 0x01 || pdu_type > 0x07) {
+            printf("[DICOM WARNING] Invalid PDU type: 0x%02X - not a valid DICOM PDU\n", pdu_type);
+            printf("[DICOM WARNING] This may be raw TCP data or includes non-DICOM headers\n");
+
+            // Check for common TCP payload patterns
+            if (pdu_type == 0xBB || pdu_type == 0xCC) {
+                printf("[DICOM WARNING] Detected TCP packet with 0x%02X marker - skipping to avoid protocol violation\n", pdu_type);
+                context->total_dropped_pkt++;
+                return 0;  // Skip this packet to avoid protocol violations
+            }
+        } else {
+            // This is a valid PDU type - get its name
+            switch (pdu_type) {
+                case DICOM_PDU_ASSOCIATE_RQ: pdu_type_str = "ASSOCIATE-RQ"; break;
+                case DICOM_PDU_ASSOCIATE_AC: pdu_type_str = "ASSOCIATE-AC"; break;
+                case DICOM_PDU_ASSOCIATE_RJ: pdu_type_str = "ASSOCIATE-RJ"; break;
+                case DICOM_PDU_DATA_TF: pdu_type_str = "DATA-TF"; break;
+                case DICOM_PDU_RELEASE_RQ: pdu_type_str = "RELEASE-RQ"; break;
+                case DICOM_PDU_RELEASE_RP: pdu_type_str = "RELEASE-RP"; break;
+                case DICOM_PDU_ABORT: pdu_type_str = "ABORT"; break;
+            }
+            printf("[DICOM] Processing DICOM PDU type: %s (0x%02X)\n", pdu_type_str, pdu_type);
+        }
 
         // If this is an association request, extract the AE titles
         if (pdu_type == DICOM_PDU_ASSOCIATE_RQ && packet_size >= 42) {
@@ -303,7 +335,7 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
             strncpy(context->current_calling_ae_title, calling_ae, sizeof(context->current_calling_ae_title)-1);
             context->current_calling_ae_title[sizeof(context->current_calling_ae_title)-1] = '\0';
 
-            printf("[DICOM] Trying Calling AE: '%s', Called AE: '%s'\n",
+            printf("[DICOM] Association request with Calling AE: '%s', Called AE: '%s'\n",
                    calling_ae, called_ae);
         }
     }
