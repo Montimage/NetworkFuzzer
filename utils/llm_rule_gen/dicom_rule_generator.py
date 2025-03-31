@@ -14,20 +14,18 @@ from typing import Optional
 
 # Example rule template to use as a basis for generation
 EXAMPLE_RULE = """
+<beginning>
 <!-- Property 32: Modify the PDU length to be inconsistent with actual payload -->
 <embedded_functions><![CDATA[
     static void em_modify_dicom_pdu_len(
         const rule_info_t *rule, int verdict, uint64_t timestamp,
         uint64_t counter, const mmt_array_t * const trace) {
         int is_string = 0;
-        // int new_val = 0;  // Set PDU length to 0 byte
         int new_val = 10000;  // Set PDU length to 10000 bytes
         // Replace PDU length field (attribute ID 2 in protocol 701)
         replace_dicom_attribute(701, 2, &new_val, is_string);
         forward_packet();
     }
-
-    // Define wrapper function or modify if_satisfied as needed
 ]]></embedded_functions>
 <property property_id="32" type_property="FORWARD"
         description="Modify DICOM PDU length to invalid value (10000)"
@@ -35,6 +33,7 @@ EXAMPLE_RULE = """
     <event description="Got any DICOM packets"
         boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 8))"/>
 </property>
+</beginning>
 """
 
 # Common DICOM attribute information
@@ -147,6 +146,31 @@ def generate_rule_with_openai(prompt: str, model: str = "gpt-4") -> str:
         elif "```" in generated_rule:
             generated_rule = re.search(r"```\s*(.*?)\s*```", generated_rule, re.DOTALL).group(1)
 
+        # Get a unique property ID
+        unique_property_id = suggest_property_id()
+
+        # Replace property_id in the generated rule with our unique ID
+        generated_rule = re.sub(
+            r'property_id="(\d+)"',
+            f'property_id="{unique_property_id}"',
+            generated_rule
+        )
+
+        # Add a comment about the property ID being automatically assigned
+        if "<!-- Property" in generated_rule:
+            # Replace existing Property comment
+            generated_rule = re.sub(
+                r'<!-- Property \d+:',
+                f'<!-- Property {unique_property_id}:',
+                generated_rule
+            )
+        else:
+            # Add a comment at the beginning if not present
+            first_line_end = generated_rule.find('\n')
+            if first_line_end != -1:
+                comment = f"<!-- Property {unique_property_id}: Auto-assigned unique ID -->\n"
+                generated_rule = generated_rule[:first_line_end+1] + comment + generated_rule[first_line_end+1:]
+
         return generated_rule
 
     except Exception as e:
@@ -154,12 +178,41 @@ def generate_rule_with_openai(prompt: str, model: str = "gpt-4") -> str:
         return None
 
 def suggest_property_id() -> int:
-    """Suggest a new property ID for the rule (simple incrementing)"""
+    """Find the highest existing property ID in the rules directory and suggest the next available ID"""
     try:
-        # Try to find the highest existing property ID in the rules directory
-        max_id = 31  # Start from 31 as given in the example
+        # Start from a reasonable default
+        max_id = 31
+
+        # Check if rules directory exists
+        if os.path.exists("rules"):
+            # Get all XML files in the rules directory
+            xml_files = [f for f in os.listdir("rules") if f.endswith('.xml')]
+
+            # Extract property_ids from all rule files
+            for file in xml_files:
+                try:
+                    with open(os.path.join("rules", file), 'r') as f:
+                        content = f.read()
+                        # Find property_id="X" in the XML
+                        matches = re.findall(r'property_id="(\d+)"', content)
+                        if matches:
+                            for match in matches:
+                                try:
+                                    prop_id = int(match)
+                                    if prop_id > max_id:
+                                        max_id = prop_id
+                                except ValueError:
+                                    # Not a valid integer, skip
+                                    pass
+                except Exception as e:
+                    # If we can't read a file, just continue
+                    print(f"Warning: Could not read {file}: {e}")
+                    continue
+
+        # Return the next available ID
         return max_id + 1
-    except:
+    except Exception as e:
+        print(f"Warning: Error finding next property ID: {e}")
         # Default to a safe starting number if we can't determine existing IDs
         return 50
 
@@ -181,7 +234,12 @@ def save_rule_to_file(rule_content: str, filename: Optional[str] = None) -> str:
     # Make sure we have the rules directory
     os.makedirs("rules", exist_ok=True)
 
-    filepath = os.path.join("rules", filename)
+    # If filename already starts with 'rules/', don't add it again
+    if filename.startswith('rules/'):
+        filepath = filename
+    else:
+        filepath = os.path.join("rules", filename)
+
     with open(filepath, 'w') as f:
         f.write(rule_content)
 
@@ -210,7 +268,11 @@ def main():
     rule = generate_rule_with_openai(prompt, args.model)
 
     if rule:
-        print("\nGenerated Rule:")
+        # Extract the property_id assigned to the rule
+        property_id_match = re.search(r'property_id="(\d+)"', rule)
+        property_id = property_id_match.group(1) if property_id_match else "unknown"
+
+        print(f"\nGenerated Rule (Property ID: {property_id}):")
         print("-" * 80)
         print(rule)
         print("-" * 80)
@@ -218,6 +280,10 @@ def main():
         if args.save:
             filepath = save_rule_to_file(rule, args.output)
             print(f"\nRule saved to: {filepath}")
+            print(f"Property ID: {property_id} (automatically assigned to avoid conflicts)")
+        else:
+            print("\nRule generated successfully but not saved.")
+            print("Use -s option to save the rule to a file for later use.")
     else:
         print("Failed to generate a rule.")
 
