@@ -127,7 +127,7 @@ int generate(int argc, char **argv) {
     // Check if the script exists
     if (access(script_path, F_OK) == -1) {
         fprintf(stderr, "Error: Rule generator script not found at: %s\n", script_path);
-        fprintf(stderr, "Please ensure the Python script is installed in the utils/llm_rule_gen directory.\n");
+        //fprintf(stderr, "Please ensure the Python script is installed in the utils/llm_rule_gen directory.\n");
         return EXIT_FAILURE;
     }
 
@@ -146,9 +146,6 @@ int generate(int argc, char **argv) {
         fprintf(stderr, "2. Set the environment variable: export OPENAI_API_KEY='your-api-key-here'\n");
         fprintf(stderr, "\nSee utils/llm_rule_gen/README.md for more information.\n");
         return EXIT_FAILURE;
-    } else if (getenv("OPENAI_API_KEY") == NULL && env_file_exists) {
-        // Log that we found the .env file
-        log_write(LOG_INFO, "Using API key from .env file at %s", env_file_path);
     }
 
     // Build the command
@@ -203,9 +200,6 @@ int generate(int argc, char **argv) {
         strcat(command, prompt);
         strcat(command, "\"");
     }
-
-    // Execute the command
-    log_write(LOG_INFO, "Executing rule generator command: %s", command);
 
     int status = system(command);
 

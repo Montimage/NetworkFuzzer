@@ -15,6 +15,13 @@ from typing import Optional
 # Example rule template to use as a basis for generation
 EXAMPLE_RULE = """
 <beginning>
+<!-- Property 31: Drop DICOM packets -->
+<property value="COMPUTE" property_id="31" type_property="FORWARD"
+    description="Drop DICOM association request and accept packets" if_satisfied="#drop()">
+    <event description="DICOM packets"
+        boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 3))"/>
+</property>
+
 <!-- Property 32: Modify the PDU length to be inconsistent with actual payload -->
 <embedded_functions><![CDATA[
     static void em_modify_dicom_pdu_len(
@@ -101,9 +108,22 @@ def generate_rule_with_openai(prompt: str, model: str = "gpt-4") -> str:
         You are an expert in DICOM protocol testing and network fuzzing. Your task is to generate XML rules
         for testing DICOM attributes with valid or invalid values.
 
-        Below is an example rule structure that modifies the PDU length:
+        Below are example rule structures:
 
         {EXAMPLE_RULE}
+
+        There are two main types of rules you can generate:
+        1. Drop Rules: Use #drop() to drop specific DICOM packets
+           - Set value="COMPUTE" in the property tag
+           - Use if_satisfied="#drop()"
+           - Example: Drop association request/accept packets
+           - For drop rules, you don't need to use replace_dicom_attribute()
+           - Use boolean_expression to match the packets you want to drop
+
+        2. Modification Rules: Use replace_dicom_attribute() to modify packet contents
+           - Include embedded C function with replace_dicom_attribute()
+           - Set appropriate is_string flag (1 for strings, 0 for numbers)
+           - Example: Modify PDU length to invalid value
 
         Please generate a similar rule based on the user's request. The rule should:
         1. Include proper embedded C function with meaningful comments
