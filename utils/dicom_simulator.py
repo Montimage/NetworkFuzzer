@@ -197,8 +197,8 @@ def send_c_store(ae, dicom_folder, pacs_ip, pacs_port, pacs_ae_title):
     else:
         print("[-] Failed to connect.")
 
-def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
-    """Send a C-FIND request with dynamic query level."""
+def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT", patient_name_wildcard=None):
+    """Send a C-FIND request with dynamic query level and optional wildcard matching for Patient Name."""
     global current_association, operation_cancelled, current_query_model
     operation_cancelled = False
     current_query_model = PatientRootQueryRetrieveInformationModelFind
@@ -211,9 +211,15 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
 
     # Add required search attributes based on query level
     if query_level == "PATIENT":
-        query.PatientName = ""
+        # If wildcard pattern is provided, use it for PatientName
+        if patient_name_wildcard:
+            query.PatientName = patient_name_wildcard
+            print(f"[*] Searching for patients with name matching pattern: {patient_name_wildcard}")
+            print(f"[*] Using wildcard matching: '*' matches any sequence of characters, '?' matches any single character")
+        else:
+            query.PatientName = ""
+            print("[*] Searching for all patients")
         query.PatientID = ""
-        print("[*] Searching for all patients")
     elif query_level == "STUDY":
         # For study level, explicitly request all relevant fields
         query.StudyInstanceUID = ""
@@ -222,11 +228,17 @@ def send_c_find(ae, pacs_ip, pacs_port, pacs_ae_title, query_level="PATIENT"):
         query.AccessionNumber = ""
         query.StudyID = ""
         query.StudyDescription = ""
-        query.PatientName = ""
+        # If wildcard pattern is provided, use it for PatientName
+        if patient_name_wildcard:
+            query.PatientName = patient_name_wildcard
+            print(f"[*] Searching for studies with patient name matching pattern: {patient_name_wildcard}")
+            print(f"[*] Using wildcard matching: '*' matches any sequence of characters, '?' matches any single character")
+        else:
+            query.PatientName = ""
+            print("[*] Searching for all studies")
         query.PatientID = ""
         query.NumberOfStudyRelatedSeries = ""
         query.NumberOfStudyRelatedInstances = ""
-        print("[*] Searching for all studies")
     elif query_level == "SERIES":
         query.StudyInstanceUID = ""
         query.SeriesInstanceUID = ""
@@ -1052,6 +1064,9 @@ def main():
                         help="Specify the query level for C-FIND (default is 'PATIENT')")
     parser.add_argument("--retrieve_method", choices=["get", "move"], default="move",
                         help="Specify the retrieval method (C-GET or C-MOVE)")
+    parser.add_argument("--patient_name_wildcard",
+                        help="Wildcard pattern for Patient Name search (e.g., 'SMITH*' or 'J?HN'). "
+                             "Use '*' to match any sequence of characters, '?' to match any single character.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output for debugging")
     parser.add_argument("--log_file", help="Output file for detailed logging (for analyze-negotiation)")
     args = parser.parse_args()
@@ -1099,7 +1114,9 @@ def main():
         send_c_store(ae, args.dicom_folder, args.pacs_ip, args.pacs_port, args.called_ae_title)
     elif args.action == 'find':
         print("[*] Starting C-FIND operation (press Ctrl+C to send C-CANCEL)")
-        send_c_find(ae, args.pacs_ip, args.pacs_port, args.called_ae_title, query_level=args.query_level)
+        send_c_find(ae, args.pacs_ip, args.pacs_port, args.called_ae_title,
+                   query_level=args.query_level,
+                   patient_name_wildcard=args.patient_name_wildcard)
     elif args.action == 'retrieve':
         if not args.study_uid:
             print("Error: --study_uid is required for retrieval.")
