@@ -359,6 +359,10 @@ uint32_t update_dicom_data( u_char *data, uint32_t data_size, const ipacket_t *i
 		att_data_len = 1;
     	att_offset = 11;
 		break;
+	case 15:
+		att_data_len = 21;
+    	att_offset = 54;
+		break;
 	default:
         fprintf(stderr, "Unsupported modify attribute: %d",att_id);
         return ret;
@@ -541,6 +545,10 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
 		att_data_len = 1;
     	att_offset = 11;
 		break;
+	case 15:
+		att_data_len = 21; // TODO: flexible length
+		att_offset = 54;
+		break;
     default:
         fprintf(stderr, "Unsupported modify attribute: %d\n", att_id);
         return ret;
@@ -592,8 +600,10 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
 // }
 
 int get_dicom_attribute_info(uint32_t att_id, int *att_offset, int *att_data_len) {
+    printf("[DICOM DEBUG] Getting info for attribute ID: %d\n", att_id);
+
     switch (att_id) {
-		case 1:
+        case 1:
             *att_data_len = 1;
             *att_offset = 0;
             break;
@@ -613,14 +623,14 @@ int get_dicom_attribute_info(uint32_t att_id, int *att_offset, int *att_data_len
             *att_data_len = 16;
             *att_offset = 26;
             break;
-		case 6:
+        case 6:
             *att_data_len = 21;
             *att_offset = 78;
             break;
-		case 8:
-			*att_data_len = 4;
-			*att_offset = 295;
-			break;
+        case 8:
+            *att_data_len = 4;
+            *att_offset = 295;
+            break;
         case 10:
             *att_data_len = 4;
             *att_offset = 6;
@@ -629,10 +639,55 @@ int get_dicom_attribute_info(uint32_t att_id, int *att_offset, int *att_data_len
             *att_data_len = 1;
             *att_offset = 11;
             break;
+        case 15:  // Patient Name attribute
+            *att_data_len = 21;  // Based on hex dump, patient name is 30 bytes
+            *att_offset = 54;   // Based on hex dump, patient name starts at byte 112
+            printf("[DICOM DEBUG] Found patient name attribute (ID 15) - offset: %d, length: %d\n", *att_offset, *att_data_len);
+
+            // Print the patient name as a string
+            forward_packet_context_t *context = _get_current_context();
+            if (context != NULL) {
+                int index = get_protocol_index_by_id(context->ipacket, 701);
+                if (index != -1) {
+                    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+                    int patient_name_offset = dicom_offset + *att_offset;
+
+                    // Create a buffer for the patient name
+                    char patient_name[256] = {0};
+                    int copy_len = *att_data_len;
+                    if (patient_name_offset + copy_len > context->packet_size) {
+                        copy_len = context->packet_size - patient_name_offset;
+                    }
+
+                    // Copy the patient name
+                    memcpy(patient_name, &context->packet_data[patient_name_offset], copy_len);
+
+                    // Print the patient name in hex
+                    printf("[DICOM DEBUG] Patient name (hex): ");
+                    for (int i = 0; i < copy_len; i++) {
+                        printf("%02X ", (unsigned char)patient_name[i]);
+                    }
+                    printf("\n");
+
+                    // Print the patient name as a string, replacing non-printable characters with dots
+                    printf("[DICOM DEBUG] Patient name (string): '");
+                    for (int i = 0; i < copy_len; i++) {
+                        if (patient_name[i] >= 32 && patient_name[i] <= 126) {
+                            printf("%c", patient_name[i]);
+                        } else {
+                            printf(".");
+                        }
+                    }
+                    printf("'\n");
+                }
+            }
+            break;
         default:
             fprintf(stderr, "Unsupported modify attribute: %d\n", att_id);
             return -1;
     }
+
+    printf("[DICOM DEBUG] Attribute info - offset: %d, data length: %d\n", *att_offset, *att_data_len);
     return 0;
 }
 
@@ -652,6 +707,71 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
         return -1; // protocol not found
 
     unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+
+    // For patient name (ID 15), we need to handle it specially
+    if (att_id == 15) {
+        printf("[DICOM DEBUG] Modifying patient name attribute (ID 15)\n");
+
+        // Calculate the actual offset in the packet
+        int actual_offset = dicom_offset + att_offset;
+
+        // Check if we have enough space in the packet
+        if (actual_offset + att_data_len > context->packet_size) {
+            printf("[DICOM DEBUG] Packet too small to modify patient name. Packet size: %d, needed: %d\n",
+                   context->packet_size, actual_offset + att_data_len);
+            return -4;
+        }
+
+        // Create a buffer for the new patient name
+        char new_patient_name[256] = {0};
+
+        if (is_string) {
+            // For string values, fill with the new value
+            const char *val = (const char *)new_val;
+            int val_len = strlen(val);
+
+            // Fill the buffer with '1' characters
+            for (int i = 0; i < att_data_len; i++) {
+                new_patient_name[i] = '1';
+            }
+
+            // Print the new patient name
+            printf("[DICOM DEBUG] New patient name: '");
+            for (int i = 0; i < att_data_len; i++) {
+                printf("%c", new_patient_name[i]);
+            }
+            printf("'\n");
+
+            // Print the bytes before modification
+            printf("[DICOM DEBUG] Bytes before modification: ");
+            for (int i = 0; i < att_data_len; i++) {
+                printf("%02X ", (unsigned char)context->packet_data[actual_offset + i]);
+            }
+            printf("\n");
+
+            // Modify the patient name
+            memcpy(&context->packet_data[actual_offset], new_patient_name, att_data_len);
+
+            // Print the bytes after modification
+            printf("[DICOM DEBUG] Bytes after modification: ");
+            for (int i = 0; i < att_data_len; i++) {
+                printf("%02X ", (unsigned char)context->packet_data[actual_offset + i]);
+            }
+            printf("\n");
+        } else {
+            // For numeric values, convert to ASCII
+            u_char ascii_string[50] = {0};
+            int val = *(const int *)new_val;
+            if (!int_to_ascii_string(ascii_string, att_data_len * 2, (uint64_t)val)) {
+                return -2; // failed to convert numeric value
+            }
+
+            // Modify the patient name
+            memcpy(&context->packet_data[actual_offset], ascii_string, att_data_len);
+        }
+
+        return 1;
+    }
 
     u_char ascii_string[50] = {0}; // buffer to store a string ASCII converted
 
