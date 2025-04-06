@@ -360,7 +360,7 @@ uint32_t update_dicom_data( u_char *data, uint32_t data_size, const ipacket_t *i
     	att_offset = 11;
 		break;
 	case 15:
-		att_data_len = 21;
+		att_data_len = 9;
     	att_offset = 54;
 		break;
 	default:
@@ -546,7 +546,7 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
     	att_offset = 11;
 		break;
 	case 15:
-		att_data_len = 21; // TODO: flexible length
+		att_data_len = 9; // TODO: flexible length
 		att_offset = 54;
 		break;
     default:
@@ -640,8 +640,8 @@ int get_dicom_attribute_info(uint32_t att_id, int *att_offset, int *att_data_len
             *att_offset = 11;
             break;
         case 15:  // Patient Name attribute
-            *att_data_len = 21;  // Based on hex dump, patient name is 30 bytes
-            *att_offset = 54;   // Based on hex dump, patient name starts at byte 112
+            *att_data_len = 9;
+            *att_offset = 54;
             printf("[DICOM DEBUG] Found patient name attribute (ID 15) - offset: %d, length: %d\n", *att_offset, *att_data_len);
 
             // Print the patient name as a string
@@ -722,17 +722,37 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
             return -4;
         }
 
-        // Create a buffer for the new patient name
-        char new_patient_name[256] = {0};
+        // Print the bytes before modification
+        printf("[DICOM DEBUG] Bytes before modification: ");
+        for (int i = 0; i < att_data_len; i++) {
+            printf("%02X ", (unsigned char)context->packet_data[actual_offset + i]);
+        }
+        printf("\n");
 
         if (is_string) {
-            // For string values, fill with the new value
-            const char *val = (const char *)new_val;
+            // For string values, use the provided new value
+            // The new_val is a pointer to a string pointer, so we need to dereference it
+            const char *val = *(const char **)new_val;
+            printf("[DICOM DEBUG] Received new patient name: '%s'\n", val);
+
             int val_len = strlen(val);
 
-            // Fill the buffer with '1' characters
-            for (int i = 0; i < att_data_len; i++) {
-                new_patient_name[i] = '1';
+            // Check if the new value is too long
+            if (val_len > att_data_len) {
+                printf("[DICOM DEBUG] New patient name is too long (%d chars), truncating to %d chars\n",
+                       val_len, att_data_len);
+                val_len = att_data_len;
+            }
+
+            // Create a buffer for the new patient name
+            char new_patient_name[256] = {0};
+
+            // Copy the new value to the buffer
+            strncpy(new_patient_name, val, val_len);
+
+            // Fill the remaining space with spaces if needed
+            for (int i = val_len; i < att_data_len; i++) {
+                new_patient_name[i] = ' ';
             }
 
             // Print the new patient name
@@ -742,14 +762,7 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
             }
             printf("'\n");
 
-            // Print the bytes before modification
-            printf("[DICOM DEBUG] Bytes before modification: ");
-            for (int i = 0; i < att_data_len; i++) {
-                printf("%02X ", (unsigned char)context->packet_data[actual_offset + i]);
-            }
-            printf("\n");
-
-            // Modify the patient name
+            // Modify only the patient name value, preserving the original tag, VR, and length
             memcpy(&context->packet_data[actual_offset], new_patient_name, att_data_len);
 
             // Print the bytes after modification
@@ -766,7 +779,7 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
                 return -2; // failed to convert numeric value
             }
 
-            // Modify the patient name
+            // Modify only the patient name value
             memcpy(&context->packet_data[actual_offset], ascii_string, att_data_len);
         }
 

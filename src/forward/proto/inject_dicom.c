@@ -9,6 +9,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <time.h>
 
 #include "inject_dicom.h"
 #include "../../lib/mmt_lib.h"
@@ -19,6 +20,7 @@
 #define BUFFER_SIZE 4096
 #define MAX_RETRIES 3  // Number of times to retry sending a packet
 
+// A-ASSOCIATE-RQ packet with exact byte values from the hex dump
 const unsigned char a_associate_rq[] = {
     // PDU Type and Length
     0x01, 0x00, 0x00, 0x00, 0x01, 0x9d,
@@ -111,9 +113,18 @@ static void parse_dicom_response(inject_dicom_context_t *context, const unsigned
         return;
     }
 
-    context->last_response_code = buffer[0];
+    // Check if the PDU type is at the beginning of the packet
+    uint8_t pdu_type = buffer[0];
 
-    switch(buffer[0]) {
+    // If the first byte is 0x00, check if the PDU type is at offset 4
+    if (pdu_type == 0x00 && bytes_received >= 5) {
+        pdu_type = buffer[4];
+        printf("[DICOM DEBUG] PDU type found at offset 4: 0x%02X\n", pdu_type);
+    }
+
+    context->last_response_code = pdu_type;
+
+    switch(pdu_type) {
         case DICOM_PDU_ASSOCIATE_AC:
             strcpy(context->last_error_message, "Association accepted");
             break;
@@ -159,7 +170,6 @@ static void parse_dicom_response(inject_dicom_context_t *context, const unsigned
             break;
 
         case DICOM_PDU_DATA_TF:
-            strcpy(context->last_error_message, "Data transfer response received");
             break;
 
         case DICOM_PDU_ABORT:
@@ -176,7 +186,7 @@ static void parse_dicom_response(inject_dicom_context_t *context, const unsigned
             break;
 
         default:
-            snprintf(context->last_error_message, BUFFER_SIZE, "Unknown PDU type: %d", buffer[0]);
+            snprintf(context->last_error_message, BUFFER_SIZE, "Unknown PDU type: %d", pdu_type);
             break;
     }
 }
@@ -257,6 +267,7 @@ inject_dicom_context_t* inject_dicom_alloc(const forward_packet_target_conf_t *c
     context->total_rejected_connections = 0; // Initialize rejected connections counter
     strcpy(context->last_error_message, "No errors");
     context->last_response_code = 0;
+    context->found_patient_results = 0; // Initialize patient search results flag
 
     // Initialize AE title tracking fields
     memset(context->current_calling_ae_title, 0, sizeof(context->current_calling_ae_title));
@@ -269,8 +280,11 @@ inject_dicom_context_t* inject_dicom_alloc(const forward_packet_target_conf_t *c
 // Helper function to check for and handle DICOM responses
 static int receive_dicom_response(inject_dicom_context_t *context) {
     unsigned char buffer[BUFFER_SIZE];
-    int bytes_received;
+    int total_bytes_received = 0;
     struct timeval timeout;
+    int complete_response = 0;
+    time_t start_time = time(NULL);
+    const int MAX_WAIT_SECONDS = 5; // Maximum time to wait for a complete response
 
     // Set a short timeout (100ms) to check for responses without blocking too long
     timeout.tv_sec = 0;
@@ -281,10 +295,117 @@ static int receive_dicom_response(inject_dicom_context_t *context) {
     }
 
     memset(buffer, 0, BUFFER_SIZE);
-    bytes_received = recv(context->client_fd, buffer, BUFFER_SIZE, 0);
 
-    if (bytes_received > 0) {
-        parse_dicom_response(context, buffer, bytes_received);
+    // Keep reading until we get a complete response or timeout
+    while (!complete_response && total_bytes_received < BUFFER_SIZE) {
+        // Check if we've exceeded the maximum wait time
+        if (time(NULL) - start_time > MAX_WAIT_SECONDS) {
+            printf("[DICOM DEBUG] Timeout waiting for complete response after %d seconds\n", MAX_WAIT_SECONDS);
+            break;
+        }
+
+        int bytes_received = recv(context->client_fd,
+                                 buffer + total_bytes_received,
+                                 BUFFER_SIZE - total_bytes_received,
+                                 0);
+
+        if (bytes_received > 0) {
+            total_bytes_received += bytes_received;
+
+            // Check if we have a complete response
+            // For DATA-TF PDUs, we need at least 6 bytes for the header
+            if (total_bytes_received >= 6) {
+                // If this is a DATA-TF PDU, check if we have the complete PDU
+                if (buffer[0] == DICOM_PDU_DATA_TF) {
+                    // Extract the PDU length from bytes 2-5 (4 bytes, big-endian)
+                    uint32_t pdu_len = (buffer[2] << 24) | (buffer[3] << 16) |
+                                      (buffer[4] << 8) | buffer[5];
+
+                    printf("[DICOM DEBUG] DATA-TF PDU detected with length: %u bytes\n", pdu_len);
+
+                    // Check if we have the complete PDU
+                    if (total_bytes_received >= pdu_len + 6) {
+                        complete_response = 1;
+                        printf("[DICOM DEBUG] Complete DATA-TF PDU received (%d bytes)\n", total_bytes_received);
+                    } else {
+                        printf("[DICOM DEBUG] Incomplete DATA-TF PDU: received %d/%d bytes\n",
+                               total_bytes_received, pdu_len + 6);
+                    }
+                } else {
+                    // For other PDU types, assume we have a complete response
+                    complete_response = 1;
+                    printf("[DICOM DEBUG] Complete non-DATA-TF PDU received (%d bytes)\n", total_bytes_received);
+                }
+            }
+        } else if (bytes_received == 0) {
+            // Connection closed by server
+            printf("[DICOM DEBUG] Connection closed by server\n");
+            break;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            // An actual error occurred
+            printf("[DICOM DEBUG] Error receiving data: %s\n", strerror(errno));
+            break;
+        }
+    }
+
+    if (total_bytes_received > 0) {
+        // Print the total number of bytes received
+        printf("[DICOM DEBUG] Total bytes received: %d\n", total_bytes_received);
+
+        // Print all bytes received in hex format
+        printf("[DICOM DEBUG] All bytes received (hex): ");
+        for (int i = 0; i < total_bytes_received; i++) {
+            printf("%02X ", buffer[i]);
+            // Add a newline every 16 bytes for readability
+            if ((i + 1) % 16 == 0 && i < total_bytes_received - 1) {
+                printf("\n[DICOM DEBUG]                    ");
+            }
+        }
+        printf("\n");
+
+        // Debug: Print the first few bytes of the response
+        printf("[DICOM DEBUG] Response first 8 bytes: ");
+        for (int i = 0; i < (total_bytes_received < 8 ? total_bytes_received : 8); i++) {
+            printf("%02X ", buffer[i]);
+        }
+        printf("\n");
+
+        // For DATA-TF PDUs, we might not always get a response
+        // This is normal and not an error condition
+        if (buffer[0] == DICOM_PDU_DATA_TF) {
+            printf("[DICOM] Received DATA-TF response\n");
+
+            // Extract the PDU length from bytes 2-5 (4 bytes, big-endian)
+            uint32_t pdu_len = (buffer[2] << 24) | (buffer[3] << 16) | (buffer[4] << 8) | buffer[5];
+
+            printf("[DICOM DEBUG] DATA-TF PDU length: %u bytes (0x%08X)\n", pdu_len, pdu_len);
+
+            // Determine if we got results based on total bytes received
+            // If total_bytes_received > 100, we got results
+            if (total_bytes_received > 100) {
+                printf("[DICOM DEBUG] Patient search results found! Total response: %d bytes (threshold: 100)\n", total_bytes_received);
+                snprintf(context->last_error_message, BUFFER_SIZE,
+                         "Data transfer response received with patient search results (Total bytes: %d)", total_bytes_received);
+
+                // Update the summary to indicate we found results
+                context->found_patient_results = 1;
+            } else {
+                printf("[DICOM DEBUG] No patient search results found. Total response: %d bytes (threshold: 100)\n", total_bytes_received);
+                snprintf(context->last_error_message, BUFFER_SIZE,
+                         "Data transfer response received with no patient search results (Total bytes: %d)", total_bytes_received);
+
+                // Update the summary to indicate we didn't find results
+                context->found_patient_results = 0;
+            }
+
+            // Check for PDV flags
+            if (total_bytes_received >= 10) {
+                uint8_t pdv_flags = buffer[9];
+                printf("[DICOM DEBUG] PDV flags: 0x%02X\n", pdv_flags);
+            }
+        }
+
+        parse_dicom_response(context, buffer, total_bytes_received);
         printf("[DICOM] Response: %s\n", context->last_error_message);
 
         // If we got an accept, save the current AE title
@@ -303,7 +424,7 @@ static int receive_dicom_response(inject_dicom_context_t *context) {
         }
 
         return 1;
-    } else if (bytes_received == 0) {
+    } else if (total_bytes_received == 0) {
         // Connection closed by server
         strcpy(context->last_error_message, "Connection closed by server");
         printf("[-] Connection closed by server\n");
@@ -316,6 +437,8 @@ static int receive_dicom_response(inject_dicom_context_t *context) {
     }
 
     // No response available (timeout)
+    // This is normal for DATA-TF PDUs, which don't always require a response
+    printf("[DICOM DEBUG] No response received within timeout period\n");
     return 0;
 }
 
@@ -334,8 +457,9 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
     printf("\n");
 
     // Validate the PDU type - DICOM PDUs should start with types 01-07
+    uint8_t pdu_type = 0;
     if (packet_size > 0) {
-        uint8_t pdu_type = packet_data[0];
+        pdu_type = packet_data[0];
         const char *pdu_type_str = "Unknown";
 
         // If PDU type is outside valid range (01-07), this might not be a valid DICOM PDU
@@ -361,6 +485,15 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
                 case DICOM_PDU_ABORT: pdu_type_str = "ABORT"; break;
             }
             printf("[DICOM] Processing DICOM PDU type: %s (0x%02X)\n", pdu_type_str, pdu_type);
+
+            // For DATA-TF PDUs, we need to check if we have an active association
+            if (pdu_type == DICOM_PDU_DATA_TF) {
+                // Check if we have a valid association
+                if (context->last_successful_ae_title[0] == '\0') {
+                    printf("[DICOM WARNING] Attempting to send DATA-TF without an active association\n");
+                    printf("[DICOM WARNING] This may result in the packet being dropped by the server\n");
+                }
+            }
         }
 
         // If this is an association request, extract the AE titles
@@ -381,7 +514,6 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
     for (int i = 0; i < context->nb_copies; i++) {
         int retry_count = 0;
         int sent = 0;
-        int connection_reset = 0;
 
         while (retry_count < MAX_RETRIES) {
             ret = send(context->client_fd, packet_data, packet_size, 0);
@@ -394,6 +526,17 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
                 // After sending, wait briefly for a response
                 int response = receive_dicom_response(context);
 
+                // If this is a DATA-TF PDU, we need to check if we got a response with patient search results
+                if (pdu_type == DICOM_PDU_DATA_TF && response > 0) {
+                    // The receive_dicom_response function already updates context->found_patient_results
+                    // based on the PDU length of the response packet
+                    if (context->found_patient_results) {
+                        printf("[DICOM] Patient search results found in response to modified packet!\n");
+                    } else {
+                        printf("[DICOM] No patient search results found in response to modified packet.\n");
+                    }
+                }
+
                 if (response < 0) {
                     // Connection issue detected, reconnect
                     printf("[DICOM] Connection issue detected, reconnecting\n");
@@ -402,7 +545,6 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
 
                     // If this was a connection reset, we should retry sending this packet
                     if (errno == ECONNRESET) {
-                        connection_reset = 1;
                         sent = 0;  // Reset sent flag to try again
                         continue;  // Skip to next iteration without incrementing retry_count
                     }
@@ -419,7 +561,7 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
                     printf("[DICOM] Broken pipe detected. Reconnecting...\n");
                     close(context->client_fd);
                     _dicom_connect(context);
-                    connection_reset = 1;
+                    sent = 0;  // Reset sent flag to try again
                 }
 
                 // Small delay before retrying
@@ -455,6 +597,12 @@ void inject_dicom_release(inject_dicom_context_t *context) {
     // Report last error message
     printf("[+] Last DICOM message: %s\n", context->last_error_message);
 
+    // Report patient search results
+    if (context->found_patient_results) {
+        printf("[+] Patient search results were found!\n");
+    } else {
+        printf("[+] No patient search results were found.\n");
+    }
     // Report last successful AE title
     if (context->last_successful_ae_title[0] != '\0') {
         printf("[+] FOUND WORKING AE TITLE: '%s'\n", context->last_successful_ae_title);
