@@ -39,6 +39,7 @@ struct inject_dicom_context_struct {
     size_t total_rejected_connections;
     char last_error_message[4096]; // Use same size as BUFFER_SIZE in .c file
     int last_response_code;
+    bool found_patient_results; // Flag to track if patient search results were found
 
     // Fields for tracking AE titles
     char current_calling_ae_title[17]; // Current AE Title being tried
