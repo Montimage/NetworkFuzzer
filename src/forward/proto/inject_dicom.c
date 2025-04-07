@@ -15,8 +15,6 @@
 #include "../../lib/mmt_lib.h"
 
 #define MAX_PDU_SIZE 16384
-#define SERVER_IP   "192.168.126.124"  // TODO: get IP from config file
-#define SERVER_PORT 4242               // Standard DICOM port
 #define BUFFER_SIZE 4096
 #define MAX_RETRIES 3  // Number of times to retry sending a packet
 
@@ -213,11 +211,15 @@ void _dicom_connect(inject_dicom_context_t *context) {
         exit(EXIT_FAILURE);
     }
 
-    // 2. Set up server address
+    // 2. Set up server address using configured host and port
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
-    printf("[DICOM] Connecting to server: %s:%d\n", SERVER_IP, SERVER_PORT);
+    server_addr.sin_port = htons(context->port);
+    if (inet_pton(AF_INET, context->host, &server_addr.sin_addr) <= 0) {
+        printf("[-] Invalid address: %s\n", context->host);
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+    printf("[DICOM] Connecting to server: %s:%d\n", context->host, context->port);
 
     // 3. Connect to the DICOM server
     if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
