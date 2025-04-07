@@ -27,6 +27,7 @@
 #include "../engine/verdict_printer.h"
 #include "../engine/rule.h"
 #include "../forward/forward_packet.h"
+#include "../forward/proto/inject_dicom.h"
 
 typedef struct context_struct{
 	mmt_sec_handler_t *sec_handler;
@@ -58,6 +59,7 @@ void usage(const char * prg_name) {
 				DEFAULT_CONFIG_FILE);
 	printf("\t-t <trace file>  : Gives the trace file for offline analyse.\n");
 	printf("\t-i <interface>   : Gives the interface name for live traffic analysis.\n");
+	printf("\t-A               : Send A-ASSOCIATE-RQ during DICOM connections (disabled by default).\n");
 	printf("\t-X attr=value    : Override configuration attributes.\n");
 	printf("\t                    For example \"-X output.enable=true -Xoutput.output-dir=/tmp/\" will enable output to file and change output directory to /tmp.\n");
 	printf("\t                    This parameter can appear several times.\n");
@@ -78,7 +80,7 @@ static inline config_t *_parse_options(int argc, char ** argv ) {
 	int opt;
 	const char *config_file = DEFAULT_CONFIG_FILE;
 	config_t *conf = NULL;
-	const char *options = "t:i:c:X:xh";
+	const char *options = "t:i:c:X:xhA";
 
 	//to get config
 	extern char *optarg;
@@ -97,6 +99,7 @@ static inline config_t *_parse_options(int argc, char ** argv ) {
 			conf_print_identities_list();
 			exit( EXIT_SUCCESS );
 			break;
+		case 'A':
 		case 'X':
 		case 't':
 		case 'i':
@@ -133,7 +136,10 @@ static inline config_t *_parse_options(int argc, char ** argv ) {
 			//switch to online mode
 			conf->input->input_mode = ONLINE_ANALYSIS;
 			break;
-
+		case 'A':
+			// Set the global variable to true when -A is provided
+			g_send_associate_rq = true;
+			break;
 		case 'X':
 			//example: -X file-output.enable=true
 			//we will separate the phrase "file-output.enable=true" into 2
@@ -477,37 +483,6 @@ static int _packet_handle( const ipacket_t *ipacket, void *args ) {
 	}
 
 	mmt_sec_process( context->sec_handler, msg );
-
-//TODO: remve this block
-//#ifdef MODULE_ADD_OR_RM_RULES_RUNTIME
-//	if( total_received_reports == 1000 ){
-//		DEBUG("Add %zu rules", _add_rules("(1:33,32,34)"));
-//		//need to add/rm or not?
-//		if( _rand_bool() ){
-//			printf("\n%zu\n", total_received_reports );
-//			//add or rm rules?
-//			if( _rand_bool() ){
-//				//rm random rules ID
-//				int nb_rules_to_rm = _rand_int( 5 );
-//				for( i=0; i<nb_rules_to_rm; i++ )
-//					rm_rules_arr[i] = _rand_int( 50 );
-//				mmt_sec_remove_rules( nb_rules_to_rm, rm_rules_arr );
-//			}else{
-//				//add
-//				int nb_rules_to_add = _rand_int( 5 );
-//				ch = string;
-//				ch += sprintf(string, "(%d:", _rand_int(9) );
-//				for( i=0; i<nb_rules_to_add; i++ )
-//					ch += sprintf(ch, "%d,", _rand_int( 50 ) );
-//				*ch = '\0';
-//				*(ch - 1) = ')';
-//
-//				_add_rules( string );
-//
-//			}
-//		}
-//	}
-//#endif
 
 	total_received_reports ++;
 

@@ -13,10 +13,16 @@
 
 #include "inject_dicom.h"
 #include "../../lib/mmt_lib.h"
+#include "../../engine/configure.h"
 
 #define MAX_PDU_SIZE 16384
 #define BUFFER_SIZE 4096
 #define MAX_RETRIES 3  // Number of times to retry sending a packet
+#define DEFAULT_CONFIG_FILE "./networkfuzzer.conf"
+
+// Global variable to control whether to send A-ASSOCIATE-RQ
+// Default is false (don't send), set to true when -A option is used
+bool g_send_associate_rq = false;
 
 // A-ASSOCIATE-RQ packet with exact byte values from the hex dump
 const unsigned char a_associate_rq[] = {
@@ -228,32 +234,22 @@ void _dicom_connect(inject_dicom_context_t *context) {
         exit(EXIT_FAILURE);
     }
     printf("[DICOM] Successfully connected to DICOM server\n");
-    /*
-    // 4. Send A-ASSOCIATE RQ (Association Request)
-    printf("Expected A-ASSOCIATE-RQ size: %lu bytes\n", sizeof(a_associate_rq));
 
-    bytes_sent = send(sockfd, a_associate_rq, sizeof(a_associate_rq), 0);
-    if (bytes_sent < 0) {
-        perror("[-] Failed to send A-ASSOCIATE RQ");
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    }
-    printf("[+] A-ASSOCIATE RQ sent (%ld bytes)\n", bytes_sent);
-    // 5. Wait for A-ASSOCIATE AC (Association Accept)
-    bytes_received = recv(sockfd, buffer, BUFFER_SIZE, 0);
-    if (bytes_received < 0) {
-        perror("[-] Failed to receive A-ASSOCIATE AC");
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    }
+    // 4. Send A-ASSOCIATE RQ (Association Request) if enabled
+    if (g_send_associate_rq) {
+        printf("Expected A-ASSOCIATE-RQ size: %lu bytes\n", sizeof(a_associate_rq));
 
-    // 6. Check if it's an A-ASSOCIATE AC
-    if (buffer[0] == 0x02) {
-        printf("[+] Received A-ASSOCIATE AC (%ld bytes)\n", bytes_received);
+        bytes_sent = send(sockfd, a_associate_rq, sizeof(a_associate_rq), 0);
+        if (bytes_sent < 0) {
+            perror("[-] Failed to send A-ASSOCIATE RQ");
+            close(sockfd);
+            exit(EXIT_FAILURE);
+        }
+        printf("[+] A-ASSOCIATE RQ sent (%ld bytes)\n", bytes_sent);
     } else {
-        printf("[-] Unexpected response received\n");
+        printf("[DICOM] Skipping A-ASSOCIATE RQ as per configuration\n");
     }
-    */
+
     // Assign socket to context client_fd
     context->client_fd = sockfd;
     context->shown_error = false;

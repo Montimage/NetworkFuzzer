@@ -23,6 +23,9 @@
 #define DICOM_REJ_TEMP_LOCAL_LIMIT               3
 #define DICOM_REJ_PERM_CALLING_AE_NOT_RECOGNIZED 7
 
+// Global variable to control whether to send A-ASSOCIATE-RQ
+extern bool g_send_associate_rq;
+
 // Forward declare the context struct
 typedef struct inject_dicom_context_struct inject_dicom_context_t;
 
