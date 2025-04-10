@@ -3,6 +3,40 @@ import subprocess
 import sys
 import shutil
 import csv
+import logging
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("process_pcaps.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# List of DICOM fields to extract with tshark
+DICOM_FIELDS = [
+    "ip.src", "ip.dst", "tcp.srcport", "tcp.dstport",
+    "dicom.pdu.type", "dicom.pdu.len", "dicom.assoc.version",
+    "dicom.assoc.ae.called", "dicom.assoc.ae.calling",
+    "dicom.assoc.reject.result", "dicom.assoc.reject.source", "dicom.assoc.reject.reason",
+    "dicom.assoc.abort.source", "dicom.assoc.abort.reason",
+    "dicom.assoc.item.type", "dicom.assoc.item.len", "dicom.actx",
+    "dicom.pctx.id", "dicom.pctx.result", "dicom.pctx.abss.syntax", "dicom.pctx.xfer.syntax",
+    "dicom.userinfo.uid", "dicom.userinfo.version", "dicom.userinfo.extneg.sopclassuid",
+    "dicom.userinfo.extneg.relational", "dicom.userinfo.extneg.datetimematching",
+    "dicom.userinfo.extneg.fuzzymatching", "dicom.userinfo.extneg.timezone",
+    "dicom.userinfo.rolesel.sopclassuid", "dicom.userinfo.rolesel.scurole",
+    "dicom.userinfo.rolesel.scprole", "dicom.userinfo.asyncneg.maxnumopsinv",
+    "dicom.userinfo.asyncneg.maxnumopsper", "dicom.userinfo.user_identify.type",
+    "dicom.userinfo.user_identify.response_requested", "dicom.userinfo.user_identify.primary_field",
+    "dicom.userinfo.user_identify.secondary_field", "dicom.max_pdu_len", "dicom.pdv.len",
+    "dicom.pdv.ctx", "dicom.pdv.flags", "dicom.tag", "dicom.tag.vr", "dicom.tag.vl",
+    "dicom.tag.value.str"
+]
 
 def process_single_pcap_cicflowmeter(pcap_path, output_path=None):
     """
@@ -38,7 +72,7 @@ def process_single_pcap_cicflowmeter(pcap_path, output_path=None):
 
     # Run the cicflowmeter command to process the .pcap file
     try:
-        print(f"Processing with cicflowmeter: {pcap_path} -> {csv_path}")
+        logger.info(f"Processing with cicflowmeter: {pcap_path} -> {csv_path}")
         subprocess.run([
             "cicflowmeter",
             "-f", pcap_path,
@@ -46,7 +80,7 @@ def process_single_pcap_cicflowmeter(pcap_path, output_path=None):
         ], check=True)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Error processing {pcap_path} with cicflowmeter: {e}")
+        logger.error(f"Error processing {pcap_path} with cicflowmeter: {e}")
         return False
 
 def process_single_pcap_zeek(pcap_path, output_path=None):
@@ -107,7 +141,7 @@ def process_single_pcap_zeek(pcap_path, output_path=None):
         os.chdir(temp_dir)
 
         # Add -C flag to ignore checksums based on the warning message
-        print(f"Processing with Zeek: {pcap_path}")
+        logger.info(f"Processing with Zeek: {pcap_path}")
         subprocess.run([
             "/usr/local/zeek/bin/zeek",
             "-C",  # Ignore checksums
@@ -118,10 +152,10 @@ def process_single_pcap_zeek(pcap_path, output_path=None):
         if os.path.exists("conn.log"):
             # Move and rename conn.log to the output path
             shutil.copy("conn.log", log_path)
-            print(f"Zeek conn.log copied to: {log_path}")
+            logger.info(f"Zeek conn.log copied to: {log_path}")
 
             # Process the conn.log to CSV
-            print(f"Converting conn.log to CSV: {csv_path}")
+            logger.info(f"Converting conn.log to CSV: {csv_path}")
 
             # Initialize variables
             fields = []  # Column headers
@@ -147,29 +181,85 @@ def process_single_pcap_zeek(pcap_path, output_path=None):
                 writer.writerow(fields)  # Write headers
                 writer.writerows(data_rows)  # Write rows
 
-            print(f"CSV file generated: {csv_path}")
+            logger.info(f"CSV file generated: {csv_path}")
 
             # Clean up
             os.chdir(original_dir)
             shutil.rmtree(temp_dir)
             return True
         else:
-            print(f"Error: Zeek did not generate conn.log for {pcap_path}")
+            logger.error(f"Error: Zeek did not generate conn.log for {pcap_path}")
             os.chdir(original_dir)
             shutil.rmtree(temp_dir)
             return False
 
     except subprocess.CalledProcessError as e:
-        print(f"Error processing {pcap_path} with Zeek: {e}")
+        logger.error(f"Error processing {pcap_path} with Zeek: {e}")
         os.chdir(original_dir)
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         return False
     except Exception as e:
-        print(f"Unexpected error processing {pcap_path} with Zeek: {e}")
+        logger.error(f"Unexpected error processing {pcap_path} with Zeek: {e}")
         os.chdir(original_dir)
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+        return False
+
+def process_single_pcap_tshark(pcap_path, output_path=None):
+    """
+    Process a single .pcap file using tshark, extracting DICOM fields to a CSV file.
+
+    Args:
+        pcap_path (str): Path to the .pcap file.
+        output_path (str, optional): Path for the output CSV file. If None, uses the same path as the input with .csv extension.
+
+    Returns:
+        bool: True if processing was successful, False otherwise.
+    """
+    # Convert to absolute paths to avoid issues
+    pcap_path = os.path.abspath(pcap_path)
+
+    # Determine output CSV path
+    if output_path is None:
+        csv_path = os.path.splitext(pcap_path)[0] + "_dicom.csv"
+    else:
+        output_path = os.path.abspath(output_path)
+        if os.path.isdir(output_path):
+            # If output is a directory, use the original filename with _dicom.csv extension in that directory
+            filename = os.path.basename(os.path.splitext(pcap_path)[0]) + "_dicom.csv"
+            csv_path = os.path.join(output_path, filename)
+        else:
+            # Use the exact output path specified
+            csv_path = output_path
+
+    # Create output directory if it doesn't exist
+    output_dir = os.path.dirname(csv_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Run the tshark command to extract DICOM fields
+    try:
+        logger.info(f"Processing with tshark: {pcap_path} -> {csv_path}")
+
+        # Build the command with all DICOM fields
+        fields_args = sum([["-e", field] for field in DICOM_FIELDS], [])
+        command = [
+            "tshark", "-r", pcap_path, "-Y", "dicom", "-T", "fields",
+            "-E", "separator=,", "-E", "quote=d", "-E", "header=y"
+        ] + fields_args
+
+        # Run the command and write output to the CSV file
+        with open(csv_path, "w") as f:
+            subprocess.run(command, stdout=f, check=True)
+
+        logger.info(f"CSV file generated: {csv_path}")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error processing {pcap_path} with tshark: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error processing {pcap_path} with tshark: {e}")
         return False
 
 def process_single_pcap(pcap_path, output_path=None, mode="cicflowmeter"):
@@ -179,19 +269,19 @@ def process_single_pcap(pcap_path, output_path=None, mode="cicflowmeter"):
     Args:
         pcap_path (str): Path to the .pcap file.
         output_path (str, optional): Path for the output file. If None, uses the same path as the input with appropriate extension.
-        mode (str): Processing mode - 'cicflowmeter' or 'zeek'.
+        mode (str): Processing mode - 'cicflowmeter', 'zeek', or 'tshark'.
 
     Returns:
         bool: True if processing was successful, False otherwise.
     """
     # Ensure the input file exists
     if not os.path.exists(pcap_path):
-        print(f"Error: The file '{pcap_path}' does not exist.")
+        logger.error(f"Error: The file '{pcap_path}' does not exist.")
         return False
 
     # Ensure the file is a .pcap file
     if not pcap_path.endswith(".pcap"):
-        print(f"Error: The file '{pcap_path}' is not a .pcap file.")
+        logger.error(f"Error: The file '{pcap_path}' is not a .pcap file.")
         return False
 
     # Process based on mode
@@ -199,8 +289,10 @@ def process_single_pcap(pcap_path, output_path=None, mode="cicflowmeter"):
         return process_single_pcap_cicflowmeter(pcap_path, output_path)
     elif mode.lower() == "zeek":
         return process_single_pcap_zeek(pcap_path, output_path)
+    elif mode.lower() == "tshark":
+        return process_single_pcap_tshark(pcap_path, output_path)
     else:
-        print(f"Error: Unsupported mode '{mode}'. Use 'cicflowmeter' or 'zeek'.")
+        logger.error(f"Error: Unsupported mode '{mode}'. Use 'cicflowmeter', 'zeek', or 'tshark'.")
         return False
 
 def process_pcap_files(input_folder, output_folder=None, mode="cicflowmeter"):
@@ -210,11 +302,11 @@ def process_pcap_files(input_folder, output_folder=None, mode="cicflowmeter"):
     Args:
         input_folder (str): Path to the folder containing .pcap files.
         output_folder (str, optional): Directory to store output files. If None, files are placed alongside PCAP files.
-        mode (str): Processing mode - 'cicflowmeter' or 'zeek'.
+        mode (str): Processing mode - 'cicflowmeter', 'zeek', or 'tshark'.
     """
     # Ensure the input folder exists
     if not os.path.exists(input_folder):
-        print(f"Error: The folder '{input_folder}' does not exist.")
+        logger.error(f"Error: The folder '{input_folder}' does not exist.")
         return
 
     # Create output directory if specified and doesn't exist
@@ -262,9 +354,11 @@ if __name__ == "__main__":
         print("\nProcessing Modes:")
         print("  cicflowmeter         Process PCAP files using cicflowmeter, outputs CSV files")
         print("  zeek                 Process PCAP files using Zeek, outputs both LOG and CSV files")
+        print("  tshark               Process PCAP files using tshark, extracts DICOM fields to CSV")
         print("\nExamples:")
         print("  python process_pcaps.py -f capture.pcap -m zeek -o results.log")
         print("  python process_pcaps.py -d pcap_collection/ -o output_folder/ -m cicflowmeter")
+        print("  python process_pcaps.py -f dicom_capture.pcap -m tshark -o dicom_features.csv")
         sys.exit(1)
 
     # Parse arguments
@@ -302,8 +396,8 @@ if __name__ == "__main__":
         elif sys.argv[i] == "-m":
             if i + 1 < len(sys.argv):
                 mode = sys.argv[i + 1].lower()
-                if mode not in ["cicflowmeter", "zeek"]:
-                    print(f"Error: Unsupported mode '{mode}'. Use 'cicflowmeter' or 'zeek'.")
+                if mode not in ["cicflowmeter", "zeek", "tshark"]:
+                    print(f"Error: Unsupported mode '{mode}'. Use 'cicflowmeter', 'zeek', or 'tshark'.")
                     sys.exit(1)
                 i += 2
             else:
@@ -344,5 +438,5 @@ if __name__ == "__main__":
         print("  To process a directory: python process_pcaps.py -d <input_folder> [-o <output_folder>] [-m <mode>]")
         print("  To process a single file: python process_pcaps.py -f <input_file> [-o <output_file>] [-m <mode>]")
         print("  For backward compatibility: python process_pcaps.py <input_folder_or_file>")
-        print("  Modes: 'cicflowmeter' (default) or 'zeek'")
+        print("  Modes: 'cicflowmeter' (default), 'zeek', or 'tshark'")
         sys.exit(1)
