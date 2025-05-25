@@ -1,25 +1,52 @@
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
-LABEL maintainer="Montimage <contact@montimage.com>"
+LABEL maintainer="Montimage <contact@montimage.eu>"
 
-ENV INSTALL_DIR  ${INSTALL_DIR:-/opt/mmt/networkfuzzer}
+# Prevent interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install --yes \
-       git gcc make libxml2-dev libpcap-dev libconfuse-dev libsctp-dev
+# Set default installation directory (can be overridden)
+ENV INSTALL_DIR /opt/mmt/networkfuzzer
 
-ADD .   ${INSTALL_DIR}/
+# ONLY if you encounter issues with unsigned APT repositories (e.g., GPG errors)
+RUN echo 'Acquire::AllowInsecureRepositories "true";' > /etc/apt/apt.conf.d/99insecure \
+ && apt-get update --allow-insecure-repositories \
+ && apt-get install -y --no-install-recommends \
+    gnupg ca-certificates curl wget git gcc make libxml2-dev libpcap-dev libconfuse-dev libsctp-dev \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# Update & install essential tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gnupg \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    gcc \
+    g++ \
+    make \
+    libxml2-dev \
+    libpcap-dev \
+    libconfuse-dev \
+    libsctp-dev \
+    && apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create install directory
+ADD .   ${INSTALL_DIR}
 WORKDIR ${INSTALL_DIR}
 
-# Install DPI from source
+# Install DPI from source (use 'dicom' branch)
 RUN rm -rf mmt-dpi
-RUN git clone --depth 1 https://github.com/Montimage/mmt-dpi.git \
+RUN git clone --depth 1 --branch dicom https://github.com/Montimage/mmt-dpi.git \
          && cd mmt-dpi/sdk                                       \
          && make -j2                                             \
          && make install && ldconfig                             \
          && cd ../../ && rm -rf mmt-dpi
 
 RUN  make sample-rules
-
 
 ENTRYPOINT ["./networkfuzzer"]
 # default parameter
