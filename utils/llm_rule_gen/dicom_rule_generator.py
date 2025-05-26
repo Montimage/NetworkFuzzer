@@ -21,7 +21,9 @@ EXAMPLE_RULE = """
     <event description="DICOM packets"
         boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 3))"/>
 </property>
+</beginning>
 
+<beginning>
 <!-- Property 32: Modify the PDU length to be inconsistent with actual payload -->
 <embedded_functions><![CDATA[
     static void em_modify_dicom_pdu_len(
