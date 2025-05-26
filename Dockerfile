@@ -21,6 +21,22 @@ RUN git clone --depth 1 --branch dicom https://github.com/Montimage/mmt-dpi.git 
     make -j2 && make install && ldconfig && \
     cd /tmp && rm -rf mmt-dpi
 
+# Build and install MMT-SECURITY
+WORKDIR /tmp
+RUN git clone https://github.com/Montimage/mmt-security.git && \
+    cd mmt-security && \
+    make clean-all && \
+    make -j1 && \
+    make install && ldconfig && \
+    make deb
+
+# Build and install MMT-PROBE
+WORKDIR /tmp
+RUN git clone https://github.com/Montimage/mmt-probe.git && \
+    cd mmt-probe && \
+    make && \
+    make install && make deb
+
 # Copy only requirements.txt and install Python dependencies
 COPY utils/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
