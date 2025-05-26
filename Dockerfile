@@ -48,4 +48,10 @@ WORKDIR ${INSTALL_DIR}
 # Build sample rules (depends on your source code)
 RUN make sample-rules
 
+# Compile utility binaries in /opt/mmt/examples
+RUN gcc -g -o /opt/mmt/examples/extract_all /opt/mmt/examples/extract_all.c \
+        -I /opt/mmt/dpi/include -L /opt/mmt/dpi/lib -lmmt_core -ldl -lpcap && \
+    gcc -o /opt/mmt/examples/proto_attributes_iterator /opt/mmt/examples/proto_attributes_iterator.c \
+        -I /opt/mmt/dpi/include -L /opt/mmt/dpi/lib -lmmt_core -ldl -lpcap
+
 CMD ["./networkfuzzer", "-h"]
