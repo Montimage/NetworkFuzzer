@@ -2,3 +2,8 @@ pydicom
 pynetdicom==2.1.1
 python-dotenv
 openai
+pandas
+numpy
+ctgan==0.11.0
+pyshark
+scapy

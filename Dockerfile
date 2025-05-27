@@ -5,17 +5,13 @@ LABEL maintainer="Montimage <contact@montimage.eu>"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV INSTALL_DIR=/opt/mmt/networkfuzzer
 
-# Install all system dependencies in one layer early
-RUN echo 'Acquire::AllowInsecureRepositories "true";' > /etc/apt/apt.conf.d/99insecure && \
-    apt-get update --allow-insecure-repositories && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install --yes \
         gnupg ca-certificates curl wget git gcc g++ make python3 python3-pip tcpdump \
-        libxml2-dev libpcap-dev libconfuse-dev libsctp-dev && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+        libxml2-dev libpcap-dev libconfuse-dev libsctp-dev
 
 WORKDIR /tmp
 
-# Clone and build DPI once in its own layer
+# Clone and build MMT-DPI
 RUN git clone --depth 1 --branch dicom https://github.com/Montimage/mmt-dpi.git && \
     cd mmt-dpi/sdk && \
     make -j2 && make install && ldconfig && \
