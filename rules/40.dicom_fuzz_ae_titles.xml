@@ -12,7 +12,6 @@
     static char last_valid_ae_title[32] = "";
 
     static char *ae_title_patterns[] = {
-        "ORTHANC",        // Valid known one
         "DCM4CHEE",       // Another common DICOM server
         "CONQUESTSRV1",   // Conquest DICOM server
         "STORESCP",       // DCMTK store SCP
@@ -31,6 +30,7 @@
         "INVALID!@#$%",   // Special chars (invalid)
         "WAYTOOLONGAETITLEOVER16CHARS", // Too long (invalid)
         "     ",          // All spaces (invalid)
+        "ORTHANC",        // Valid known one
         "MODALITY",       // Standard valid one
     };
 
@@ -83,7 +83,7 @@
         for (int i = 0; i < number_patterns; i++) {
             char *ae_title = ae_title_patterns[i];
             log_info("Fuzzing with AE Title: '%s'", ae_title);
-            replace_dicom_attribute(701, 5, ae_title, 1);
+            replace_dicom_attribute(701, 4, ae_title, 1);
             forward_packet();
             usleep(500000);  // 500ms delay - increased to ensure response is processed
 
