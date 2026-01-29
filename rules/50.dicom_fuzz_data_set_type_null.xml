@@ -1,0 +1,20 @@
+<beginning>
+<!-- Property 50: Force null data set type (0x0101) on data PDVs (pdv_flags==2) -->
+<embedded_functions><![CDATA[
+static void em_fuzz_data_set_type_null(
+     const rule_info_t *rule, int verdict, uint64_t timestamp,
+     uint64_t counter, const mmt_array_t * const trace ){
+     int is_string = 0;
+     uint16_t new_val = 0x0101; // null data set (no data set present)
+     replace_dicom_attribute(701, 21, &new_val, is_string);
+     forward_packet();
+}
+]]></embedded_functions>
+
+<property property_id="50" type_property="FORWARD"
+     description="Force null data set type on DICOM data PDVs"
+     if_satisfied="em_fuzz_data_set_type_null">
+    <event description="Got DICOM P-DATA-TF data PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 2))"/>
+</property>
+</beginning>

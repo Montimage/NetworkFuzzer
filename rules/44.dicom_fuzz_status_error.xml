@@ -1,0 +1,20 @@
+<beginning>
+<!-- Property 44: Inject DICOM error status 0xA700 (Out of Resources) -->
+<embedded_functions><![CDATA[
+static void em_fuzz_status_error(
+     const rule_info_t *rule, int verdict, uint64_t timestamp,
+     uint64_t counter, const mmt_array_t * const trace ){
+     int is_string = 0;
+     uint16_t new_val = 0xA700; // Out of Resources
+     replace_dicom_attribute(701, 16, &new_val, is_string);
+     forward_packet();
+}
+]]></embedded_functions>
+
+<property property_id="44" type_property="FORWARD"
+     description="Inject DICOM error status 0xA700 (Out of Resources)"
+     if_satisfied="em_fuzz_status_error">
+    <event description="Got DICOM P-DATA-TF command PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 3))"/>
+</property>
+</beginning>

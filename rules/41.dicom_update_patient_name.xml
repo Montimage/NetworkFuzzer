@@ -1,22 +1,20 @@
 <beginning>
+<!-- Property 41: Modify DICOM patient name in data PDVs -->
 <embedded_functions><![CDATA[
 static void em_modify_dicom_patient_name(
      const rule_info_t *rule, int verdict, uint64_t timestamp,
      uint64_t counter, const mmt_array_t * const trace ){
      int is_string = 1;
-     char *new_val = "R????????"; // got patient search results
-     //char *new_val = "123456789"; // got nothing
-     // modify the patient name (attribute ID 15)
+     char *new_val = "R????????";
      replace_dicom_attribute(701, 15, &new_val, is_string);
      forward_packet();
 }
 ]]></embedded_functions>
 
-<!-- Property 41: Update DICOM patient name -->
 <property property_id="41" type_property="FORWARD"
-     description="Update DICOM patient name"
+     description="Modify DICOM patient name"
      if_satisfied="em_modify_dicom_patient_name">
-    <event description="Got DICOM packet with PDU type 4 (DATA-TF)"
+    <event description="Got DICOM P-DATA-TF data PDV (pdv_flags == 2)"
         boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 2))"/>
 </property>
 </beginning>

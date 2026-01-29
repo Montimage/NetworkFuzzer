@@ -1,0 +1,20 @@
+<beginning>
+<!-- Property 47: Set DICOM message ID to 0 -->
+<embedded_functions><![CDATA[
+static void em_fuzz_message_id_zero(
+     const rule_info_t *rule, int verdict, uint64_t timestamp,
+     uint64_t counter, const mmt_array_t * const trace ){
+     int is_string = 0;
+     uint16_t new_val = 0;
+     replace_dicom_attribute(701, 18, &new_val, is_string);
+     forward_packet();
+}
+]]></embedded_functions>
+
+<property property_id="47" type_property="FORWARD"
+     description="Fuzz DICOM message ID by setting to zero"
+     if_satisfied="em_fuzz_message_id_zero">
+    <event description="Got DICOM P-DATA-TF command PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 3))"/>
+</property>
+</beginning>

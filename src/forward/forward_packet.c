@@ -302,6 +302,177 @@ uint32_t int_to_ascii_string(u_char * ascii_string, int length, uint64_t num) {
     return 1;
 }
 
+/*
+ * Helper: search for a DICOM tag in DIMSE command data (little-endian).
+ * DIMSE tags are: group(2 bytes LE) + element(2 bytes LE).
+ * Returns byte offset of the tag within data[], or -1 if not found.
+ */
+static int find_dimse_tag(const uint8_t *data, int start, int end,
+                          uint16_t group, uint16_t element) {
+	for (int i = start; i <= end - 4; i++) {
+		if (data[i]   == (group & 0xFF)   && data[i+1] == (group >> 8) &&
+		    data[i+2] == (element & 0xFF) && data[i+3] == (element >> 8)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Helper: search for a sub-item by type in A-ASSOCIATE variable items area.
+ * Each item: type(1) + reserved(1) + length(2 BE) + value(length bytes).
+ * Returns byte offset of the item within data[], or -1 if not found.
+ */
+static int find_assoc_subitem(const uint8_t *data, int start, int end,
+                              uint8_t item_type) {
+	int pos = start;
+	while (pos <= end - 4) {
+		uint8_t type = data[pos];
+		uint16_t len = (data[pos+2] << 8) | data[pos+3];
+		if (type == item_type)
+			return pos;
+		pos += 4 + len;
+	}
+	return -1;
+}
+
+/*
+ * Find and replace a DIMSE command attribute (IDs 14, 16, 17, 18, 21) in P-DATA-TF PDU.
+ * DIMSE command data starts at dicom_offset + 12 (past 6-byte PDU header + 4-byte PDV length + 1 context + 1 flags).
+ * Tag layout: group(2 LE) + element(2 LE) + length(4 LE) + value.
+ * For U16 attributes: write 2 bytes LE.
+ * For string attributes: memcpy + space-pad to existing length.
+ * Returns 1 on success, negative on error.
+ */
+static int find_and_replace_dimse_attribute(uint8_t *data, int data_size,
+        int dicom_offset, uint32_t att_id, const void *new_val, int is_string) {
+	int dimse_start = dicom_offset + 12;
+	int dimse_end = data_size;
+	if (dimse_start >= dimse_end)
+		return -1;
+
+	uint16_t group = 0x0000, element;
+	switch (att_id) {
+	case 14: element = 0x0100; break; // command_field
+	case 16: element = 0x0900; break; // status
+	case 17: element = 0x0002; break; // affected_sop_class_uid
+	case 18: element = 0x0110; break; // message_id
+	case 21: element = 0x0800; break; // data_set_type
+	default: return -1;
+	}
+
+	int tag_pos = find_dimse_tag(data, dimse_start, dimse_end, group, element);
+	if (tag_pos < 0) {
+		fprintf(stderr, "DIMSE tag (%04x,%04x) not found for att_id %d\n", group, element, att_id);
+		return -1;
+	}
+
+	// Read 4-byte LE length at tag_pos + 4
+	int len_offset = tag_pos + 4;
+	if (len_offset + 4 > data_size)
+		return -4;
+	uint32_t val_len = data[len_offset] | (data[len_offset+1] << 8) |
+	                   (data[len_offset+2] << 16) | (data[len_offset+3] << 24);
+
+	int val_offset = tag_pos + 8;
+	if (val_offset + (int)val_len > data_size)
+		return -4;
+
+	if (is_string) {
+		const char *str_val = (const char *)new_val;
+		int str_len = strlen(str_val);
+		if (str_len > (int)val_len)
+			str_len = (int)val_len;
+		memcpy(&data[val_offset], str_val, str_len);
+		// space-pad remaining bytes
+		for (int i = str_len; i < (int)val_len; i++)
+			data[val_offset + i] = ' ';
+	} else {
+		uint16_t num_val = *(const uint16_t *)new_val;
+		if (val_len >= 2) {
+			data[val_offset]     = num_val & 0xFF;
+			data[val_offset + 1] = (num_val >> 8) & 0xFF;
+		}
+	}
+
+	fprintf(stderr, "Successfully replaced DIMSE att_id %d at offset %d (val_len=%u)\n",
+	        att_id, val_offset, val_len);
+	return 1;
+}
+
+/*
+ * Find and replace an A-ASSOCIATE sub-item attribute (IDs 19, 20) in A-ASSOCIATE PDU.
+ * Variable items start at dicom_offset + 74.
+ * For abstract syntax (ID 19): find Presentation Context (0x20/0x21), then sub-item 0x30.
+ * For transfer syntax (ID 20): find Presentation Context (0x20/0x21), then sub-item 0x40.
+ * Replaces value string, space-padded to existing length.
+ * Returns 1 on success, negative on error.
+ */
+static int find_and_replace_assoc_subitem(uint8_t *data, int data_size,
+        int dicom_offset, uint32_t att_id, const char *new_val) {
+	int var_start = dicom_offset + 74;
+	int var_end = data_size;
+	if (var_start >= var_end)
+		return -1;
+
+	// Determine PDU type to know Presentation Context item type
+	uint8_t pdu_type = data[dicom_offset];
+	uint8_t pres_type;
+	if (pdu_type == 1) // A-ASSOCIATE-RQ
+		pres_type = 0x20;
+	else if (pdu_type == 2) // A-ASSOCIATE-AC
+		pres_type = 0x21;
+	else
+		return -1;
+
+	// Find the Presentation Context item
+	int pres_pos = find_assoc_subitem(data, var_start, var_end, pres_type);
+	if (pres_pos < 0) {
+		fprintf(stderr, "Presentation Context item (0x%02x) not found for att_id %d\n", pres_type, att_id);
+		return -1;
+	}
+
+	uint16_t pres_len = (data[pres_pos + 2] << 8) | data[pres_pos + 3];
+	int pres_value_start = pres_pos + 4;
+	int pres_value_end = pres_value_start + pres_len;
+	if (pres_value_end > data_size)
+		pres_value_end = data_size;
+
+	// Skip Presentation Context ID (1 byte) + reserved (3 bytes) = 4 bytes
+	int sub_start = pres_value_start + 4;
+
+	uint8_t sub_type;
+	if (att_id == 19)
+		sub_type = 0x30; // Abstract Syntax
+	else if (att_id == 20)
+		sub_type = 0x40; // Transfer Syntax
+	else
+		return -1;
+
+	int sub_pos = find_assoc_subitem(data, sub_start, pres_value_end, sub_type);
+	if (sub_pos < 0) {
+		fprintf(stderr, "Sub-item (0x%02x) not found for att_id %d\n", sub_type, att_id);
+		return -1;
+	}
+
+	uint16_t sub_len = (data[sub_pos + 2] << 8) | data[sub_pos + 3];
+	int sub_val_offset = sub_pos + 4;
+	if (sub_val_offset + sub_len > data_size)
+		return -4;
+
+	int str_len = strlen(new_val);
+	if (str_len > (int)sub_len)
+		str_len = (int)sub_len;
+	memcpy(&data[sub_val_offset], new_val, str_len);
+	// space-pad remaining bytes
+	for (int i = str_len; i < (int)sub_len; i++)
+		data[sub_val_offset + i] = ' ';
+
+	fprintf(stderr, "Successfully replaced A-ASSOCIATE att_id %d at offset %d (sub_len=%u)\n",
+	        att_id, sub_val_offset, sub_len);
+	return 1;
+}
+
 // TODO: Move these functions to DICOM plugin: update dicom numeric and string
 
 /**
@@ -317,7 +488,6 @@ uint32_t int_to_ascii_string(u_char * ascii_string, int length, uint64_t num) {
  */
 uint32_t update_dicom_data( u_char *data, uint32_t data_size, const ipacket_t *ipacket, uint32_t proto_id, uint32_t att_id, uint32_t new_val){
 	uint32_t ret = 0;
-	fprintf(stderr, "Going to update the value of attribute %d, new value : %u (%x)\n",att_id, new_val, new_val);
 	debug("DICOM: update the value of attribute %d, new value : %u (%x)",att_id, new_val, new_val);
 	if( proto_id != 701 )
 		return ret;
@@ -328,54 +498,52 @@ uint32_t update_dicom_data( u_char *data, uint32_t data_size, const ipacket_t *i
 	unsigned int dicom_offset = get_packet_offset_at_index( ipacket, index );
 
 	int att_data_len = 0;
-    int att_offset = 0;
+	int att_offset = 0;
 
 	switch( att_id ){
 	case 1:
 		att_data_len = 1;
-    	att_offset = 0;
+		att_offset = 0;
 		break;
 	case 2:
 		att_data_len = 4;
-    	att_offset = 2;
+		att_offset = 2;
 		break;
 	case 3:
 		att_data_len = 2;
-    	att_offset = 6;
+		att_offset = 6;
 		break;
 	case 6:
 		att_data_len = 21;
-    	att_offset = 78;
+		att_offset = 78;
 		break;
 	case 8:
 		att_data_len = 4;
-    	att_offset = 295;
+		att_offset = 295;
 		break;
 	case 10:
 		att_data_len = 4;
-    	att_offset = 6;
+		att_offset = 6;
+		break;
+	case 11:
+		att_data_len = 1;
+		att_offset = 10;
 		break;
 	case 12:
 		att_data_len = 1;
-    	att_offset = 11;
+		att_offset = 11;
 		break;
 	case 15:
 		att_data_len = 9;
-    	att_offset = 54;
+		att_offset = 54;
 		break;
 	default:
-        fprintf(stderr, "Unsupported modify attribute: %d",att_id);
-        return ret;
+		fprintf(stderr, "Unsupported modify attribute: %d\n", att_id);
+		return ret;
 	}
 	att_offset += dicom_offset;
-    fprintf(stderr, "attribute id: %d, attribute offset: %d, attribute data len: %d\n",att_id, att_offset, att_data_len);
 
 	ret = int_to_ascii_string((u_char *) &data[att_offset], att_data_len * 2, new_val);
-    if (ret == 1) {
-      printf("Successfully modified!!!");
-    } else {
-      printf("Failed to modify!!!");
-    }
 
 	return 1;
 }
@@ -600,95 +768,111 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
 // }
 
 int get_dicom_attribute_info(uint32_t att_id, int *att_offset, int *att_data_len) {
-    printf("[DICOM DEBUG] Getting info for attribute ID: %d\n", att_id);
-
     switch (att_id) {
-        case 1:
+        case 1:  // PDU Type
             *att_data_len = 1;
             *att_offset = 0;
             break;
-        case 2:
+        case 2:  // PDU Length
             *att_data_len = 4;
             *att_offset = 2;
             break;
-        case 3:
+        case 3:  // Protocol Version
             *att_data_len = 2;
             *att_offset = 6;
             break;
-        case 4:
+        case 4:  // Called AE Title
             *att_data_len = 16;
             *att_offset = 10;
             break;
-        case 5:
+        case 5:  // Calling AE Title
             *att_data_len = 16;
             *att_offset = 26;
             break;
-        case 6:
+        case 6:  // Application Context
             *att_data_len = 21;
             *att_offset = 78;
             break;
-        case 8:
+        case 8:  // Max PDU Length
             *att_data_len = 4;
             *att_offset = 295;
             break;
-        case 10:
+        case 10: // PDV Length
             *att_data_len = 4;
             *att_offset = 6;
             break;
-        case 12:
+        case 11: // PDV Context ID
+            *att_data_len = 1;
+            *att_offset = 10;
+            break;
+        case 12: // PDV Flags
             *att_data_len = 1;
             *att_offset = 11;
             break;
-        case 15:  // Patient Name attribute
+        case 15: // Patient Name
             *att_data_len = 9;
             *att_offset = 54;
-            printf("[DICOM DEBUG] Found patient name attribute (ID 15) - offset: %d, length: %d\n", *att_offset, *att_data_len);
-
-            // Print the patient name as a string
-            forward_packet_context_t *context = _get_current_context();
-            if (context != NULL) {
-                int index = get_protocol_index_by_id(context->ipacket, 701);
-                if (index != -1) {
-                    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
-                    int patient_name_offset = dicom_offset + *att_offset;
-
-                    // Create a buffer for the patient name
-                    char patient_name[256] = {0};
-                    int copy_len = *att_data_len;
-                    if (patient_name_offset + copy_len > context->packet_size) {
-                        copy_len = context->packet_size - patient_name_offset;
-                    }
-
-                    // Copy the patient name
-                    memcpy(patient_name, &context->packet_data[patient_name_offset], copy_len);
-
-                    // Print the patient name in hex
-                    printf("[DICOM DEBUG] Patient name (hex): ");
-                    for (int i = 0; i < copy_len; i++) {
-                        printf("%02X ", (unsigned char)patient_name[i]);
-                    }
-                    printf("\n");
-
-                    // Print the patient name as a string, replacing non-printable characters with dots
-                    printf("[DICOM DEBUG] Patient name (string): '");
-                    for (int i = 0; i < copy_len; i++) {
-                        if (patient_name[i] >= 32 && patient_name[i] <= 126) {
-                            printf("%c", patient_name[i]);
-                        } else {
-                            printf(".");
-                        }
-                    }
-                    printf("'\n");
-                }
-            }
             break;
         default:
             fprintf(stderr, "Unsupported modify attribute: %d\n", att_id);
             return -1;
     }
 
-    printf("[DICOM DEBUG] Attribute info - offset: %d, data length: %d\n", *att_offset, *att_data_len);
     return 0;
+}
+
+// Read raw bytes from DICOM packet data at a given offset
+int get_dicom_raw_data(uint32_t proto_id, int offset, int length, void *buffer) {
+    forward_packet_context_t *context = _get_current_context();
+    if (context == NULL)
+        return -3;
+
+    int index = get_protocol_index_by_id(context->ipacket, proto_id);
+    if (index == -1)
+        return -1;
+
+    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+    int actual_offset = dicom_offset + offset;
+
+    if (actual_offset + length > context->packet_size)
+        return -4;
+
+    memcpy(buffer, &context->packet_data[actual_offset], length);
+    return length;
+}
+
+// Write raw bytes to DICOM packet data at a given offset
+int replace_dicom_data_at_offset(uint32_t proto_id, int offset, int length, const void *data) {
+    forward_packet_context_t *context = _get_current_context();
+    if (context == NULL)
+        return -3;
+
+    int index = get_protocol_index_by_id(context->ipacket, proto_id);
+    if (index == -1)
+        return -1;
+
+    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+    int actual_offset = dicom_offset + offset;
+
+    if (actual_offset + length > context->packet_size)
+        return -4;
+
+    memcpy(&context->packet_data[actual_offset], data, length);
+    return 1;
+}
+
+// Get the length of available DICOM data in the current packet
+int get_dicom_packet_data_len(uint32_t proto_id) {
+    forward_packet_context_t *context = _get_current_context();
+    if (context == NULL)
+        return -3;
+
+    int index = get_protocol_index_by_id(context->ipacket, proto_id);
+    if (index == -1)
+        return -1;
+
+    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+    return context->packet_size - dicom_offset;
 }
 
 // This function changes an attribute in the packet
@@ -696,6 +880,57 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
     forward_packet_context_t *context = _get_current_context();
     if (context == NULL)
         return -3;
+
+    // Handle new dynamic-offset attributes (IDs 14, 16, 17, 18, 19, 20, 21)
+    // These require tag searching rather than fixed offsets
+    switch (att_id) {
+    case 14: // command_field (DIMSE tag 0000,0100)
+    case 16: // status (DIMSE tag 0000,0900)
+    case 18: // message_id (DIMSE tag 0000,0110)
+    case 21: // data_set_type (DIMSE tag 0000,0800)
+    {
+        int index = get_protocol_index_by_id(context->ipacket, proto_id);
+        if (index == -1) return -1;
+        unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+        if (is_string) {
+            // Convert string to uint16_t for numeric DIMSE fields
+            uint16_t num = (uint16_t)strtoul((const char *)new_val, NULL, 0);
+            return find_and_replace_dimse_attribute(context->packet_data,
+                context->packet_size, dicom_offset, att_id, &num, 0);
+        }
+        return find_and_replace_dimse_attribute(context->packet_data,
+            context->packet_size, dicom_offset, att_id, new_val, 0);
+    }
+    case 17: // affected_sop_class_uid (DIMSE tag 0000,0002) — string
+    {
+        int index = get_protocol_index_by_id(context->ipacket, proto_id);
+        if (index == -1) return -1;
+        unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+        if (is_string) {
+            const char *str = *(const char **)new_val;
+            return find_and_replace_dimse_attribute(context->packet_data,
+                context->packet_size, dicom_offset, att_id, str, 1);
+        }
+        return find_and_replace_dimse_attribute(context->packet_data,
+            context->packet_size, dicom_offset, att_id, new_val, 0);
+    }
+    case 19: // abstract_syntax (A-ASSOCIATE sub-item 0x30) — string
+    case 20: // transfer_syntax (A-ASSOCIATE sub-item 0x40) — string
+    {
+        int index = get_protocol_index_by_id(context->ipacket, proto_id);
+        if (index == -1) return -1;
+        unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+        const char *str;
+        if (is_string)
+            str = *(const char **)new_val;
+        else
+            str = (const char *)new_val;
+        return find_and_replace_assoc_subitem(context->packet_data,
+            context->packet_size, dicom_offset, att_id, str);
+    }
+    default:
+        break; // fall through to existing fixed-offset logic
+    }
 
     int att_offset, att_data_len;
     if (get_dicom_attribute_info(att_id, &att_offset, &att_data_len) != 0) {
@@ -708,78 +943,30 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
 
     unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
 
-    // For patient name (ID 15), we need to handle it specially
+    // For patient name (ID 15), handle string with space-padding
     if (att_id == 15) {
-        printf("[DICOM DEBUG] Modifying patient name attribute (ID 15)\n");
-
-        // Calculate the actual offset in the packet
         int actual_offset = dicom_offset + att_offset;
 
-        // Check if we have enough space in the packet
-        if (actual_offset + att_data_len > context->packet_size) {
-            printf("[DICOM DEBUG] Packet too small to modify patient name. Packet size: %d, needed: %d\n",
-                   context->packet_size, actual_offset + att_data_len);
+        if (actual_offset + att_data_len > context->packet_size)
             return -4;
-        }
-
-        // Print the bytes before modification
-        printf("[DICOM DEBUG] Bytes before modification: ");
-        for (int i = 0; i < att_data_len; i++) {
-            printf("%02X ", (unsigned char)context->packet_data[actual_offset + i]);
-        }
-        printf("\n");
 
         if (is_string) {
-            // For string values, use the provided new value
-            // The new_val is a pointer to a string pointer, so we need to dereference it
             const char *val = *(const char **)new_val;
-            printf("[DICOM DEBUG] Received new patient name: '%s'\n", val);
-
             int val_len = strlen(val);
-
-            // Check if the new value is too long
-            if (val_len > att_data_len) {
-                printf("[DICOM DEBUG] New patient name is too long (%d chars), truncating to %d chars\n",
-                       val_len, att_data_len);
+            if (val_len > att_data_len)
                 val_len = att_data_len;
-            }
 
-            // Create a buffer for the new patient name
-            char new_patient_name[256] = {0};
+            char buf[256] = {0};
+            strncpy(buf, val, val_len);
+            for (int i = val_len; i < att_data_len; i++)
+                buf[i] = ' ';
 
-            // Copy the new value to the buffer
-            strncpy(new_patient_name, val, val_len);
-
-            // Fill the remaining space with spaces if needed
-            for (int i = val_len; i < att_data_len; i++) {
-                new_patient_name[i] = ' ';
-            }
-
-            // Print the new patient name
-            printf("[DICOM DEBUG] New patient name: '");
-            for (int i = 0; i < att_data_len; i++) {
-                printf("%c", new_patient_name[i]);
-            }
-            printf("'\n");
-
-            // Modify only the patient name value, preserving the original tag, VR, and length
-            memcpy(&context->packet_data[actual_offset], new_patient_name, att_data_len);
-
-            // Print the bytes after modification
-            printf("[DICOM DEBUG] Bytes after modification: ");
-            for (int i = 0; i < att_data_len; i++) {
-                printf("%02X ", (unsigned char)context->packet_data[actual_offset + i]);
-            }
-            printf("\n");
+            memcpy(&context->packet_data[actual_offset], buf, att_data_len);
         } else {
-            // For numeric values, convert to ASCII
             u_char ascii_string[50] = {0};
             int val = *(const int *)new_val;
-            if (!int_to_ascii_string(ascii_string, att_data_len * 2, (uint64_t)val)) {
-                return -2; // failed to convert numeric value
-            }
-
-            // Modify only the patient name value
+            if (!int_to_ascii_string(ascii_string, att_data_len * 2, (uint64_t)val))
+                return -2;
             memcpy(&context->packet_data[actual_offset], ascii_string, att_data_len);
         }
 

@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 55: Replace both abstract and transfer syntax with invalid OIDs -->
+<embedded_functions><![CDATA[
+static void em_fuzz_both_syntaxes(
+     const rule_info_t *rule, int verdict, uint64_t timestamp,
+     uint64_t counter, const mmt_array_t * const trace ){
+     int is_string = 1;
+     // Replace abstract syntax
+     char *abs_val = "9.9.999.99999.9.9";
+     replace_dicom_attribute(701, 19, &abs_val, is_string);
+     // Replace transfer syntax
+     char *ts_val = "8.8.888.88888.8.8";
+     replace_dicom_attribute(701, 20, &ts_val, is_string);
+     forward_packet();
+}
+]]></embedded_functions>
+
+<property property_id="55" type_property="FORWARD"
+     description="Fuzz both DICOM abstract and transfer syntax with invalid OIDs"
+     if_satisfied="em_fuzz_both_syntaxes">
+    <event description="Got DICOM A-ASSOCIATE-RQ"
+        boolean_expression="(dicom.pdu_type == 1)"/>
+</property>
+</beginning>
