@@ -1,22 +1,19 @@
 <beginning>
-<!-- Property 54: Combined fuzz: N-DELETE (0x0150) + message_id=9999 -->
+<!-- Property 54: Combined fuzz: command field boundary + message ID boundary -->
 <embedded_functions><![CDATA[
-static void em_fuzz_command_and_message_id(
-     const rule_info_t *rule, int verdict, uint64_t timestamp,
-     uint64_t counter, const mmt_array_t * const trace ){
-     int is_string = 0;
-     // Set command field to N-DELETE-RQ (0x0150)
-     uint16_t cmd_val = 0x0150;
-     replace_dicom_attribute(701, 14, &cmd_val, is_string);
-     // Set message ID to 9999
-     uint16_t msg_val = 9999;
-     replace_dicom_attribute(701, 18, &msg_val, is_string);
-     forward_packet();
-}
+    #include "fuzz_dicom.h"
+
+    static void em_fuzz_command_and_message_id(
+         const rule_info_t *rule, int verdict, uint64_t timestamp,
+         uint64_t counter, const mmt_array_t * const trace ){
+         fuzz_dicom_attribute(701, 14, FUZZ_BOUNDARY, 0);
+         fuzz_dicom_attribute(701, 18, FUZZ_BOUNDARY, 0);
+         forward_packet();
+    }
 ]]></embedded_functions>
 
 <property property_id="54" type_property="FORWARD"
-     description="Combined fuzz: N-DELETE command + message_id=9999"
+     description="Combined fuzz: command field + message ID boundary values"
      if_satisfied="em_fuzz_command_and_message_id">
     <event description="Got DICOM P-DATA-TF command PDV"
         boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 3))"/>

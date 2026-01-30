@@ -1,0 +1,21 @@
+# DICOM Transfer Syntax UIDs - valid and invalid
+# Implicit VR Little Endian (Default)
+1.2.840.10008.1.2
+# Explicit VR Little Endian
+1.2.840.10008.1.2.1
+# Deflated Explicit VR Little Endian
+1.2.840.10008.1.2.1.99
+# Explicit VR Big Endian (Retired)
+1.2.840.10008.1.2.2
+# JPEG Baseline
+1.2.840.10008.1.2.4.50
+# JPEG Lossless
+1.2.840.10008.1.2.4.70
+# JPEG 2000 Lossless
+1.2.840.10008.1.2.4.90
+# Invalid syntaxes
+8.8.888.88888.8.8
+0.0.0
+INVALID
+NOT_A_TRANSFER_SYNTAX
+""

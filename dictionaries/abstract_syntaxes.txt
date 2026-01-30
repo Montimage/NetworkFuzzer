@@ -1,0 +1,21 @@
+# DICOM Abstract Syntax UIDs - valid and invalid
+# Verification SOP Class
+1.2.840.10008.1.1
+# Patient Root Query/Retrieve - FIND
+1.2.840.10008.5.1.4.1.2.1.1
+# Patient Root Query/Retrieve - MOVE
+1.2.840.10008.5.1.4.1.2.1.2
+# Patient Root Query/Retrieve - GET
+1.2.840.10008.5.1.4.1.2.1.3
+# Study Root Query/Retrieve - FIND
+1.2.840.10008.5.1.4.1.2.2.1
+# CT Image Storage
+1.2.840.10008.5.1.4.1.1.2
+# MR Image Storage
+1.2.840.10008.5.1.4.1.1.4
+# Invalid syntaxes
+9.9.999.99999.9.9
+0.0.0.0
+INVALID
+NOT_AN_ABSTRACT_SYNTAX
+""

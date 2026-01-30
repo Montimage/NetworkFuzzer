@@ -21,6 +21,7 @@
 #include "../lib/process_packet.h"
 #include "../lib/mmt_lib.h"
 #include "dump_packet.h"
+#include "fuzz_dicom.h"
 
 #define MAX_PACKET_SIZE 0xFFFF
 

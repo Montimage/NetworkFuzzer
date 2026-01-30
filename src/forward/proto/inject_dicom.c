@@ -449,6 +449,28 @@ int inject_dicom_send_packet(inject_dicom_context_t *context, const uint8_t *pac
     _clear_dicom_buffer_if_need(context);
     context->total_pkt_to_send++;
 
+    // Fix PDU length: when we send a single TCP segment, the pdu_len field in the
+    // DICOM header may declare a larger size than what we actually have (the original
+    // PDU was split across multiple TCP segments). Update pdu_len to match the actual
+    // payload so that the receiving DPI engine can classify this as valid DICOM.
+    uint8_t pdu_buf[MAX_PDU_SIZE];
+    if (packet_size >= 6 && packet_size <= MAX_PDU_SIZE) {
+        uint8_t ptype = packet_data[0];
+        uint32_t declared_len = (packet_data[2] << 24) | (packet_data[3] << 16) |
+                                (packet_data[4] << 8)  | packet_data[5];
+        uint32_t actual_payload = packet_size - 6; // 6-byte DICOM PDU header
+        if (ptype >= 0x01 && ptype <= 0x07 && declared_len != actual_payload) {
+            memcpy(pdu_buf, packet_data, packet_size);
+            // Write corrected pdu_len in big-endian
+            pdu_buf[2] = (actual_payload >> 24) & 0xFF;
+            pdu_buf[3] = (actual_payload >> 16) & 0xFF;
+            pdu_buf[4] = (actual_payload >> 8)  & 0xFF;
+            pdu_buf[5] =  actual_payload        & 0xFF;
+            packet_data = pdu_buf;
+            printf("[DICOM] Fixed PDU length: %u -> %u bytes\n", declared_len, actual_payload);
+        }
+    }
+
     // Debug: Print the first few bytes of the packet to diagnose PDU type issues
     printf("[DICOM DEBUG] Packet #%zu first 8 bytes: ", context->total_pkt_to_send);
     for (int i = 0; i < (packet_size < 8 ? packet_size : 8); i++) {

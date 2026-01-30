@@ -1,53 +1,22 @@
 <beginning>
-<!-- Property 40: Fuzz DICOM Calling AE Title with various patterns -->
+<!-- Property 40: Fuzz DICOM Called AE Title with dictionary patterns -->
 <embedded_functions><![CDATA[
-    static unsigned long int number_patterns = 0;
-    static int pattern_index = 0;
-
-    static char *ae_title_patterns[] = {
-        "DCM4CHEE",
-        "CONQUESTSRV1",
-        "STORESCP",
-        "MYPACS",
-        "VIEWER",
-        "OSIRIX",
-        "HOROS",
-        "PACSONE",
-        "DCMROUTER",
-        "WORKSTATION",
-        "12345678901234",
-        "LOWERCASE",
-        "A",
-        "TOOLONGAETITLE16",
-        "",
-        "INVALID!@#$%",
-        "WAYTOOLONGAETITLEOVER16CHARS",
-        "     ",
-        "ORTHANC",
-        "MODALITY",
-    };
+    #include "fuzz_dicom.h"
 
     void on_load() {
-        number_patterns = sizeof(ae_title_patterns) / sizeof(ae_title_patterns[0]);
-        pattern_index = 0;
+        fuzz_dicom_load_dictionary(4, "dictionaries/ae_titles.txt");
     }
 
     static void em_fuzz_dicom_ae_titles(
         const rule_info_t *rule, int verdict, uint64_t timestamp,
         uint64_t counter, const mmt_array_t * const trace) {
-
-        if (pattern_index >= number_patterns)
-            pattern_index = 0;
-
-        char *ae_title = ae_title_patterns[pattern_index];
-        replace_dicom_attribute(701, 4, ae_title, 1);
-        pattern_index++;
+        fuzz_dicom_attribute(701, 4, FUZZ_DICTIONARY, 0);
         forward_packet();
     }
 ]]></embedded_functions>
 
 <property property_id="40" type_property="FORWARD"
-        description="Fuzz DICOM Calling AE Title with various patterns"
+        description="Fuzz DICOM Called AE Title with dictionary patterns"
         if_satisfied="em_fuzz_dicom_ae_titles">
     <event description="Got DICOM A-ASSOCIATE-RQ packet"
         boolean_expression="(dicom.pdu_type == 1)"/>

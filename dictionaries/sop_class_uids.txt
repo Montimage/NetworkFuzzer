@@ -1,0 +1,21 @@
+# DICOM SOP Class UIDs - valid and invalid
+# Verification SOP Class
+1.2.840.10008.1.1
+# Patient Root Query/Retrieve Information Model - FIND
+1.2.840.10008.5.1.4.1.2.1.1
+# CT Image Storage
+1.2.840.10008.5.1.4.1.1.2
+# MR Image Storage
+1.2.840.10008.5.1.4.1.1.4
+# Secondary Capture Image Storage
+1.2.840.10008.5.1.4.1.1.7
+# US Image Storage
+1.2.840.10008.5.1.4.1.1.6.1
+# Digital X-Ray Image Storage
+1.2.840.10008.5.1.4.1.1.1.1
+# Invalid OIDs
+9.9.999.99999.9.9.9.9.9.9
+0.0.0.0.0
+INVALID_UID
+NOT_A_UID_AT_ALL
+""
