@@ -17,7 +17,7 @@
 extern int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id,
                                    const void *new_val, int is_string);
 
-#define MAX_ATT_ID        25
+#define MAX_ATT_ID        30
 #define MAX_DICT_ENTRIES  1024
 #define MAX_DICT_LINE_LEN 256
 
@@ -50,6 +50,14 @@ static int is_string_attribute(uint32_t att_id)
     case 17: /* Affected SOP Class UID */
     case 19: /* Abstract Syntax */
     case 20: /* Transfer Syntax */
+    case 22: /* Move Destination */
+    case 23: /* Patient ID */
+    case 24: /* Patient Birth Date */
+    case 25: /* Patient Sex */
+    case 26: /* Study Instance UID */
+    case 27: /* Accession Number */
+    case 28: /* Window Center */
+    case 29: /* Window Width */
         return 1;
     default:
         return 0;
@@ -68,6 +76,14 @@ static int is_indirect_string(uint32_t att_id)
     case 17: /* Affected SOP Class UID */
     case 19: /* Abstract Syntax */
     case 20: /* Transfer Syntax */
+    case 22: /* Move Destination — DIMSE tag, indirect */
+    case 23: /* Patient ID — DIMSE tag, indirect */
+    case 24: /* Patient Birth Date — DIMSE tag, indirect */
+    case 25: /* Patient Sex — DIMSE tag, indirect */
+    case 26: /* Study Instance UID — DIMSE tag, indirect */
+    case 27: /* Accession Number — DIMSE tag, indirect */
+    case 28: /* Window Center — DIMSE tag, indirect */
+    case 29: /* Window Width — DIMSE tag, indirect */
         return 1;
     default:
         return 0;
@@ -307,6 +323,44 @@ static const char *default_dict_patient_name[] = {
     "X^Y^Z^W^V",
 };
 
+/* Default dictionary for Move Destination (att_id 22) */
+static const char *default_dict_move_destination[] = {
+    "ATTACKER_SCP",
+    "EVIL_PACS",
+    "EXFIL_NODE",
+    "MY_STORAGE",
+    "ROGUE_SCP",
+};
+
+/* Default dictionary for Patient ID (att_id 23) */
+static const char *default_dict_patient_id[] = {
+    "000000",
+    "999999",
+    "PATIENT_X",
+    "' OR 1=1 --",
+    "<script>alert(1)</script>",
+};
+
+/* Default dictionary for Study Instance UID (att_id 26) */
+static const char *default_dict_study_instance_uid[] = {
+    "1.2.3.4.5.6.7.8.9",
+    "9.9.9.9.9.9.9.9.9",
+    "INVALID_STUDY_UID",
+    "0.0.0.0.0",
+};
+
+/* Default dictionary for Window Center/Width (att_ids 28, 29) */
+static const char *default_dict_window_values[] = {
+    "0",
+    "1",
+    "-1000",
+    "-2048",
+    "4096",
+    "40",
+    "400",
+    "2000",
+};
+
 static void load_default_dict(uint32_t att_id, fuzz_att_state_t *state)
 {
     const char **defaults = NULL;
@@ -334,6 +388,19 @@ static void load_default_dict(uint32_t att_id, fuzz_att_state_t *state)
         break;
     case 20: /* Transfer Syntax */
         DEFAULTS(default_dict_transfer_syntax);
+        break;
+    case 22: /* Move Destination */
+        DEFAULTS(default_dict_move_destination);
+        break;
+    case 23: /* Patient ID */
+        DEFAULTS(default_dict_patient_id);
+        break;
+    case 26: /* Study Instance UID */
+        DEFAULTS(default_dict_study_instance_uid);
+        break;
+    case 28: /* Window Center */
+    case 29: /* Window Width */
+        DEFAULTS(default_dict_window_values);
         break;
     default:
         return;

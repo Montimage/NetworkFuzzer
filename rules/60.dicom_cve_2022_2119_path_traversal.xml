@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 60: CVE-2022-2119/2120 - Path traversal in Affected SOP Class UID -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(17, "dictionaries/exploit_sop_uids.txt");
+    }
+
+    static void em_cve_path_traversal(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        fuzz_dicom_attribute(701, 17, FUZZ_DICTIONARY, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="60" type_property="FORWARD"
+        description="CVE-2022-2119/2120: Fuzz Affected SOP Class UID with path traversal payloads"
+        if_satisfied="em_cve_path_traversal">
+    <event description="Got DICOM P-DATA-TF command PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 3))"/>
+</property>
+</beginning>

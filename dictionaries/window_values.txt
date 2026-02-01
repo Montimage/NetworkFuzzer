@@ -1,0 +1,15 @@
+# Window Center/Width values for imaging parameter manipulation
+# Alters medical image display without changing pixel data
+0
+1
+-1000
+-2048
+4096
+40
+400
+2000
+-32768
+32767
+65535
+0.5
+99999

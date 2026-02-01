@@ -354,11 +354,19 @@ static int find_and_replace_dimse_attribute(uint8_t *data, int data_size,
 
 	uint16_t group = 0x0000, element;
 	switch (att_id) {
-	case 14: element = 0x0100; break; // command_field
-	case 16: element = 0x0900; break; // status
-	case 17: element = 0x0002; break; // affected_sop_class_uid
-	case 18: element = 0x0110; break; // message_id
-	case 21: element = 0x0800; break; // data_set_type
+	case 14: group = 0x0000; element = 0x0100; break; // command_field
+	case 16: group = 0x0000; element = 0x0900; break; // status
+	case 17: group = 0x0000; element = 0x0002; break; // affected_sop_class_uid
+	case 18: group = 0x0000; element = 0x0110; break; // message_id
+	case 21: group = 0x0000; element = 0x0800; break; // data_set_type
+	case 22: group = 0x0000; element = 0x0600; break; // Move Destination
+	case 23: group = 0x0010; element = 0x0020; break; // Patient ID
+	case 24: group = 0x0010; element = 0x0030; break; // Patient Birth Date
+	case 25: group = 0x0010; element = 0x0040; break; // Patient Sex
+	case 26: group = 0x0020; element = 0x000D; break; // Study Instance UID
+	case 27: group = 0x0008; element = 0x0050; break; // Accession Number
+	case 28: group = 0x0028; element = 0x1050; break; // Window Center
+	case 29: group = 0x0028; element = 0x1051; break; // Window Width
 	default: return -1;
 	}
 
@@ -882,7 +890,7 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
     if (context == NULL)
         return -3;
 
-    // Handle new dynamic-offset attributes (IDs 14, 16, 17, 18, 19, 20, 21)
+    // Handle dynamic-offset attributes (IDs 14, 16, 17, 18, 19, 20, 21, 22-29)
     // These require tag searching rather than fixed offsets
     switch (att_id) {
     case 14: // command_field (DIMSE tag 0000,0100)
@@ -903,6 +911,14 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
             context->packet_size, dicom_offset, att_id, new_val, 0);
     }
     case 17: // affected_sop_class_uid (DIMSE tag 0000,0002) — string
+    case 22: // Move Destination (DIMSE tag 0000,0600) — string
+    case 23: // Patient ID (DIMSE tag 0010,0020) — string
+    case 24: // Patient Birth Date (DIMSE tag 0010,0030) — string
+    case 25: // Patient Sex (DIMSE tag 0010,0040) — string
+    case 26: // Study Instance UID (DIMSE tag 0020,000D) — string
+    case 27: // Accession Number (DIMSE tag 0008,0050) — string
+    case 28: // Window Center (DIMSE tag 0028,1050) — string
+    case 29: // Window Width (DIMSE tag 0028,1051) — string
     {
         int index = get_protocol_index_by_id(context->ipacket, proto_id);
         if (index == -1) return -1;

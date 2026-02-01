@@ -1,0 +1,20 @@
+<beginning>
+<!-- Property 57: Inject A-ABORT during data transfer by converting P-DATA-TF to A-ABORT -->
+<embedded_functions><![CDATA[
+    static void em_abort_during_transfer(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        int is_string = 0;
+        int new_val = 7; // A-ABORT PDU type
+        replace_dicom_attribute(701, 1, &new_val, is_string);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="57" type_property="FORWARD"
+        description="Convert P-DATA-TF to A-ABORT to disrupt active data transfer"
+        if_satisfied="em_abort_during_transfer">
+    <event description="Got DICOM P-DATA-TF packet (PDU type 4)"
+        boolean_expression="(dicom.pdu_type == 4)"/>
+</property>
+</beginning>

@@ -1,0 +1,19 @@
+<beginning>
+<!-- Property 67: Response Manipulation - Replace command with C-CANCEL -->
+<embedded_functions><![CDATA[
+    static void em_inject_cancel(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        uint16_t cancel_cmd = 0x0FFF; // C-CANCEL command
+        replace_dicom_attribute(701, 14, &cancel_cmd, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="67" type_property="FORWARD"
+        description="Replace DIMSE command field with C-CANCEL (0x0FFF) to disrupt operations"
+        if_satisfied="em_inject_cancel">
+    <event description="Got DICOM P-DATA-TF command PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 3))"/>
+</property>
+</beginning>

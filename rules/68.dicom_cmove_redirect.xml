@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 68: C-MOVE/C-GET Target Redirection - Modify Move Destination -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(22, "dictionaries/move_destinations.txt");
+    }
+
+    static void em_cmove_redirect(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        fuzz_dicom_attribute(701, 22, FUZZ_DICTIONARY, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="68" type_property="FORWARD"
+        description="Redirect C-MOVE/C-GET by modifying Move Destination AE Title"
+        if_satisfied="em_cmove_redirect">
+    <event description="Got DICOM P-DATA-TF command PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 3))"/>
+</property>
+</beginning>

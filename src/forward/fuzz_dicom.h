@@ -63,4 +63,17 @@ void fuzz_dicom_reset(void);
  */
 uint64_t fuzz_dicom_get_counter(uint32_t att_id);
 
+/*
+ * Extended DICOM attribute IDs for DIMSE dataset tags (Phase 3).
+ * These require dynamic tag search in find_and_replace_dimse_attribute().
+ */
+#define DICOM_ATT_MOVE_DESTINATION    22  /* (0000,0600) Move Destination */
+#define DICOM_ATT_PATIENT_ID          23  /* (0010,0020) Patient ID */
+#define DICOM_ATT_PATIENT_BIRTH_DATE  24  /* (0010,0030) Patient Birth Date */
+#define DICOM_ATT_PATIENT_SEX         25  /* (0010,0040) Patient Sex */
+#define DICOM_ATT_STUDY_INSTANCE_UID  26  /* (0020,000D) Study Instance UID */
+#define DICOM_ATT_ACCESSION_NUMBER    27  /* (0008,0050) Accession Number */
+#define DICOM_ATT_WINDOW_CENTER       28  /* (0028,1050) Window Center */
+#define DICOM_ATT_WINDOW_WIDTH        29  /* (0028,1051) Window Width */
+
 #endif /* SRC_FORWARD_FUZZ_DICOM_H_ */

@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 74: C-FIND Study Instance UID Enumeration -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(26, "dictionaries/study_instance_uids.txt");
+    }
+
+    static void em_cfind_study_uid_enum(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        fuzz_dicom_attribute(701, 26, FUZZ_DICTIONARY, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="74" type_property="FORWARD"
+        description="Enumerate studies via C-FIND by fuzzing Study Instance UID"
+        if_satisfied="em_cfind_study_uid_enum">
+    <event description="Got DICOM P-DATA-TF data PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 2))"/>
+</property>
+</beginning>

@@ -1,0 +1,10 @@
+# C-MOVE/C-GET target redirection dictionary
+# Move Destination AE Titles for redirecting retrieved studies
+ATTACKER_SCP
+EVIL_PACS
+EXFIL_NODE
+MY_STORAGE
+ROGUE_SCP
+EXTERNAL_ARC
+UNKNOWN_DEST
+TEST_RECEIVER

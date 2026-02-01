@@ -1,0 +1,20 @@
+<beginning>
+<!-- Property 63: DUL State Machine Confusion - Re-associate during data transfer -->
+<embedded_functions><![CDATA[
+    static void em_reassoc_mid_transfer(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        int is_string = 0;
+        int new_val = 1; // A-ASSOCIATE-RQ PDU type
+        replace_dicom_attribute(701, 1, &new_val, is_string);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="63" type_property="FORWARD"
+        description="Convert P-DATA-TF to A-ASSOCIATE-RQ to re-associate mid-transfer"
+        if_satisfied="em_reassoc_mid_transfer">
+    <event description="Got DICOM P-DATA-TF packet (PDU type 4)"
+        boolean_expression="(dicom.pdu_type == 4)"/>
+</property>
+</beginning>
