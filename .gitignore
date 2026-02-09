@@ -3,6 +3,8 @@
 *.pcap
 *.bin
 *.zip
+*.dcm
+*.npy
 
 # Maven
 target/
