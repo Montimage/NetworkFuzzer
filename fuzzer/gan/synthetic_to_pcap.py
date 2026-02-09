@@ -29,7 +29,7 @@ from datetime import datetime
 
 from scapy.all import IP, TCP, Raw, Ether, wrpcap, conf
 
-from attack_profiles import (
+from fuzzer.gan.attack_profiles import (
     ATTACK_PROFILES, MALFORMATION_MUTATIONS, PDU_TYPE_MAP,
     get_attack_profile, get_malformation_list,
     VERIFICATION_SOP, IMPLICIT_VR_LE, DICOM_APP_CONTEXT,

@@ -1,5 +1,8 @@
 # Log files
 *.log
+*.pcap
+*.bin
+*.zip
 
 # Maven
 target/

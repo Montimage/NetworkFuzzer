@@ -31,7 +31,7 @@ except ImportError as e:
     print("Please install ctgan: pip install ctgan")
     sys.exit(1)
 
-from attack_profiles import (
+from fuzzer.gan.attack_profiles import (
     ATTACK_PROFILES, get_attack_profile, list_attack_types, get_pdu_sequence,
     LEGITIMATE_AE_TITLES, VERIFICATION_SOP, CT_IMAGE_STORAGE, MR_IMAGE_STORAGE,
     US_IMAGE_STORAGE, IMPLICIT_VR_LE, EXPLICIT_VR_LE, DICOM_APP_CONTEXT,

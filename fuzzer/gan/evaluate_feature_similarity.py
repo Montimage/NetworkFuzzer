@@ -20,7 +20,7 @@ import logging
 from scipy.stats import chi2_contingency, ks_2samp, pearsonr, entropy
 from collections import Counter
 
-from attack_profiles import ATTACK_PROFILES, PDU_TYPE_MAP, get_attack_profile
+from fuzzer.gan.attack_profiles import ATTACK_PROFILES, PDU_TYPE_MAP, get_attack_profile
 
 logging.basicConfig(
     level=logging.INFO,
