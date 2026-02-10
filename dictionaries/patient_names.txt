@@ -1,0 +1,12 @@
+# DICOM Patient Name fuzzing dictionary
+# Format: Family^Given^Middle^Prefix^Suffix
+DOE^JOHN
+SMITH^JANE
+A
+
+X^Y^Z^W^V
+TOOLONGPN
+INVALID!@#
+O'BRIEN^J
+123456789
+""

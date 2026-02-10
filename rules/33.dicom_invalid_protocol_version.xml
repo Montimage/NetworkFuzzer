@@ -1,12 +1,11 @@
 <beginning>
-<!-- Property 33: Modify the DICOM protocol version to unsupported value 0xFFFF -->
+<!-- Property 33: Modify DICOM protocol version to unsupported value -->
 <embedded_functions><![CDATA[
     static void em_modify_dicom_version(
         const rule_info_t *rule, int verdict, uint64_t timestamp,
-        uint64_t counter, const mmt_array_t * const trace ){
-        int new_val = 0xFFFF;
+        uint64_t counter, const mmt_array_t * const trace) {
         int is_string = 0;
-        // Replace protocol version field (attribute ID 3 in protocol 701)
+        int new_val = 0xFFFF; // unsupported protocol version
         replace_dicom_attribute(701, 3, &new_val, is_string);
         forward_packet();
     }
@@ -15,7 +14,7 @@
 <property property_id="33" type_property="FORWARD"
         description="Modify DICOM protocol version to unsupported value (0xFFFF)"
         if_satisfied="em_modify_dicom_version">
-    <event description="Got any DICOM packets"
+    <event description="Got any DICOM packet"
         boolean_expression="((dicom.pdu_type &gt; 0) &amp;&amp; (dicom.pdu_type &lt; 8))"/>
 </property>
 </beginning>

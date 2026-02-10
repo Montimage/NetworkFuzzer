@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 59: CVE-2024-23914 - Format string attack on Application Context -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(6, "dictionaries/exploit_app_contexts.txt");
+    }
+
+    static void em_cve_format_string(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        fuzz_dicom_attribute(701, 6, FUZZ_DICTIONARY, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="59" type_property="FORWARD"
+        description="CVE-2024-23914: Fuzz Application Context with format string payloads"
+        if_satisfied="em_cve_format_string">
+    <event description="Got any DICOM PDU"
+        boolean_expression="((dicom.pdu_type &gt;= 1) &amp;&amp; (dicom.pdu_type &lt;= 7))"/>
+</property>
+</beginning>

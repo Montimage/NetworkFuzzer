@@ -1,5 +1,10 @@
 # Log files
 *.log
+*.pcap
+*.bin
+*.zip
+*.dcm
+*.npy
 
 # Maven
 target/

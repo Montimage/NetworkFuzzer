@@ -1,118 +1,22 @@
 <beginning>
-<!-- Property 40: Fuzz DICOM AE Titles with various patterns and log server responses -->
+<!-- Property 40: Fuzz DICOM Called AE Title with dictionary patterns -->
 <embedded_functions><![CDATA[
-    #include <stdlib.h>
-    #include <unistd.h>
-    #include <string.h>
-    #include <stdio.h>
-    #include <time.h>
-
-    static unsigned long int number_patterns = 0;
-    static int found_valid_ae_title = 0;
-    static char last_valid_ae_title[32] = "";
-
-    static char *ae_title_patterns[] = {
-        "DCM4CHEE",       // Another common DICOM server
-        "CONQUESTSRV1",   // Conquest DICOM server
-        "STORESCP",       // DCMTK store SCP
-        "MYPACS",         // Generic PACS
-        "VIEWER",         // Generic viewer
-        "OSIRIX",         // OsiriX
-        "HOROS",          // Horos (OsiriX fork)
-        "PACSONE",        // PacsOne
-        "DCMROUTER",      // DICOM router
-        "WORKSTATION",    // Generic workstation
-        "12345678901234", // Numeric only, 14 chars (valid)
-        "LOWERCASE",      // All lowercase (valid but unusual)
-        "A",              // Single char (valid but unusual)
-        "TOOLONGAETITLE16", // 16 chars - max length (valid)
-        "",               // Empty (invalid)
-        "INVALID!@#$%",   // Special chars (invalid)
-        "WAYTOOLONGAETITLEOVER16CHARS", // Too long (invalid)
-        "     ",          // All spaces (invalid)
-        "ORTHANC",        // Valid known one
-        "MODALITY",       // Standard valid one
-    };
+    #include "fuzz_dicom.h"
 
     void on_load() {
-        number_patterns = sizeof(ae_title_patterns) / sizeof(ae_title_patterns[0]);
-        found_valid_ae_title = 0;
-        memset(last_valid_ae_title, 0, sizeof(last_valid_ae_title));
-        log_info("DICOM AE Title fuzzer loaded with %lu patterns", number_patterns);
-    }
-
-    // Check if the injector context has a valid AE title
-    // This checks if the global variable has been set in inject_dicom.c
-    static int check_for_valid_ae_title() {
-        // This is a callback function signature that will be called
-        // after each packet injection to check if we should continue
-        FILE *fp = fopen("/tmp/dicom_ae_result", "r");
-        if (fp) {
-            char buffer[256];
-            if (fgets(buffer, sizeof(buffer), fp)) {
-                buffer[strcspn(buffer, "\n")] = 0; // Remove newline
-                if (strstr(buffer, "ACCEPTED:")) {
-                    char *ae_title = buffer + 9; // Skip "ACCEPTED:"
-                    log_info("Found valid AE Title: '%s'", ae_title);
-                    strncpy(last_valid_ae_title, ae_title, sizeof(last_valid_ae_title)-1);
-                    found_valid_ae_title = 1;
-                    fclose(fp);
-                    return 1; // Found valid AE
-                }
-            }
-            fclose(fp);
-            return 0; // No valid AE title found
-        }
-        return 0; // File doesn't exist
+        fuzz_dicom_load_dictionary(4, "dictionaries/ae_titles.txt");
     }
 
     static void em_fuzz_dicom_ae_titles(
         const rule_info_t *rule, int verdict, uint64_t timestamp,
         uint64_t counter, const mmt_array_t * const trace) {
-
-        log_info("Starting DICOM AE Title fuzzing");
-
-        // Reset the status file
-        FILE *fp = fopen("/tmp/dicom_ae_result", "w");
-        if (fp) {
-            fprintf(fp, "PENDING\n");
-            fclose(fp);
-        }
-
-        // Loop through all patterns and forward each modified packet
-        for (int i = 0; i < number_patterns; i++) {
-            char *ae_title = ae_title_patterns[i];
-            log_info("Fuzzing with AE Title: '%s'", ae_title);
-            replace_dicom_attribute(701, 4, ae_title, 1);
-            forward_packet();
-            usleep(500000);  // 500ms delay - increased to ensure response is processed
-
-            if (check_for_valid_ae_title()) {
-                log_info("Stopping fuzzing early - found valid AE title: '%s'", last_valid_ae_title);
-                break;
-            }
-        }
-
-        if (found_valid_ae_title) {
-            log_info("DICOM fuzzing successful - found valid AE title: '%s'", last_valid_ae_title);
-        } else {
-            log_info("Completed DICOM AE Title fuzzing - no valid AE titles found among %lu patterns", number_patterns);
-        }
-    }
-
-    void on_unload() {
-        if (found_valid_ae_title) {
-            log_info("DICOM AE Title fuzzer unloaded - valid AE title found: '%s'", last_valid_ae_title);
-        } else {
-            log_info("DICOM AE Title fuzzer unloaded - no valid AE titles found");
-        }
-        // Clean up
-        remove("/tmp/dicom_ae_result");
+        fuzz_dicom_attribute(701, 4, FUZZ_DICTIONARY, 0);
+        forward_packet();
     }
 ]]></embedded_functions>
 
 <property property_id="40" type_property="FORWARD"
-        description="Fuzz DICOM Calling AE Titles"
+        description="Fuzz DICOM Called AE Title with dictionary patterns"
         if_satisfied="em_fuzz_dicom_ae_titles">
     <event description="Got DICOM A-ASSOCIATE-RQ packet"
         boolean_expression="(dicom.pdu_type == 1)"/>

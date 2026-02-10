@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 75: Imaging Parameter Manipulation - Fuzz Window Center -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(28, "dictionaries/window_values.txt");
+    }
+
+    static void em_fuzz_window_center(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        fuzz_dicom_attribute(701, 28, FUZZ_DICTIONARY, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="75" type_property="FORWARD"
+        description="Manipulate image display by fuzzing Window Center value"
+        if_satisfied="em_fuzz_window_center">
+    <event description="Got DICOM P-DATA-TF data PDV"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 2))"/>
+</property>
+</beginning>

@@ -1,0 +1,26 @@
+<beginning>
+<!-- Property 55: Fuzz both abstract and transfer syntax with dictionary values -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(19, "dictionaries/abstract_syntaxes.txt");
+        fuzz_dicom_load_dictionary(20, "dictionaries/transfer_syntaxes.txt");
+    }
+
+    static void em_fuzz_both_syntaxes(
+         const rule_info_t *rule, int verdict, uint64_t timestamp,
+         uint64_t counter, const mmt_array_t * const trace ){
+         fuzz_dicom_attribute(701, 19, FUZZ_DICTIONARY, 0);
+         fuzz_dicom_attribute(701, 20, FUZZ_DICTIONARY, 0);
+         forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="55" type_property="FORWARD"
+     description="Fuzz both DICOM abstract and transfer syntax with dictionary values"
+     if_satisfied="em_fuzz_both_syntaxes">
+    <event description="Got DICOM A-ASSOCIATE-RQ"
+        boolean_expression="(dicom.pdu_type == 1)"/>
+</property>
+</beginning>

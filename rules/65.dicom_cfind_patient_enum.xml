@@ -1,0 +1,24 @@
+<beginning>
+<!-- Property 65: C-FIND Patient Name enumeration with wildcard patterns -->
+<embedded_functions><![CDATA[
+    #include "fuzz_dicom.h"
+
+    void on_load() {
+        fuzz_dicom_load_dictionary(15, "dictionaries/cfind_patient_wildcards.txt");
+    }
+
+    static void em_cfind_patient_enum(
+        const rule_info_t *rule, int verdict, uint64_t timestamp,
+        uint64_t counter, const mmt_array_t * const trace) {
+        fuzz_dicom_attribute(701, 15, FUZZ_DICTIONARY, 0);
+        forward_packet();
+    }
+]]></embedded_functions>
+
+<property property_id="65" type_property="FORWARD"
+        description="Enumerate patients via C-FIND with wildcard patterns in Patient Name"
+        if_satisfied="em_cfind_patient_enum">
+    <event description="Got DICOM P-DATA-TF data PDV (pdv_flags == 2)"
+        boolean_expression="((dicom.pdu_type == 4) &amp;&amp; (dicom.pdv_flags == 2))"/>
+</property>
+</beginning>
