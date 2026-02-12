@@ -47,6 +47,7 @@ EXAMPLE_RULE = """
 
 # Common DICOM attribute information
 DICOM_ATTRIBUTES = {
+    # PDU-level attributes (Association layer)
     "pdu_type": {
         "id": 1,
         "description": "PDU Type",
@@ -68,11 +69,80 @@ DICOM_ATTRIBUTES = {
     "presentation_context": {"id": 7, "description": "Presentation Context"},
     "max_pdu_length": {"id": 8, "description": "Maximum PDU Length"},
     "implementation_class_uid": {"id": 9, "description": "Implementation Class UID", "is_string": 1},
+    
+    # PDV-level attributes (P-DATA-TF)
     "pdv_length": {"id": 10, "description": "PDV Length"},
-    "pdv_context": {"id": 11, "description": "PDV Context"},
+    "pdv_context": {"id": 11, "description": "PDV Context ID"},
     "pdv_flags": {"id": 12, "description": "PDV Flags"},
-    "command_group_length": {"id": 13, "description": "Command Group Length"},
-    "command_field": {"id": 14, "description": "Command Field"},
+    
+    # DIMSE Command attributes
+    "command_group_length": {"id": 13, "description": "Command Group Length (0000,0000)"},
+    "command_field": {
+        "id": 14,
+        "description": "Command Field (0000,0100)",
+        "values": {
+            "C-STORE-RQ": 0x0001,
+            "C-STORE-RSP": 0x8001,
+            "C-FIND-RQ": 0x0020,
+            "C-FIND-RSP": 0x8020,
+            "C-GET-RQ": 0x0010,
+            "C-GET-RSP": 0x8010,
+            "C-MOVE-RQ": 0x0021,
+            "C-MOVE-RSP": 0x8021,
+            "C-ECHO-RQ": 0x0030,
+            "C-ECHO-RSP": 0x8030,
+            "C-CANCEL": 0x0FFF,
+            "N-EVENT-REPORT-RQ": 0x0100,
+            "N-EVENT-REPORT-RSP": 0x8100,
+            "N-GET-RQ": 0x0110,
+            "N-GET-RSP": 0x8110,
+            "N-SET-RQ": 0x0120,
+            "N-SET-RSP": 0x8120,
+            "N-CREATE-RQ": 0x0130,
+            "N-CREATE-RSP": 0x8130,
+            "N-ACTION-RQ": 0x0140,
+            "N-ACTION-RSP": 0x8140,
+            "N-DELETE-RQ": 0x0150,
+            "N-DELETE-RSP": 0x8150
+        }
+    },
+    "patient_name": {"id": 15, "description": "Patient Name", "is_string": 1},
+    "status": {
+        "id": 16,
+        "description": "Status (0000,0900)",
+        "values": {
+            "Success": 0x0000,
+            "Pending": 0xFF00,
+            "Pending with warnings": 0xFF01,
+            "Out of Resources": 0xA700,
+            "Data Set does not match SOP Class": 0xA900,
+            "Cannot understand / Error": 0xC000,
+            "Cancel": 0xFE00
+        }
+    },
+    "affected_sop_class_uid": {"id": 17, "description": "Affected SOP Class UID (0000,0002)", "is_string": 1},
+    "message_id": {"id": 18, "description": "Message ID (0000,0110)"},
+    "abstract_syntax": {"id": 19, "description": "Abstract Syntax (Presentation Context)", "is_string": 1},
+    "transfer_syntax": {"id": 20, "description": "Transfer Syntax (Presentation Context)", "is_string": 1},
+    "data_set_type": {
+        "id": 21,
+        "description": "Data Set Type (0000,0800)",
+        "values": {
+            "No Data Set": 0x0101,
+            "Data Set Present": 0x0000
+        }
+    },
+    
+    # Extended DIMSE dataset tags (Phase 3)
+    "move_destination": {"id": 22, "description": "Move Destination (0000,0600)", "is_string": 1},
+    "patient_id": {"id": 23, "description": "Patient ID (0010,0020)", "is_string": 1},
+    "patient_birth_date": {"id": 24, "description": "Patient Birth Date (0010,0030)", "is_string": 1},
+    "patient_sex": {"id": 25, "description": "Patient Sex (0010,0040)", "is_string": 1},
+    "study_instance_uid": {"id": 26, "description": "Study Instance UID (0020,000D)", "is_string": 1},
+    "accession_number": {"id": 27, "description": "Accession Number (0008,0050)", "is_string": 1},
+    "window_center": {"id": 28, "description": "Window Center (0028,1050)", "is_string": 1},
+    "window_width": {"id": 29, "description": "Window Width (0028,1051)", "is_string": 1},
+    
     # Meta-attributes below - not suitable for direct fuzzing
     "p_hdr": {"id": 4096, "description": "Packet Header", "note": "This is a meta-attribute and may not be suitable for direct fuzzing"},
     "p_data": {"id": 4097, "description": "Packet Data", "note": "This is a meta-attribute and may not be suitable for direct fuzzing"},
@@ -106,6 +176,19 @@ def generate_rule_with_openai(prompt: str, model: str = "gpt-4") -> str:
         valid_attributes = ", ".join([f"'{attr}' (ID: {data['id']})" for attr, data in DICOM_ATTRIBUTES.items()
                                      if not ("note" in data and "meta-attribute" in data["note"])])
 
+        # Categorize attributes for better guidance
+        pdu_attrs = [f"'{k}' (ID: {v['id']})" for k, v in DICOM_ATTRIBUTES.items() 
+                     if v['id'] in [1, 2, 3, 4, 5, 6, 7, 8, 9]]
+        pdv_attrs = [f"'{k}' (ID: {v['id']})" for k, v in DICOM_ATTRIBUTES.items() 
+                     if v['id'] in [10, 11, 12]]
+        dimse_attrs = [f"'{k}' (ID: {v['id']})" for k, v in DICOM_ATTRIBUTES.items() 
+                       if v['id'] in [13, 14, 15, 16, 17, 18, 19, 20, 21]]
+        dataset_attrs = [f"'{k}' (ID: {v['id']})" for k, v in DICOM_ATTRIBUTES.items() 
+                         if v['id'] in [22, 23, 24, 25, 26, 27, 28, 29]]
+        
+        string_attrs = [f"'{k}' (ID: {v['id']})" for k, v in DICOM_ATTRIBUTES.items() 
+                        if v.get('is_string') == 1]
+        
         system_prompt = f"""
         You are an expert in DICOM protocol testing and network fuzzing. Your task is to generate XML rules
         for testing DICOM attributes with valid or invalid values.
@@ -133,6 +216,32 @@ def generate_rule_with_openai(prompt: str, model: str = "gpt-4") -> str:
         3. Define correct boolean_expression based on the attribute being tested
         4. Use replace_dicom_attribute() with protocol ID 701 and the correct attribute ID
         5. Properly set is_string to 1 for string values and 0 for numeric values
+
+        DICOM ATTRIBUTE CATEGORIES:
+        
+        PDU-level attributes (Association layer): {', '.join(pdu_attrs)}
+        - Used in A-ASSOCIATE-RQ/AC/RJ, A-RELEASE, A-ABORT PDUs
+        - Match with: dicom.pdu_type conditions
+        
+        PDV-level attributes (P-DATA-TF): {', '.join(pdv_attrs)}
+        - Used in P-DATA-TF PDUs (pdu_type == 4)
+        - Match with: dicom.pdu_type == 4
+        
+        DIMSE Command attributes: {', '.join(dimse_attrs)}
+        - Used in DIMSE command messages within P-DATA-TF
+        - Match with: dicom.pdu_type == 4 and dicom.command_field conditions
+        
+        Extended DIMSE dataset tags: {', '.join(dataset_attrs)}
+        - Used in DIMSE dataset messages (C-FIND, C-MOVE, etc.)
+        - Match with: dicom.pdu_type == 4 and specific command_field values
+        
+        STRING ATTRIBUTES (is_string = 1): {', '.join(string_attrs)}
+        - Use string values in quotes
+        - Examples: "INVALID_AE", "1.2.840.10008.1.1", "JOHN^DOE"
+        
+        NUMERIC ATTRIBUTES (is_string = 0): All others
+        - Use integer values
+        - Examples: 10000, 0xFFFF, 0x0001
 
         IMPORTANT: You can ONLY use the following DICOM attributes:
         {valid_attributes}
