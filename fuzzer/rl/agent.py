@@ -7,6 +7,7 @@ DicomFuzzEnv environment.
 """
 
 import os
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,8 @@ class ProgressCallback:
         self.hangs = 0
         self.crashes = 0
         self.last_log = 0
+        self.num_timesteps = 0
+        self.start_time = time.monotonic()
 
     def __call__(self, locals_, globals_):
         """Called after each step."""
@@ -90,14 +93,18 @@ class ProgressCallback:
                     if info.get('crash'):
                         self.crashes += 1
 
-        timesteps = locals_.get('num_timesteps', 0)
-        if timesteps - self.last_log >= self.log_interval:
-            progress = timesteps / self.total_timesteps * 100
-            logger.info(f"Progress: {timesteps}/{self.total_timesteps} ({progress:.1f}%) | "
+        self.num_timesteps = locals_.get('num_timesteps', 0)
+        if self.num_timesteps - self.last_log >= self.log_interval:
+            progress = self.num_timesteps / self.total_timesteps * 100
+            logger.info(f"Progress: {self.num_timesteps}/{self.total_timesteps} ({progress:.1f}%) | "
                        f"Hangs: {self.hangs} | Crashes: {self.crashes}")
-            self.last_log = timesteps
+            self.last_log = self.num_timesteps
 
         return True
+
+    @property
+    def elapsed_seconds(self):
+        return time.monotonic() - self.start_time
 
 
 def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_fuzzer.zip",
@@ -110,6 +117,13 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
         total_timesteps: total training steps
         model_path: where to save the trained model
         log_interval: log every N episodes
+
+    Returns:
+        model: the trained (or partially trained) model
+
+    Raises:
+        KeyboardInterrupt: re-raised after saving the model so callers
+            can print summary stats.
     """
     os.makedirs(os.path.dirname(model_path) or '.', exist_ok=True)
 
@@ -121,11 +135,21 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
         total_timesteps=total_timesteps
     )
 
-    model.learn(total_timesteps=total_timesteps, log_interval=log_interval, callback=callback)
+    interrupted = False
+    try:
+        model.learn(total_timesteps=total_timesteps, log_interval=log_interval, callback=callback)
+    except KeyboardInterrupt:
+        interrupted = True
+        logger.info(f"\nTraining interrupted after {callback.num_timesteps}/{total_timesteps} timesteps "
+                    f"({callback.elapsed_seconds:.1f}s)")
 
-    logger.info(f"Training complete. Total hangs: {callback.hangs}, crashes: {callback.crashes}")
+    # Always save model
+    logger.info(f"Hangs: {callback.hangs}, Crashes: {callback.crashes}")
     model.save(model_path)
     logger.info(f"Model saved to {model_path}")
+
+    if interrupted:
+        raise KeyboardInterrupt()
 
     return model
 

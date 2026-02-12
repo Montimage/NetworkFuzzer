@@ -22,6 +22,7 @@ Usage:
 
 import os
 import sys
+import time
 import argparse
 import logging
 
@@ -204,88 +205,149 @@ Examples:
     from fuzzer.rl.agent import create_agent, train_agent, run_agent
 
     model = create_agent(env, algorithm=args.algorithm)
-    model = train_agent(model, total_timesteps=args.timesteps, model_path=args.model_out)
+    start_time = time.monotonic()
 
-    # Test
-    if args.test:
-        print(f"\n{'=' * 90}")
-        print(f"TEST RUN ({args.n_test} episodes)")
-        print(f"{'=' * 90}")
+    try:
+        model = train_agent(model, total_timesteps=args.timesteps, model_path=args.model_out)
 
-        results = run_agent(model, env, n_episodes=args.n_test)
+        # Test
+        if args.test:
+            print(f"\n{'=' * 90}")
+            print(f"TEST RUN ({args.n_test} episodes)")
+            print(f"{'=' * 90}")
 
-        os.makedirs(args.output_dir, exist_ok=True)
+            results = run_agent(model, env, n_episodes=args.n_test)
 
-        print(f"\n{'Ep':>3} {'Reward':>7} {'Action Type':<12} {'Details':<30} "
-              f"{'Response':<12} {'Crash':>6} {'Hang':>6}")
-        print("-" * 100)
+            os.makedirs(args.output_dir, exist_ok=True)
 
-        total_crashes = 0
-        total_hangs = 0
-        action_results = {}
+            print(f"\n{'Ep':>3} {'Reward':>7} {'Action Type':<12} {'Details':<30} "
+                  f"{'Response':<12} {'Crash':>6} {'Hang':>6}")
+            print("-" * 100)
 
-        for i, (pdu_bytes, ep_reward, info) in enumerate(results):
-            action_type = info.get('action_type', 'unknown')
-            details = info.get('mutation', info.get('payload', info.get('sequence', '-')))
-            resp = info.get('response', 'none')
-            crash = "CRASH!" if info.get('crash', False) else ""
-            hang = "HANG!" if info.get('hang', False) else ""
+            total_crashes = 0
+            total_hangs = 0
+            action_results = {}
 
-            if info.get('crash'):
-                total_crashes += 1
-            if info.get('hang'):
-                total_hangs += 1
+            for i, (pdu_bytes, ep_reward, info) in enumerate(results):
+                action_type = info.get('action_type', 'unknown')
+                details = info.get('mutation', info.get('payload', info.get('sequence', '-')))
+                resp = info.get('response', 'none')
+                crash = "CRASH!" if info.get('crash', False) else ""
+                hang = "HANG!" if info.get('hang', False) else ""
 
-            # Track action effectiveness
-            action_key = f"{action_type}"
-            if action_key not in action_results:
-                action_results[action_key] = {"count": 0, "reward": 0, "crashes": 0, "hangs": 0}
-            action_results[action_key]["count"] += 1
-            action_results[action_key]["reward"] += ep_reward
-            if info.get('crash'):
-                action_results[action_key]["crashes"] += 1
-            if info.get('hang'):
-                action_results[action_key]["hangs"] += 1
+                if info.get('crash'):
+                    total_crashes += 1
+                if info.get('hang'):
+                    total_hangs += 1
 
-            print(f"{i+1:>3} {ep_reward:>7.1f} {action_type:<12} {str(details)[:30]:<30} "
-                  f"{resp:<12} {crash:>6} {hang:>6}")
+                # Track action effectiveness
+                action_key = f"{action_type}"
+                if action_key not in action_results:
+                    action_results[action_key] = {"count": 0, "reward": 0, "crashes": 0, "hangs": 0}
+                action_results[action_key]["count"] += 1
+                action_results[action_key]["reward"] += ep_reward
+                if info.get('crash'):
+                    action_results[action_key]["crashes"] += 1
+                if info.get('hang'):
+                    action_results[action_key]["hangs"] += 1
 
-            # Show response sequence
-            for r in info.get('responses', []):
-                print(f"      -> {r['message']}: {r['response']} ({r.get('time_ms', 0):.0f}ms)")
+                print(f"{i+1:>3} {ep_reward:>7.1f} {action_type:<12} {str(details)[:30]:<30} "
+                      f"{resp:<12} {crash:>6} {hang:>6}")
 
-        print("-" * 100)
+                # Show response sequence
+                for r in info.get('responses', []):
+                    print(f"      -> {r['message']}: {r['response']} ({r.get('time_ms', 0):.0f}ms)")
 
-        rewards = [r[1] for r in results]
-        print(f"\nSummary:")
-        print(f"  Avg reward:     {sum(rewards)/len(rewards):.1f}")
-        print(f"  Total crashes:  {total_crashes}")
-        print(f"  Total hangs:    {total_hangs}")
+            print("-" * 100)
 
-        print(f"\n  Action type effectiveness:")
-        for action, data in sorted(action_results.items(), key=lambda x: -x[1]["reward"]):
-            avg = data['reward'] / max(data['count'], 1)
-            print(f"    {action:<15} avg={avg:.1f} "
-                  f"crashes={data['crashes']} hangs={data['hangs']} n={data['count']}")
+            rewards = [r[1] for r in results]
+            print(f"\nSummary:")
+            print(f"  Avg reward:     {sum(rewards)/len(rewards):.1f}")
+            print(f"  Total crashes:  {total_crashes}")
+            print(f"  Total hangs:    {total_hangs}")
 
-        # Show top actions from environment stats
-        print(f"\n  Top actions (from training):")
-        for action, stats in env.get_action_stats(10):
+            print(f"\n  Action type effectiveness:")
+            for action, data in sorted(action_results.items(), key=lambda x: -x[1]["reward"]):
+                avg = data['reward'] / max(data['count'], 1)
+                print(f"    {action:<15} avg={avg:.1f} "
+                      f"crashes={data['crashes']} hangs={data['hangs']} n={data['count']}")
+
+            # Show top actions from environment stats
+            print(f"\n  Top actions (from training):")
+            for action, stats in env.get_action_stats(10):
+                avg = stats['reward'] / max(stats['count'], 1)
+                print(f"    {action:<40} avg={avg:.1f} n={stats['count']}")
+
+            # Final health check
+            if args.target_host:
+                print(f"\n--- Post-Training Health Check ---")
+                health = adapter.check_health(args.target_host, target_port)
+                print(f"  Healthy:  {health.is_healthy}")
+                print(f"  Latency:  {health.latency_ms:.1f} ms")
+                if health.error:
+                    print(f"  Error:    {health.error}")
+
+    except KeyboardInterrupt:
+        _print_interrupt_summary(env, model, start_time, adapter,
+                                args.target_host, target_port)
+
+    finally:
+        env.close()
+        print("\nDone.")
+
+    return 0
+
+
+def _print_interrupt_summary(env, model, start_time, adapter, target_host, target_port):
+    """Print training summary after Ctrl+C interruption."""
+    elapsed = time.monotonic() - start_time
+
+    print(f"\n{'=' * 70}")
+    print(f"TRAINING INTERRUPTED (Ctrl+C)")
+    print(f"{'=' * 70}")
+
+    # Duration
+    mins, secs = divmod(elapsed, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs > 0:
+        print(f"  Duration:       {int(hrs)}h {int(mins)}m {int(secs)}s")
+    elif mins > 0:
+        print(f"  Duration:       {int(mins)}m {int(secs)}s")
+    else:
+        print(f"  Duration:       {secs:.1f}s")
+
+    # Timesteps from model
+    if model and hasattr(model, 'num_timesteps'):
+        print(f"  Timesteps:      {model.num_timesteps}")
+
+    # Environment counters
+    print(f"  Hangs:          {env.counters['hangs']}")
+    print(f"  Crashes:        {env.counters['crashes']}")
+    print(f"  Successes:      {env.counters['successes']}")
+    print(f"  Errors:         {env.counters['errors']}")
+
+    # Top actions
+    top_actions = env.get_action_stats(10)
+    if top_actions:
+        print(f"\n  Top actions (by avg reward):")
+        for action, stats in top_actions:
             avg = stats['reward'] / max(stats['count'], 1)
-            print(f"    {action:<40} avg={avg:.1f} n={stats['count']}")
+            print(f"    {action:<40} avg={avg:.1f} n={stats['count']} "
+                  f"crashes={stats['crashes']} hangs={stats['hangs']}")
 
-        # Final health check
-        if args.target_host:
-            print(f"\n--- Post-Training Health Check ---")
-            health = adapter.check_health(args.target_host, target_port)
+    # Health check
+    if target_host:
+        print(f"\n--- Post-Interrupt Health Check ---")
+        try:
+            health = adapter.check_health(target_host, target_port, timeout=3.0)
             print(f"  Healthy:  {health.is_healthy}")
             print(f"  Latency:  {health.latency_ms:.1f} ms")
             if health.error:
                 print(f"  Error:    {health.error}")
+        except Exception as e:
+            print(f"  Health check failed: {e}")
 
-    env.close()
-    print("\nDone.")
-    return 0
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":
