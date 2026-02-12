@@ -35,7 +35,8 @@ inject_proto_context_t* inject_proto_alloc( const config_t *config ){
 			break;
 
 		case FORWARD_PACKET_PROTO_DICOM:
-			context->dicom = inject_dicom_alloc(target, conf->nb_copies );
+			context->dicom = inject_dicom_alloc(target, conf->nb_copies,
+				conf->dicom_called_ae, conf->dicom_calling_ae );
 			break;
 
 		default:
@@ -92,7 +93,11 @@ static inline int _get_tcp_data_offset( const ipacket_t *ipacket ){
 	if( index == -1 )
 		return -1;
 	//offset of tcp in packet
-	return get_packet_offset_at_index(ipacket, index) + 32; //32 bytes of TCP header (TODO: better approach?)
+	int tcp_offset = get_packet_offset_at_index(ipacket, index);
+	// Read actual TCP header length from the data offset field (high 4 bits of byte 12)
+	uint8_t tcp_hdr_byte = *(uint8_t*)((uint8_t*)ipacket->data + tcp_offset + 12);
+	int tcp_hdr_len = ((tcp_hdr_byte >> 4) & 0x0F) * 4;
+	return tcp_offset + tcp_hdr_len;
 }
 
 static inline int _get_dicom_data_offset(const ipacket_t *ipacket) {
