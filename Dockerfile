@@ -17,7 +17,10 @@ RUN git clone --depth 1 --branch dicom https://github.com/Montimage/mmt-dpi.git 
     make -j2 && make install && ldconfig && \
     cd /tmp && rm -rf mmt-dpi
 
-# Copy requirements.txt and install Python dependencies
+# Install PyTorch CPU-only version first (prevents CUDA dependencies)
+RUN pip3 install --no-cache-dir torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Copy requirements.txt and install remaining Python dependencies
 COPY utils/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && \
     rm /tmp/requirements.txt
