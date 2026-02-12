@@ -21,8 +21,8 @@
 #define DEFAULT_CONFIG_FILE "./networkfuzzer.conf"
 
 // Global variable to control whether to send A-ASSOCIATE-RQ
-// Default is false (don't send), set to true when -A option is used
-bool g_send_associate_rq = false;
+// Default is true (send association), can be disabled with command-line option
+bool g_send_associate_rq = true;
 
 // A-ASSOCIATE-RQ packet with exact byte values from the hex dump
 const unsigned char a_associate_rq[] = {
@@ -239,17 +239,14 @@ void _dicom_connect(inject_dicom_context_t *context) {
 
     // 4. Send A-ASSOCIATE RQ (Association Request) if enabled
     if (g_send_associate_rq) {
-        printf("Expected A-ASSOCIATE-RQ size: %lu bytes\n", sizeof(a_associate_rq));
-
         bytes_sent = send(sockfd, a_associate_rq, sizeof(a_associate_rq), 0);
         if (bytes_sent < 0) {
             perror("[-] Failed to send A-ASSOCIATE RQ");
             close(sockfd);
             exit(EXIT_FAILURE);
         }
-        printf("[+] A-ASSOCIATE RQ sent (%ld bytes)\n", bytes_sent);
-    } else {
-        printf("[DICOM] Skipping A-ASSOCIATE RQ as per configuration\n");
+        // Only show in verbose mode
+        // printf("[+] A-ASSOCIATE RQ sent (%ld bytes)\n", bytes_sent);
     }
 
     // Assign socket to context client_fd
