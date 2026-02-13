@@ -90,6 +90,8 @@ static inline cfg_t *_load_cfg_from_file(const char *filename) {
 			CFG_STR_LIST("target-protocols", "{}", CFGF_NONE),
 			CFG_STR_LIST("target-hosts",     "{}", CFGF_NONE),
 			CFG_STR_LIST("target-ports",     "{}", CFGF_NONE),
+			CFG_STR("dicom-called-ae",  "ORTHANC",  CFGF_NONE),
+			CFG_STR("dicom-calling-ae", "MODALITY", CFGF_NONE),
 			CFG_END()
 		};
 
@@ -267,6 +269,8 @@ static inline forward_packet_conf_t *_parse_forward_packet( cfg_t *cfg ){
 	ret->promisc = _cfg_getint( cfg, "promisc", 0, 1, 1 );
 	ret->default_action = cfg_getint( cfg, "default" );
 	ret->bind_ip = _cfg_get_str(cfg, "bind-ip");
+	ret->dicom_called_ae = _cfg_get_str(cfg, "dicom-called-ae");
+	ret->dicom_calling_ae = _cfg_get_str(cfg, "dicom-calling-ae");
 
 	ret->target_size = cfg_size( cfg, "target-protocols");
 	ASSERT( ret->target_size == cfg_size( cfg, "target-hosts"), "Number of elements in target-protocols and target-hosts are different");
@@ -426,6 +430,8 @@ void conf_release( config_t *conf){
 			mmt_mem_free( conf->forward->targets[i].host );
 		}
 		mmt_mem_free( conf->forward->targets );
+		mmt_mem_free( conf->forward->dicom_called_ae );
+		mmt_mem_free( conf->forward->dicom_calling_ae );
 		mmt_mem_free( conf->forward );
 	}
 	if( conf->dump_packet ){

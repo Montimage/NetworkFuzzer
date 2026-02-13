@@ -21,6 +21,7 @@ Usage:
 
 import os
 import sys
+import time
 import argparse
 import logging
 import glob
@@ -365,7 +366,15 @@ def main():
     from fuzzer.rl.agent import create_agent, train_agent, run_agent
 
     model = create_agent(env, algorithm=args.algorithm)
-    model = train_agent(model, total_timesteps=args.timesteps, model_path=args.model_out)
+    start_time = time.monotonic()
+
+    try:
+        model = train_agent(model, total_timesteps=args.timesteps, model_path=args.model_out)
+    except KeyboardInterrupt:
+        _print_interrupt_summary(env, model, start_time, args)
+        env.close()
+        print("\nDone.")
+        return
 
     # Test
     if args.test:
@@ -782,6 +791,67 @@ def main():
 
     env.close()
     print("\nDone.")
+
+
+def _print_interrupt_summary(env, model, start_time, args):
+    """Print training summary after Ctrl+C interruption."""
+    elapsed = time.monotonic() - start_time
+
+    print(f"\n{'=' * 70}")
+    print(f"TRAINING INTERRUPTED (Ctrl+C)")
+    print(f"{'=' * 70}")
+
+    # Duration
+    mins, secs = divmod(elapsed, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs > 0:
+        print(f"  Duration:       {int(hrs)}h {int(mins)}m {int(secs)}s")
+    elif mins > 0:
+        print(f"  Duration:       {int(mins)}m {int(secs)}s")
+    else:
+        print(f"  Duration:       {secs:.1f}s")
+
+    # Timesteps
+    if model and hasattr(model, 'num_timesteps'):
+        print(f"  Timesteps:      {model.num_timesteps}")
+
+    # Environment counters (varies by env type)
+    if hasattr(env, 'counters'):
+        for key, val in env.counters.items():
+            print(f"  {key.capitalize():<14}  {val}")
+
+    # Top actions/combos
+    if hasattr(env, 'get_action_stats'):
+        top = env.get_action_stats(10)
+        if top:
+            print(f"\n  Top actions (by avg reward):")
+            for action, stats in top:
+                avg = stats['reward'] / max(stats['count'], 1)
+                print(f"    {action:<40} avg={avg:.1f} n={stats['count']} "
+                      f"crashes={stats['crashes']} hangs={stats['hangs']}")
+    elif hasattr(env, 'get_combo_stats'):
+        top = env.get_combo_stats()[:10]
+        if top:
+            print(f"\n  Top combos (by avg reward):")
+            for combo, stats in top:
+                if stats['count'] > 0:
+                    avg = stats['reward'] / stats['count']
+                    print(f"    {combo:<30} avg={avg:.1f} n={stats['count']} "
+                          f"crashes={stats['crashes']} hangs={stats['hangs']}")
+
+    # Health check
+    if args.target_host and hasattr(env, 'server_monitor') and env.server_monitor:
+        print(f"\n--- Post-Interrupt Health Check ---")
+        try:
+            health = env.server_monitor.check_health(full=True)
+            print(f"  Echo latency:   {health.echo_latency_ms:.1f} ms")
+            print(f"  Health score:   {health.health_score():.0f}/100")
+            if health.error:
+                print(f"  Error:          {health.error}")
+        except Exception as e:
+            print(f"  Health check failed: {e}")
+
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":

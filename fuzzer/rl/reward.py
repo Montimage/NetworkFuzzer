@@ -23,6 +23,8 @@ import tempfile
 import logging
 import time
 import struct
+import select
+import socket
 
 from scapy.all import wrpcap
 
@@ -41,14 +43,17 @@ RJ_REASONS_PRES = {0: "no-reason", 1: "temporary-congestion", 2: "local-limit-ex
 # Parser depth scores — deeper parsing = more interesting
 RJ_SOURCE_DEPTH = {1: 1.0, 2: 2.0, 3: 3.0}
 
-# v2: Response type base rewards (differentiated)
-# Common/graceful responses get lower rewards to discourage convergence
+# v3: Response type base rewards (differentiated)
+# De-prioritize silent closes and common rejections
+# Promote true hangs, crashes, and deep parsing errors
 RESPONSE_BASE_REWARDS = {
-    "reset": 1.0,           # Very common, server just closes - not interesting
-    "closed": 1.5,          # Connection closed normally
+    "reset": 0.5,           # Very common, server just closes - not interesting
+    "closed": 0.5,          # Connection closed normally - not interesting
+    "silent_close": 1.0,    # Server closed without response - expected for malformed input
     "reject": 4.0,          # Server parsed and rejected - somewhat interesting
     "abort": 12.0,          # Server entered abort state - interesting!
-    "timeout": 40.0,        # Server hung processing - very interesting!
+    "true_hang": 50.0,      # TRUE hang: socket alive, no response - VERY interesting!
+    "timeout": 8.0,         # Generic timeout (may be silent close) - low reward
     "accept": 20.0,         # Accepted despite mutations - interesting!
     "refused": 3.0,         # Connection refused
     "connect_timeout": 8.0, # Couldn't connect - may indicate DoS
@@ -388,20 +393,20 @@ class RewardComputer:
         """
         Send PDU to live target with response timing and deep parsing.
 
-        v2 Changes:
-          - Use differentiated base rewards per response type
-          - Penalize common rejection reasons
-          - Aggressive time scaling (linear up to cap)
-          - Novelty decay for repeated responses
+        v3 Changes:
+          - Distinguish true hangs from silent closes using socket state detection
+          - Downgrade silent close rewards (expected behavior for malformed input)
+          - Keep high rewards for true hangs and crashes
+          - Use fine-grained polling to detect closures quickly
         """
         info = {"live_response": "none", "crash": False,
                 "response_time_ms": 0, "reject_source": "", "reject_reason": "",
                 "parser_depth": 0, "response_novelty": False,
-                "common_response": False, "rare_response": False}
+                "common_response": False, "rare_response": False,
+                "true_hang": False, "silent_close": False}
         reward = 0.0
 
         try:
-            import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5.0)
 
@@ -409,116 +414,141 @@ class RewardComputer:
             sock.connect((self.target_host, self.target_port))
             sock.sendall(pdu_bytes)
 
-            sock.settimeout(3.0)
-            try:
-                t_send = time.monotonic()
-                response = sock.recv(4096)
-                t_recv = time.monotonic()
-                response_ms = (t_recv - t_send) * 1000.0
-                info["response_time_ms"] = round(response_ms, 1)
+            # v3: Use fine-grained polling to detect closures vs true hangs
+            t_send = time.monotonic()
+            response, closed, elapsed = wait_for_response_or_closure(sock, 3000)  # 3s timeout
+            info["response_time_ms"] = round(elapsed, 1)
 
-                self.seen_response_times.append(response_ms)
+            self.seen_response_times.append(elapsed)
 
-                if not response:
+            if closed:
+                # Server closed connection without sending response
+                info["live_response"] = "silent_close"
+                info["silent_close"] = True
+                info["parser_depth"] = 0.5
+                reward += RESPONSE_BASE_REWARDS.get("silent_close", 1.0)
+            
+            elif not response:
+                # No response but socket still alive - check if true hang
+                if is_socket_alive(sock):
+                    # TRUE HANG: socket alive but no response
+                    info["live_response"] = "true_hang"
+                    info["true_hang"] = True
+                    info["parser_depth"] = 5.0
+                    reward += RESPONSE_BASE_REWARDS.get("true_hang", 50.0)
+                else:
+                    # Socket died during wait
                     info["live_response"] = "closed"
                     info["parser_depth"] = 0.5
-                    reward += RESPONSE_BASE_REWARDS.get("closed", 1.5)
+                    reward += RESPONSE_BASE_REWARDS.get("closed", 0.5)
 
-                elif len(response) >= 1:
-                    resp_type = response[0]
+            elif response and len(response) >= 1:
+                resp_type = response[0]
 
-                    if resp_type == 0x03:  # A-ASSOCIATE-RJ
-                        info["live_response"] = "reject"
-                        rj = parse_reject_pdu(response)
-                        info["reject_source"] = rj["source_name"]
-                        info["reject_reason"] = rj["reason_name"]
-                        info["parser_depth"] = rj["depth"]
+                if resp_type == 0x03:  # A-ASSOCIATE-RJ
+                    info["live_response"] = "reject"
+                    rj = parse_reject_pdu(response)
+                    info["reject_source"] = rj["source_name"]
+                    info["reject_reason"] = rj["reason_name"]
+                    info["parser_depth"] = rj["depth"]
 
-                        # v2: Base reward from lookup
-                        reward += RESPONSE_BASE_REWARDS.get("reject", 4.0)
-                        # Depth bonus (deeper parsing = more interesting)
-                        reward += rj["depth"] * 2.0
+                    # v2: Base reward from lookup
+                    reward += RESPONSE_BASE_REWARDS.get("reject", 4.0)
+                    # Depth bonus (deeper parsing = more interesting)
+                    reward += rj["depth"] * 2.0
 
-                        # v2: Penalize common rejection reasons
-                        reject_key = (rj["source_name"], rj["reason_name"])
-                        if reject_key in COMMON_REJECT_REASONS:
-                            reward -= 2.0  # Penalty for common rejection
-                            info["common_response"] = True
-                        elif reject_key in RARE_REJECT_REASONS:
-                            reward += 8.0  # Bonus for rare rejection
-                            info["rare_response"] = True
-
-                    elif resp_type == 0x07:  # A-ABORT
-                        info["live_response"] = "abort"
-                        info["parser_depth"] = 3.0
-                        if len(response) >= 10:
-                            info["reject_source"] = f"abort-source-{response[8]}"
-                            info["reject_reason"] = f"abort-reason-{response[9]}"
-                        reward += RESPONSE_BASE_REWARDS.get("abort", 12.0)
-
-                    elif resp_type == 0x02:  # A-ASSOCIATE-AC
-                        info["live_response"] = "accept"
-                        info["parser_depth"] = 4.0
-                        reward += RESPONSE_BASE_REWARDS.get("accept", 20.0)
-
-                    else:
-                        # Unknown response type - very interesting!
-                        info["live_response"] = f"type_0x{resp_type:02x}"
-                        info["parser_depth"] = 2.0
-                        reward += 15.0  # Unknown types are interesting
+                    # v2: Penalize common rejection reasons
+                    reject_key = (rj["source_name"], rj["reason_name"])
+                    if reject_key in COMMON_REJECT_REASONS:
+                        reward -= 2.0  # Penalty for common rejection
+                        info["common_response"] = True
+                    elif reject_key in RARE_REJECT_REASONS:
+                        reward += 8.0  # Bonus for rare rejection
                         info["rare_response"] = True
 
-                # v2: Aggressive response time scaling (linear, capped at 25)
+                elif resp_type == 0x07:  # A-ABORT
+                    info["live_response"] = "abort"
+                    info["parser_depth"] = 3.0
+                    if len(response) >= 10:
+                        info["reject_source"] = f"abort-source-{response[8]}"
+                        info["reject_reason"] = f"abort-reason-{response[9]}"
+                    reward += RESPONSE_BASE_REWARDS.get("abort", 12.0)
+
+                elif resp_type == 0x02:  # A-ASSOCIATE-AC
+                    info["live_response"] = "accept"
+                    info["parser_depth"] = 4.0
+                    reward += RESPONSE_BASE_REWARDS.get("accept", 20.0)
+
+                else:
+                    # Unknown response type - very interesting!
+                    info["live_response"] = f"type_0x{resp_type:02x}"
+                    info["parser_depth"] = 2.0
+                    reward += 15.0  # Unknown types are interesting
+                    info["rare_response"] = True
+
+            # v3: Time bonus only for responses, not for silent closes
+            if response and not closed:
                 # Longer response = server worked harder = more interesting
-                time_bonus = min(response_ms / 8.0, 25.0)
+                time_bonus = min(elapsed / 8.0, 25.0)
+                reward += time_bonus
+                info["time_bonus"] = round(time_bonus, 1)
+            elif info.get("true_hang"):
+                # True hangs get extra time bonus
+                time_bonus = min(elapsed / 4.0, 40.0)
                 reward += time_bonus
                 info["time_bonus"] = round(time_bonus, 1)
 
-                # v2: Novelty bonus with decay
-                response_sig = (info["live_response"], info.get("reject_source", ""),
-                                info.get("reject_reason", ""))
+            # v2: Novelty bonus with decay
+            response_sig = (info["live_response"], info.get("reject_source", ""),
+                            info.get("reject_reason", ""))
 
-                # Track globally for decay
-                self.global_response_counts[response_sig] = \
-                    self.global_response_counts.get(response_sig, 0) + 1
-                count = self.global_response_counts[response_sig]
+            # Track globally for decay
+            self.global_response_counts[response_sig] = \
+                self.global_response_counts.get(response_sig, 0) + 1
+            count = self.global_response_counts[response_sig]
 
-                if response_sig not in self.seen_responses:
-                    self.seen_responses.add(response_sig)
-                    info["response_novelty"] = True
-                    # First time in episode: full novelty bonus
-                    # But decay based on global count
-                    novelty_bonus = max(10.0 / (1 + count * 0.1), 2.0)
-                    reward += novelty_bonus
-                    info["novelty_bonus"] = round(novelty_bonus, 1)
+            if response_sig not in self.seen_responses:
+                self.seen_responses.add(response_sig)
+                info["response_novelty"] = True
+                # First time in episode: full novelty bonus
+                # But decay based on global count
+                novelty_bonus = max(10.0 / (1 + count * 0.1), 2.0)
+                reward += novelty_bonus
+                info["novelty_bonus"] = round(novelty_bonus, 1)
 
-            except socket.timeout:
-                t_timeout = time.monotonic()
-                info["response_time_ms"] = round((t_timeout - t_send) * 1000.0, 1)
-                info["live_response"] = "timeout"
+        # Note: socket.timeout should not happen with wait_for_response_or_closure
+        # but keep this as fallback
+        except socket.timeout:
+            t_timeout = time.monotonic()
+            info["response_time_ms"] = round((t_timeout - t_send) * 1000.0, 1)
+            
+            # Check if socket is still alive
+            if is_socket_alive(sock):
+                info["live_response"] = "true_hang"
+                info["true_hang"] = True
                 info["parser_depth"] = 5.0
-                reward += RESPONSE_BASE_REWARDS.get("timeout", 40.0)
+                reward += RESPONSE_BASE_REWARDS.get("true_hang", 50.0)
+            else:
+                info["live_response"] = "timeout"
+                info["parser_depth"] = 2.0
+                reward += RESPONSE_BASE_REWARDS.get("timeout", 8.0)
 
-                # Verify crash
-                try:
-                    check = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    check.settimeout(2.0)
-                    check.connect((self.target_host, self.target_port))
-                    check.close()
-                except (ConnectionRefusedError, socket.timeout):
-                    info["crash"] = True
-                    reward += 60.0  # v2: Increased crash bonus
-
-            except ConnectionResetError:
-                info["live_response"] = "reset"
-                info["parser_depth"] = 0.5
-                # v2: Low reward for reset - this is the most common "graceful" response
-                reward += RESPONSE_BASE_REWARDS.get("reset", 1.0)
-
+            # Verify crash
             try:
-                sock.close()
-            except Exception:
-                pass
+                check = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                check.settimeout(2.0)
+                check.connect((self.target_host, self.target_port))
+                check.close()
+            except (ConnectionRefusedError, socket.timeout):
+                info["crash"] = True
+                reward += 80.0  # v3: High crash bonus
+
+        except ConnectionResetError:
+            info["live_response"] = "reset"
+            info["silent_close"] = True
+            info["parser_depth"] = 0.5
+            # v3: Very low reward for reset - expected behavior for malformed input
+            reward += RESPONSE_BASE_REWARDS.get("reset", 0.5)
 
         except ConnectionRefusedError:
             info["live_response"] = "refused"
@@ -532,12 +562,17 @@ class RewardComputer:
                 check.close()
             except Exception:
                 info["crash"] = True
-                reward += 100.0  # v2: Increased crash bonus
+                reward += 100.0  # v3: Maximum crash bonus
         except socket.timeout:
             info["live_response"] = "connect_timeout"
             reward += RESPONSE_BASE_REWARDS.get("connect_timeout", 8.0)
         except Exception as e:
             info["live_response"] = f"error:{e}"
             reward += 2.0
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
         return reward, info

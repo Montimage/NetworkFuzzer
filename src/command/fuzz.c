@@ -20,10 +20,10 @@
 #define DEFAULT_CALLED_AE "ORTHANC"
 #define DEFAULT_CALLING_AE "FUZZER"
 
-int gan(int argc, char **argv) {
+int fuzz(int argc, char **argv) {
     // Custom help
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
-        printf("gan [<Option>] [<normal_csv> <malicious_csv>]\n");
+        printf("fuzz [<Option>] [<normal_csv> <malicious_csv>]\n");
         printf("Option:\n");
         printf("\t--mode <mode>          : Generation mode (default: %s)\n", DEFAULT_MODE);
         printf("\t  Modes: flow, protocol, attack (CTGAN-based)\n");
@@ -61,6 +61,9 @@ int gan(int argc, char **argv) {
         printf("\t--exploration <float>  : Novel combo exploration rate 0.0-1.0 (default: 0.15)\n");
         printf("\t--test                 : Run test episodes after training\n");
         printf("\t-h                     : Prints this help, then exits.\n");
+        printf("\nEnvironment Variables:\n");
+        printf("\tPYTHON                 : Python interpreter to use (default: python3)\n");
+        printf("\t                         Example: export PYTHON=/path/to/venv/bin/python3\n");
         printf("\nArguments:\n");
         printf("\tnormal_csv             : Path to normal flows CSV (default: %s)\n", DEFAULT_NORMAL_CSV);
         printf("\tmalicious_csv          : Path to malicious flows CSV (default: %s)\n", DEFAULT_ABNORMAL_CSV);
@@ -69,19 +72,19 @@ int gan(int argc, char **argv) {
         printf("\tcve_payloads, association_flood, patient_enum, patient_data_injection,\n");
         printf("\timaging_manipulation\n");
         printf("\nExamples:\n");
-        printf("\tgan --mode protocol --samples 500 --epochs 200\n");
-        printf("\tgan --mode attack --attack-type ae_manipulation --samples 50\n");
-        printf("\tgan --mode byte-model --strategy temperature --temperature 1.5 --samples 50\n");
-        printf("\tgan --mode vae --strategy interpolate --malformation 0.5 --samples 100\n");
+        printf("\tfuzz --mode protocol --samples 500 --epochs 200\n");
+        printf("\tfuzz --mode attack --attack-type ae_manipulation --samples 50\n");
+        printf("\tfuzz --mode byte-model --strategy temperature --temperature 1.5 --samples 50\n");
+        printf("\tfuzz --mode vae --strategy interpolate --malformation 0.5 --samples 100\n");
         printf("\nRL Fuzzing examples:\n");
         printf("\t# DICOM hybrid fuzzing (combines semantic + aggressive + state attacks)\n");
-        printf("\tgan --mode rl --protocol dicom --fuzz-mode hybrid \\\n");
+        printf("\tfuzz --mode rl --protocol dicom --fuzz-mode hybrid \\\n");
         printf("\t    --target-host 192.168.1.200 --target-port 4242 \\\n");
         printf("\t    --called-ae ORTHANC --timesteps 20000 --test\n");
         printf("\n\t# DICOM semantic-only fuzzing\n");
-        printf("\tgan --mode rl --fuzz-mode semantic --target-host localhost --timesteps 10000\n");
+        printf("\tfuzz --mode rl --fuzz-mode semantic --target-host localhost --timesteps 10000\n");
         printf("\n\t# List available protocols\n");
-        printf("\tgan --mode rl --list-protocols\n");
+        printf("\tfuzz --mode rl --list-protocols\n");
         return 0;
     }
 
@@ -193,7 +196,7 @@ int gan(int argc, char **argv) {
     snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", output_dir);
     int mkret = system(mkdir_cmd);
     if (mkret != 0) {
-        fprintf(stderr, "[networkfuzzer:gan] Failed to create output directory: %s\n", output_dir);
+        fprintf(stderr, "[networkfuzzer:fuzz] Failed to create output directory: %s\n", output_dir);
         return mkret;
     }
 
@@ -230,9 +233,9 @@ int gan(int argc, char **argv) {
                     "%s -m fuzzer.models.byte_model.train --data-dir %s --epochs %s "
                     "--batch-size %s --max-length 256 --model-out %s",
                     python, data_dir, epochs, batch_size, model_path);
-                printf("[networkfuzzer:gan] Training: %s\n", ml_cmd);
+                printf("[networkfuzzer:fuzz] Training: %s\n", ml_cmd);
                 ret = system(ml_cmd);
-                if (ret != 0) { fprintf(stderr, "[networkfuzzer:gan] Training failed\n"); return ret; }
+                if (ret != 0) { fprintf(stderr, "[networkfuzzer:fuzz] Training failed\n"); return ret; }
             }
 
             // Generate
@@ -240,7 +243,7 @@ int gan(int argc, char **argv) {
                 "%s -m fuzzer.models.byte_model.generate --model %s --count %s "
                 "--strategy %s --temp %s --output-dir %s --to-pcap",
                 python, model_path, samples, strategy, temperature, pcap_output_dir);
-            printf("[networkfuzzer:gan] Generating: %s\n", ml_cmd);
+            printf("[networkfuzzer:fuzz] Generating: %s\n", ml_cmd);
             ret = system(ml_cmd);
 
         } else if (strcmp(mode, "vae") == 0) {
@@ -254,9 +257,9 @@ int gan(int argc, char **argv) {
                     "%s -m fuzzer.models.vae_model.train --data-dir %s --epochs %s "
                     "--batch-size %s --model-out %s",
                     python, data_dir, epochs, batch_size, model_path);
-                printf("[networkfuzzer:gan] Training: %s\n", ml_cmd);
+                printf("[networkfuzzer:fuzz] Training: %s\n", ml_cmd);
                 ret = system(ml_cmd);
-                if (ret != 0) { fprintf(stderr, "[networkfuzzer:gan] Training failed\n"); return ret; }
+                if (ret != 0) { fprintf(stderr, "[networkfuzzer:fuzz] Training failed\n"); return ret; }
             }
 
             snprintf(ml_cmd, sizeof(ml_cmd),
@@ -264,7 +267,7 @@ int gan(int argc, char **argv) {
                 "--strategy %s --degree %s --count %s --output-dir %s --to-pcap",
                 python, model_path, data_dir, strategy, malformation_degree,
                 samples, pcap_output_dir);
-            printf("[networkfuzzer:gan] Generating: %s\n", ml_cmd);
+            printf("[networkfuzzer:fuzz] Generating: %s\n", ml_cmd);
             ret = system(ml_cmd);
 
         } else if (strcmp(mode, "rl") == 0) {
@@ -273,7 +276,7 @@ int gan(int argc, char **argv) {
                 snprintf(ml_cmd, sizeof(ml_cmd),
                     "%s -m fuzzer.rl.train_protocol --list-protocols",
                     python);
-                printf("[networkfuzzer:gan] %s\n", ml_cmd);
+                printf("[networkfuzzer:fuzz] %s\n", ml_cmd);
                 ret = system(ml_cmd);
                 return ret;
             }
@@ -327,18 +330,18 @@ int gan(int argc, char **argv) {
                 strcat(ml_cmd, test_opts);
             }
 
-            printf("[networkfuzzer:gan] RL fuzzing: %s\n", ml_cmd);
+            printf("[networkfuzzer:fuzz] RL fuzzing: %s\n", ml_cmd);
             ret = system(ml_cmd);
         }
 
         if (ret != 0) {
-            fprintf(stderr, "[networkfuzzer:gan] ML generation failed\n");
+            fprintf(stderr, "[networkfuzzer:fuzz] ML generation failed\n");
             return ret;
         }
 
-        printf("[networkfuzzer:gan] ML generation complete.\n");
-        printf("[networkfuzzer:gan] Mode: %s, Strategy: %s\n", mode, strategy);
-        printf("[networkfuzzer:gan] PCAPs: %s\n", pcap_output_dir);
+        printf("[networkfuzzer:fuzz] ML generation complete.\n");
+        printf("[networkfuzzer:fuzz] Mode: %s, Strategy: %s\n", mode, strategy);
+        printf("[networkfuzzer:fuzz] PCAPs: %s\n", pcap_output_dir);
         return 0;
     }
 
@@ -362,10 +365,10 @@ int gan(int argc, char **argv) {
     strcat(gan_cmd, " ");
     strcat(gan_cmd, output_dir);
 
-    printf("[networkfuzzer:gan] Running: %s\n", gan_cmd);
+    printf("[networkfuzzer:fuzz] Running: %s\n", gan_cmd);
     int ret = system(gan_cmd);
     if (ret != 0) {
-        fprintf(stderr, "[networkfuzzer:gan] gan.py failed\n");
+        fprintf(stderr, "[networkfuzzer:fuzz] gan.py failed\n");
         return ret;
     }
 
@@ -377,7 +380,7 @@ int gan(int argc, char **argv) {
     FILE *fp = popen(find_csv_cmd, "r");
     if (fp) {
         if (fgets(csv_path, sizeof(csv_path), fp) == NULL) {
-            fprintf(stderr, "[networkfuzzer:gan] Error: No synthetic CSV found in %s\n", output_dir);
+            fprintf(stderr, "[networkfuzzer:fuzz] Error: No synthetic CSV found in %s\n", output_dir);
             pclose(fp);
             return 1;
         }
@@ -386,7 +389,7 @@ int gan(int argc, char **argv) {
         size_t len = strlen(csv_path);
         if (len > 0 && csv_path[len-1] == '\n') csv_path[len-1] = '\0';
     } else {
-        fprintf(stderr, "[networkfuzzer:gan] Error: Could not search for synthetic CSV in %s\n", output_dir);
+        fprintf(stderr, "[networkfuzzer:fuzz] Error: Could not search for synthetic CSV in %s\n", output_dir);
         return 1;
     }
 
@@ -394,7 +397,7 @@ int gan(int argc, char **argv) {
     snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", pcap_output_dir);
     mkret = system(mkdir_cmd);
     if (mkret != 0) {
-        fprintf(stderr, "[networkfuzzer:gan] Failed to create pcap output directory: %s\n", pcap_output_dir);
+        fprintf(stderr, "[networkfuzzer:fuzz] Failed to create pcap output directory: %s\n", pcap_output_dir);
         return mkret;
     }
 
@@ -415,10 +418,10 @@ int gan(int argc, char **argv) {
         strcat(pcap_cmd, num_flows);
     }
 
-    printf("[networkfuzzer:gan] Running: %s\n", pcap_cmd);
+    printf("[networkfuzzer:fuzz] Running: %s\n", pcap_cmd);
     ret = system(pcap_cmd);
     if (ret != 0) {
-        fprintf(stderr, "[networkfuzzer:gan] synthetic_to_pcap.py failed\n");
+        fprintf(stderr, "[networkfuzzer:fuzz] synthetic_to_pcap.py failed\n");
         return ret;
     }
 
@@ -433,18 +436,18 @@ int gan(int argc, char **argv) {
                 " --pcap-dir %s --attack-type %s",
                 pcap_output_dir, attack_type);
         }
-        printf("[networkfuzzer:gan] Running: %s\n", eval_cmd);
+        printf("[networkfuzzer:fuzz] Running: %s\n", eval_cmd);
         ret = system(eval_cmd);
         if (ret != 0) {
-            fprintf(stderr, "[networkfuzzer:gan] evaluation failed (non-fatal)\n");
+            fprintf(stderr, "[networkfuzzer:fuzz] evaluation failed (non-fatal)\n");
             // Non-fatal: continue
         }
     }
 
-    printf("[networkfuzzer:gan] Synthetic data and PCAP generation complete.\n");
-    printf("[networkfuzzer:gan] Mode: %s\n", mode);
-    if (attack_type) printf("[networkfuzzer:gan] Attack type: %s\n", attack_type);
-    if (malformed) printf("[networkfuzzer:gan] Malformations applied\n");
-    printf("[networkfuzzer:gan] PCAPs: %s\n", pcap_output_dir);
+    printf("[networkfuzzer:fuzz] Synthetic data and PCAP generation complete.\n");
+    printf("[networkfuzzer:fuzz] Mode: %s\n", mode);
+    if (attack_type) printf("[networkfuzzer:fuzz] Attack type: %s\n", attack_type);
+    if (malformed) printf("[networkfuzzer:fuzz] Malformations applied\n");
+    printf("[networkfuzzer:fuzz] PCAPs: %s\n", pcap_output_dir);
     return 0;
 }

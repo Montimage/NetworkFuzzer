@@ -62,7 +62,7 @@ static inline void _update_stat( forward_packet_context_t *context, uint32_t nb_
 	time_t now = time(NULL); //return number of second from 1970
 	if( now != context->stat.last_time ){
 		float interval = (now - context->stat.last_time);
-		log_write_dual(LOG_INFO, "Statistics of forwarded packets %.2f pps (total: %"PRIu64" packets), %.2f bps",
+		log_write(LOG_INFO, "Statistics of forwarded packets %.2f pps (total: %"PRIu64" packets), %.2f bps",
 				context->stat.nb_packets   / interval,
 				context->nb_forwarded_packets,
 				context->stat.nb_bytes * 8 / interval);
@@ -157,25 +157,8 @@ void forward_packet_release( forward_packet_context_t *context ){
 	if( !context )
 		return;
 
-	// Get the count of rejected connections from proto_injector if available
-	size_t rejected_connections = 0;
-	if (context->proto_injector && context->proto_injector->dicom) {
-		rejected_connections = context->proto_injector->dicom->total_rejected_connections;
-	}
-
-	log_write_dual(LOG_INFO, "Number of packets being successfully forwarded: %"PRIu64", dropped: %"PRIu64,
+	log_write(LOG_INFO, "Packets forwarded: %"PRIu64", dropped: %"PRIu64,
 			context->nb_forwarded_packets, context->nb_dropped_packets );
-
-	if (rejected_connections > 0) {
-		log_write_dual(LOG_WARNING, "Number of rejected DICOM associations: %zu", rejected_connections);
-
-		// If there was a last error message, report it
-		if (context->proto_injector && context->proto_injector->dicom &&
-		    context->proto_injector->dicom->last_error_message[0] != '\0') {
-			log_write_dual(LOG_WARNING, "Last DICOM error: %s",
-			              context->proto_injector->dicom->last_error_message);
-		}
-	}
 
 	if( context->injector ){
 		inject_packet_release( context->injector );
@@ -282,14 +265,8 @@ uint32_t int_to_ascii_string(u_char * ascii_string, int length, uint64_t num) {
   }
     char hex_string[50];
     sprintf(hex_string, "%0.*lx",length, num);
-    printf("hex_string: %s\n", hex_string);
     int hex_string_len = strlen(hex_string);
-    printf("hex_string_len: %d (length: %d)\n", hex_string_len, length);
     if (hex_string_len > length) {
-      printf("The input value is out of range\n");
-      printf("Input number: %lu\n", num);
-      printf("Max hex length: %d\n", length);
-      printf("Converted hex length: %d\n", hex_string_len);
       return 0;
     }
 
@@ -298,8 +275,6 @@ uint32_t int_to_ascii_string(u_char * ascii_string, int length, uint64_t num) {
         char hex_byte[3] = {hex_string[i], hex_string[i+1], '\0'};
         ascii_string[i/2] = (char) strtol(hex_byte, NULL, 16);
     }
-    // ascii_string[i/2] = '\0';
-    printf("Converted string: %s\n", ascii_string);
     return 1;
 }
 
@@ -404,8 +379,6 @@ static int find_and_replace_dimse_attribute(uint8_t *data, int data_size,
 		}
 	}
 
-	fprintf(stderr, "Successfully replaced DIMSE att_id %d at offset %d (val_len=%u)\n",
-	        att_id, val_offset, val_len);
 	return 1;
 }
 
@@ -477,8 +450,6 @@ static int find_and_replace_assoc_subitem(uint8_t *data, int data_size,
 	for (int i = str_len; i < (int)sub_len; i++)
 		data[sub_val_offset + i] = ' ';
 
-	fprintf(stderr, "Successfully replaced A-ASSOCIATE att_id %d at offset %d (sub_len=%u)\n",
-	        att_id, sub_val_offset, sub_len);
 	return 1;
 }
 
@@ -732,8 +703,6 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
     }
 
     att_offset += dicom_offset;
-    fprintf(stderr, "attribute id: %d, attribute offset: %d, attribute data len: %d\n", att_id, att_offset, att_data_len);
-
     int new_val_len = strlen((const char *)new_val);
     if (new_val_len > att_data_len) {
         fprintf(stderr, "New value is too long for attribute %d\n", att_id);
@@ -747,8 +716,6 @@ uint32_t update_dicom_string_data(char *data, uint32_t data_size, const ipacket_
     padded_val[att_data_len] = '\0'; // Ensure null termination
 
     memcpy(&data[att_offset], padded_val, att_data_len);
-
-    fprintf(stderr, "Successfully modified attribute %d with new value: %s\n", att_id, padded_val);
 
     return 1;
 }
@@ -954,11 +921,15 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
         return -1;
     }
 
-    int index = get_protocol_index_by_id(context->ipacket, proto_id);
-    if (index == -1)
-        return -1; // protocol not found
+    // Special handling for PDU type (att_id == 1): it's at offset 0, no need for protocol lookup
+    unsigned int dicom_offset = 0;
+    if (att_id != 1) {
+        int index = get_protocol_index_by_id(context->ipacket, proto_id);
+        if (index == -1)
+            return -1; // protocol not found
 
-    unsigned int dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+        dicom_offset = get_packet_offset_at_index(context->ipacket, index);
+    }
 
     // For patient name (ID 15), handle string with space-padding
     if (att_id == 15) {
@@ -991,6 +962,37 @@ int replace_dicom_attribute(uint32_t proto_id, uint32_t att_id, const void *new_
     }
 
     u_char ascii_string[50] = {0}; // buffer to store a string ASCII converted
+
+    // Special handling for binary fields (PDU type, PDU length, etc.)
+    // These should be written as raw binary, not ASCII
+    if (att_id == 1 || att_id == 2) {
+        // PDU type (1 byte) or PDU length (4 bytes) - use binary value
+        if (!is_string) {
+            int val = *(const int *)new_val;
+            
+            // Calculate actual offset
+            int actual_offset = dicom_offset + att_offset;
+            
+            // Check bounds
+            if (actual_offset + att_data_len > context->packet_size) {
+                fprintf(stderr, "Replacement exceeds packet data length (offset=%d, len=%d, packet_size=%d)\n",
+                        actual_offset, att_data_len, context->packet_size);
+                return -4;
+            }
+            
+            // Write binary value (little-endian for multi-byte, direct for single byte)
+            if (att_data_len == 1) {
+                context->packet_data[actual_offset] = (u_char)val;
+            } else if (att_data_len == 4) {
+                // PDU length is big-endian in DICOM
+                context->packet_data[actual_offset] = (val >> 24) & 0xFF;
+                context->packet_data[actual_offset + 1] = (val >> 16) & 0xFF;
+                context->packet_data[actual_offset + 2] = (val >> 8) & 0xFF;
+                context->packet_data[actual_offset + 3] = val & 0xFF;
+            }
+            return 1;
+        }
+    }
 
     if (is_string) {
         memset(ascii_string, 0x20, sizeof(ascii_string));

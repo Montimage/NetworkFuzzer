@@ -146,6 +146,8 @@ DECLARE_CONF_ATT(
 	(CONF_ATT__FORWARD__TARGET_PROTOCOLS,   "forward.target-protocols", &conf->forward->targets,  LIST),
 	(CONF_ATT__FORWARD__TARGET_HOSTS,       "forward.target-hosts",     &conf->forward->targets,  LIST),
 	(CONF_ATT__FORWARD__TARGET_PORTS,       "forward.target-ports",     &conf->forward->targets,  LIST),
+	(CONF_ATT__FORWARD__DICOM_CALLED_AE,   "forward.dicom-called-ae",  &conf->forward->dicom_called_ae,  CHAR_STAR),
+	(CONF_ATT__FORWARD__DICOM_CALLING_AE,  "forward.dicom-calling-ae", &conf->forward->dicom_calling_ae, CHAR_STAR),
 
 	(CONF_ATT__DUMP_PACKET__ENABLE,      "dump-packet.enable",      &conf->dump_packet->is_enable,   BOOL),
 	(CONF_ATT__DUMP_PACKET__OUTPUT_FILE, "dump-packet.output-file", &conf->dump_packet->output_file, CHAR_STAR)

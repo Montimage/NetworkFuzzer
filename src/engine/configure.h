@@ -88,6 +88,9 @@ typedef struct forward_packet_conf_struct{
 
 	forward_packet_target_conf_t *targets;
 	uint16_t target_size;
+
+	char *dicom_called_ae;   // Called AE title for DICOM association (default "ORTHANC")
+	char *dicom_calling_ae;  // Calling AE title for DICOM association (default "MODALITY")
 }forward_packet_conf_t;
 
 
