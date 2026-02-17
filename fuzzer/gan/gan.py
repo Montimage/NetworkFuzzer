@@ -18,18 +18,32 @@ Usage:
 import os
 import sys
 import argparse
-import pandas as pd
-import numpy as np
 import logging
 import random
 from datetime import datetime
 
-try:
-    from ctgan import CTGAN
-except ImportError as e:
-    print(f"Error importing CTGAN: {e}")
-    print("Please install ctgan: pip install ctgan")
-    sys.exit(1)
+# Lazy imports: pandas and ctgan are only needed for flow/protocol/attack modes.
+# Smart mode uses session_planner/semantic_pcap_builder which have no pandas dependency.
+pd = None
+np = None
+CTGAN = None
+
+def _import_ctgan_deps():
+    """Import pandas, numpy, and CTGAN. Called only for non-smart modes."""
+    global pd, np, CTGAN
+    if pd is not None:
+        return
+    import pandas as _pd
+    import numpy as _np
+    pd = _pd
+    np = _np
+    try:
+        from ctgan import CTGAN as _CTGAN
+        CTGAN = _CTGAN
+    except ImportError as e:
+        print(f"Error importing CTGAN: {e}")
+        print("Please install ctgan: pip install ctgan")
+        sys.exit(1)
 
 from fuzzer.gan.attack_profiles import (
     ATTACK_PROFILES, get_attack_profile, list_attack_types, get_pdu_sequence,
@@ -477,13 +491,13 @@ def save_output(data, output_dir, prefix="synthetic_dicom"):
 def main():
     parser = argparse.ArgumentParser(
         description='Generate synthetic DICOM flow data using CTGAN')
-    parser.add_argument('normal_csv',
+    parser.add_argument('normal_csv', nargs='?', default=None,
                         help='Path to CSV with normal DICOM flows')
-    parser.add_argument('malicious_csv',
+    parser.add_argument('malicious_csv', nargs='?', default=None,
                         help='Path to CSV with malicious DICOM flows')
-    parser.add_argument('output_dir',
+    parser.add_argument('output_dir', nargs='?', default='/tmp',
                         help='Directory to save generated data')
-    parser.add_argument('--mode', choices=['flow', 'protocol', 'attack'],
+    parser.add_argument('--mode', choices=['flow', 'protocol', 'attack', 'smart'],
                         default='protocol',
                         help='Generation mode (default: protocol)')
     parser.add_argument('--attack-type', type=str, default=None,
@@ -494,6 +508,18 @@ def main():
                         help='Training epochs (default: 100)')
     parser.add_argument('--batch-size', type=int, default=500,
                         help='Training batch size (default: 500)')
+    # Smart mode options
+    parser.add_argument('--target-host', type=str, default=None,
+                        help='Target server host for feedback scoring (smart mode)')
+    parser.add_argument('--target-port', type=int, default=4242,
+                        help='Target server port (default: 4242)')
+    parser.add_argument('--generator', choices=['thompson', 'ctgan', 'random'],
+                        default='thompson',
+                        help='Plan generator backend for smart mode (default: thompson)')
+    parser.add_argument('--feedback-rounds', type=int, default=1,
+                        help='Number of generate-score-update feedback rounds (default: 1)')
+    parser.add_argument('--pcap-output', type=str, default=None,
+                        help='Output directory for generated PCAPs (smart mode)')
 
     args = parser.parse_args()
 
@@ -502,6 +528,114 @@ def main():
     if args.attack_type:
         print(f"Attack Type: {args.attack_type}")
     print("=" * 80 + "\n")
+
+    # =========================================================================
+    # Smart mode: session plan generation with protocol-aware builders
+    # =========================================================================
+    if args.mode == "smart":
+        try:
+            from fuzzer.gan.session_planner import SessionPlanGenerator
+            from fuzzer.gan.semantic_pcap_builder import plans_to_pcap
+
+            pcap_dir = args.pcap_output or args.output_dir
+            os.makedirs(pcap_dir, exist_ok=True)
+
+            generator = SessionPlanGenerator()
+
+            # Choose generator backend
+            if args.generator == "ctgan":
+                generate_fn = generator.generate_ctgan
+            elif args.generator == "random":
+                generate_fn = generator.generate_random
+            else:
+                generate_fn = generator.generate_thompson
+
+            if args.target_host and args.feedback_rounds > 0:
+                # Feedback loop: generate → score → update → repeat
+                from fuzzer.gan.feedback_scorer import FeedbackScorer
+                scorer = FeedbackScorer(
+                    args.target_host, args.target_port)
+
+                for rnd in range(args.feedback_rounds):
+                    print(f"\n--- Feedback Round {rnd + 1}/{args.feedback_rounds} ---")
+
+                    plans = generate_fn(args.samples)
+                    print(f"Generated {len(plans)} session plans "
+                          f"(generator={args.generator})")
+
+                    # Build PCAPs
+                    success, errors = plans_to_pcap(plans, pcap_dir,
+                                                    dst_port=args.target_port)
+                    print(f"Built {success} PCAPs ({errors} errors)")
+
+                    # Score against live server
+                    print(f"Scoring against {args.target_host}:{args.target_port}...")
+                    scored = scorer.score_batch(plans)
+
+                    avg_score = sum(p.score for p in scored) / max(len(scored), 1)
+                    avg_depth = sum(p.depth for p in scored) / max(len(scored), 1)
+                    print(f"Round {rnd + 1}: avg_score={avg_score:.1f}, "
+                          f"avg_depth={avg_depth:.1f}")
+
+                    # Update generator with feedback
+                    generator.update_with_scores(scored)
+
+                    # Show category weights after update
+                    weights = generator.get_category_weights()
+                    top3 = sorted(weights.items(), key=lambda x: -x[1])[:3]
+                    print(f"Top categories: {', '.join(f'{c}={w:.2f}' for c, w in top3)}")
+
+                # Save final plans CSV
+                all_scored = scorer.get_scored_history()
+                plans_csv = os.path.join(pcap_dir, "session_plans_scored.csv")
+                generator.save_plans_csv(all_scored, plans_csv)
+
+                # Print summary
+                summary = scorer.get_summary()
+                print(f"\n{'=' * 60}")
+                print(f"SMART MODE COMPLETE — {summary['total']} plans scored")
+                print(f"Average score: {summary['avg_score']:.1f}")
+                print(f"Average depth: {summary['avg_depth']:.1f}")
+                print(f"Max depth: {summary['max_depth']:.1f}")
+                print(f"Response distribution: {summary['response_distribution']}")
+                print(f"PCAPs: {pcap_dir}")
+                print(f"Plans: {plans_csv}")
+                print(f"{'=' * 60}\n")
+
+            else:
+                # Offline mode: generate plans and build PCAPs (no server)
+                plans = generate_fn(args.samples)
+                print(f"Generated {len(plans)} session plans "
+                      f"(generator={args.generator})")
+
+                success, errors = plans_to_pcap(plans, pcap_dir,
+                                                dst_port=args.target_port)
+
+                # Save plans CSV
+                plans_csv = os.path.join(pcap_dir, "session_plans.csv")
+                generator.save_plans_csv(plans, plans_csv)
+
+                print(f"\n{'=' * 60}")
+                print(f"SMART MODE COMPLETE (offline)")
+                print(f"Generated {success} PCAPs ({errors} errors)")
+                print(f"PCAPs: {pcap_dir}")
+                print(f"Plans: {plans_csv}")
+                print(f"{'=' * 60}\n")
+
+        except Exception as e:
+            logger.error(f"Smart mode error: {e}", exc_info=True)
+            print(f"\nERROR: {str(e)}\n")
+            sys.exit(1)
+
+        sys.exit(0)
+
+    # Non-smart modes require pandas/ctgan and CSV inputs
+    _import_ctgan_deps()
+
+    if not args.normal_csv or not args.malicious_csv:
+        print("ERROR: normal_csv and malicious_csv are required for "
+              f"'{args.mode}' mode")
+        sys.exit(1)
 
     if args.mode == "attack" and args.attack_type:
         if args.attack_type not in ATTACK_PROFILES:
