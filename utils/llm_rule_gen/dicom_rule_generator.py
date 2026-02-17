@@ -157,15 +157,13 @@ DICOM_ATTRIBUTES = {
 }
 
 def setup_openai_api():
-    """Setup the OpenAI API with the key from environment variable"""
+    """Check that the OpenAI API key is available in environment"""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print("Error: OPENAI_API_KEY environment variable not set.")
         print("Please set it with: export OPENAI_API_KEY='your-api-key'")
+        print("Or create a .env file in utils/llm_rule_gen/ with: OPENAI_API_KEY=sk-...")
         sys.exit(1)
-
-    openai.api_key = api_key
-    return openai
 
 def generate_rule_with_openai(prompt: str, model: str = "gpt-4") -> str:
     """Generate a DICOM rule based on the provided prompt using OpenAI API"""

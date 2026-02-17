@@ -279,3 +279,72 @@ def get_pdu_sequence(profile):
 def get_malformation_list():
     """Return list of available malformation mutation names."""
     return list(MALFORMATION_MUTATIONS.keys())
+
+
+# ============================================================================
+# Attack Profile → State Sequence Mappings
+# ============================================================================
+# Maps each attack profile name to corresponding STATE_SEQUENCES entries
+# from fuzzer.rl.hybrid_env, so the session planner can reference attack
+# profiles by name when choosing PDU sequences.
+
+ATTACK_TO_STATE_SEQUENCES = {
+    "abort_injection": [
+        "immediate_abort",
+        "pdata_abort_pdata",
+        "store_abort_store",
+    ],
+    "state_confusion": [
+        "pdata_first",
+        "double_assoc",
+        "release_before_pdata",
+        "pdata_then_assoc",
+        "release_first",
+        "abort_first",
+        "release_then_assoc",
+    ],
+    "ae_manipulation": [
+        "normal",
+        "no_release",
+        "cstore_normal",
+    ],
+    "pdu_length_attack": [
+        "normal",
+        "cstore_normal",
+        "assoc_only",
+    ],
+    "cve_payloads": [
+        "normal",
+        "cstore_normal",
+        "cstore_rich",
+        "cfind_normal",
+        "cmove_normal",
+    ],
+    "association_flood": [
+        "assoc_only",
+        "double_assoc",
+        "triple_assoc",
+    ],
+    "patient_enum": [
+        "cfind_normal",
+        "cfind_flood",
+        "find_then_move",
+        "find_then_get",
+    ],
+    "patient_data_injection": [
+        "cstore_normal",
+        "cstore_rich",
+        "cstore_double",
+    ],
+    "imaging_manipulation": [
+        "cstore_normal",
+        "cstore_rich",
+        "cstore_mr",
+        "cstore_us",
+    ],
+}
+
+
+def get_state_sequences_for_attack(attack_type):
+    """Get the list of state sequence names for a given attack type."""
+    return ATTACK_TO_STATE_SEQUENCES.get(attack_type, ["normal"])

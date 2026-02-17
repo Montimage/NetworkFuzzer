@@ -148,8 +148,11 @@ int generate(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    // Build the command
-    strcpy(command, "python3 ");
+    // Build the command - use PYTHON env var if set
+    const char *python = getenv("PYTHON");
+    if (!python || !python[0]) python = "python3";
+    strcpy(command, python);
+    strcat(command, " ");
     strcat(command, script_path);
 
     if (save_flag) {

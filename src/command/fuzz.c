@@ -29,6 +29,7 @@ int fuzz(int argc, char **argv) {
         printf("\t  Modes: flow, protocol, attack (CTGAN-based)\n");
         printf("\t         byte-model (Transformer), vae (VAE)\n");
         printf("\t         rl (RL-based protocol fuzzing - supports multiple protocols)\n");
+        printf("\t         smart (session-plan generator with protocol-aware builders)\n");
         printf("\t--attack-type <type>   : Attack profile for attack mode\n");
         printf("\t--malformed            : Apply malformation mutations to PCAPs\n");
         printf("\t--samples <N>          : Number of synthetic samples to generate (default: %s)\n", DEFAULT_SAMPLES);
@@ -85,6 +86,15 @@ int fuzz(int argc, char **argv) {
         printf("\tfuzz --mode rl --fuzz-mode semantic --target-host localhost --timesteps 10000\n");
         printf("\n\t# List available protocols\n");
         printf("\tfuzz --mode rl --list-protocols\n");
+        printf("\nSmart mode examples:\n");
+        printf("\t# Offline generation (no server needed)\n");
+        printf("\tfuzz --mode smart --samples 200 --pcap-output fuzzer/data/pcap_output\n");
+        printf("\n\t# With feedback loop (live server scoring)\n");
+        printf("\tfuzz --mode smart --samples 100 --target-host localhost \\\n");
+        printf("\t    --target-port 4242 --feedback-rounds 3\n");
+        printf("\n\t# With CTGAN backend (after accumulating scored data)\n");
+        printf("\tfuzz --mode smart --samples 500 --generator ctgan \\\n");
+        printf("\t    --target-host localhost --target-port 4242\n");
         return 0;
     }
 
@@ -207,9 +217,9 @@ int fuzz(int argc, char **argv) {
     // =========================================================================
     // ML modes: byte-model, vae, rl — dispatch to Python modules
     // =========================================================================
-    if (strcmp(mode, "byte-model") == 0 || strcmp(mode, "vae") == 0 || strcmp(mode, "rl") == 0) {
+    if (strcmp(mode, "byte-model") == 0 || strcmp(mode, "vae") == 0 || strcmp(mode, "rl") == 0 || strcmp(mode, "smart") == 0) {
         char ml_cmd[4096];
-        int ret;
+        int ret = 0;
 
         // Default data dir if not specified
         if (!data_dir) {
@@ -332,6 +342,47 @@ int fuzz(int argc, char **argv) {
 
             printf("[networkfuzzer:fuzz] RL fuzzing: %s\n", ml_cmd);
             ret = system(ml_cmd);
+
+        } else if (strcmp(mode, "smart") == 0) {
+            // Smart GAN mode: session plan generation with protocol-aware builders
+            char *generator = "thompson";  // Default generator backend
+
+            // Check for --generator flag (already parsed, recheck argv)
+            for (int j = 1; j < argc; ++j) {
+                if (strcmp(argv[j], "--generator") == 0 && j+1 < argc) {
+                    generator = argv[j+1];
+                    break;
+                }
+            }
+
+            snprintf(ml_cmd, sizeof(ml_cmd),
+                "%s -m fuzzer.gan.gan --mode smart --samples %s "
+                "--generator %s --pcap-output %s",
+                python, samples, generator, pcap_output_dir);
+
+            if (target_host) {
+                char extra[512];
+                if (target_port) {
+                    snprintf(extra, sizeof(extra), " --target-host %s --target-port %s",
+                             target_host, target_port);
+                } else {
+                    snprintf(extra, sizeof(extra), " --target-host %s", target_host);
+                }
+                strcat(ml_cmd, extra);
+            }
+
+            // Check for --feedback-rounds
+            for (int j = 1; j < argc; ++j) {
+                if (strcmp(argv[j], "--feedback-rounds") == 0 && j+1 < argc) {
+                    char fb_opts[64];
+                    snprintf(fb_opts, sizeof(fb_opts), " --feedback-rounds %s", argv[j+1]);
+                    strcat(ml_cmd, fb_opts);
+                    break;
+                }
+            }
+
+            printf("[networkfuzzer:fuzz] Smart generation: %s\n", ml_cmd);
+            ret = system(ml_cmd);
         }
 
         if (ret != 0) {
@@ -352,7 +403,7 @@ int fuzz(int argc, char **argv) {
     // Step 1: Run GAN
     char gan_cmd[4096];
     snprintf(gan_cmd, sizeof(gan_cmd),
-        "%s fuzzer/gan/gan.py --mode %s --samples %s --epochs %s --batch-size %s",
+        "%s -m fuzzer.gan.gan --mode %s --samples %s --epochs %s --batch-size %s",
         python, mode, samples, epochs, batch_size);
     if (attack_type) {
         strcat(gan_cmd, " --attack-type ");
@@ -404,7 +455,7 @@ int fuzz(int argc, char **argv) {
     // Step 3: Run synthetic_to_pcap.py
     char pcap_cmd[4096];
     snprintf(pcap_cmd, sizeof(pcap_cmd),
-        "%s fuzzer/gan/synthetic_to_pcap.py %s %s",
+        "%s -m fuzzer.gan.synthetic_to_pcap %s %s",
         python, csv_path, pcap_output_dir);
     if (attack_type) {
         strcat(pcap_cmd, " --attack-type ");
@@ -429,7 +480,7 @@ int fuzz(int argc, char **argv) {
     if (evaluate) {
         char eval_cmd[4096];
         snprintf(eval_cmd, sizeof(eval_cmd),
-            "%s fuzzer/gan/evaluate_feature_similarity.py %s %s %s",
+            "%s -m fuzzer.gan.evaluate_feature_similarity %s %s %s",
             python, abnormal_csv, csv_path, pcap_output_dir);
         if (attack_type) {
             snprintf(eval_cmd + strlen(eval_cmd), sizeof(eval_cmd) - strlen(eval_cmd),
