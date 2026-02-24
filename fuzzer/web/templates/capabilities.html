@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Capabilities — NetworkFuzzer{% endblock %}
+
+{% block content %}
+<h1>Capabilities</h1>
+
+<div x-data="{ tab: 'protocols' }">
+    <div role="group">
+        <button :class="tab === 'protocols' ? '' : 'outline'"
+                @click="tab = 'protocols'"
+                hx-get="/ui/partials/capabilities/protocols"
+                hx-target="#cap-content"
+                hx-swap="innerHTML">Protocols</button>
+        <button :class="tab === 'attack_profiles' ? '' : 'outline'"
+                @click="tab = 'attack_profiles'"
+                hx-get="/ui/partials/capabilities/attack_profiles"
+                hx-target="#cap-content"
+                hx-swap="innerHTML">Attack Profiles</button>
+        <button :class="tab === 'fuzz_modes' ? '' : 'outline'"
+                @click="tab = 'fuzz_modes'"
+                hx-get="/ui/partials/capabilities/fuzz_modes"
+                hx-target="#cap-content"
+                hx-swap="innerHTML">Fuzz Modes</button>
+    </div>
+
+    <div id="cap-content"
+         hx-get="/ui/partials/capabilities/protocols"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+    </div>
+</div>
+{% endblock %}

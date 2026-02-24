@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — NetworkFuzzer{% endblock %}
+
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="grid">
+    <article>
+        <header>Running Jobs</header>
+        <p class="stat">{{ running_jobs }}</p>
+    </article>
+    <article>
+        <header>Completed</header>
+        <p class="stat">{{ completed_jobs }}</p>
+    </article>
+    <article>
+        <header>Failed</header>
+        <p class="stat">{{ failed_jobs }}</p>
+    </article>
+    <article>
+        <header>Protocols</header>
+        <p class="stat">{{ protocol_count }}</p>
+    </article>
+</div>
+
+<h2>Quick Actions</h2>
+<div class="grid">
+    <a href="/ui/chat" role="button">Start Chat</a>
+    <a href="/ui/capabilities" role="button" class="secondary">Browse Capabilities</a>
+    <a href="/ui/jobs" role="button" class="contrast">View Jobs</a>
+</div>
+{% endblock %}

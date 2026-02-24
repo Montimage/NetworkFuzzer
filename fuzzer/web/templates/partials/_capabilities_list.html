@@ -1,0 +1,13 @@
+<h3>{{ category | replace('_', ' ') | title }}</h3>
+
+{% if items %}
+<div class="grid capabilities-grid">
+    {% for item in items %}
+    <article class="capability-card">
+        <strong>{{ item }}</strong>
+    </article>
+    {% endfor %}
+</div>
+{% else %}
+<p>No {{ category | replace('_', ' ') }} available.</p>
+{% endif %}

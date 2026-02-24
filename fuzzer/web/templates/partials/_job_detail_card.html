@@ -1,0 +1,44 @@
+<article>
+    <header>
+        <span class="status-badge status-{{ job.status }}">{{ job.status }}</span>
+        {{ job.type }}
+    </header>
+
+    <table>
+        <tr><td><strong>ID</strong></td><td><code>{{ job.id }}</code></td></tr>
+        <tr><td><strong>Created</strong></td><td>{{ job.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</td></tr>
+        {% if job.started_at %}
+        <tr><td><strong>Started</strong></td><td>{{ job.started_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</td></tr>
+        {% endif %}
+        {% if job.completed_at %}
+        <tr><td><strong>Completed</strong></td><td>{{ job.completed_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</td></tr>
+        {% endif %}
+    </table>
+
+    {% if job.params %}
+    <h4>Parameters</h4>
+    <pre>{{ job.params | tojson(indent=2) }}</pre>
+    {% endif %}
+
+    {% if job.result %}
+    <h4>Output</h4>
+    <details open>
+        <summary>stdout (exit code: {{ job.result.exit_code }})</summary>
+        <pre>{{ job.result.stdout[-3000:] }}</pre>
+    </details>
+    {% if job.result.stderr %}
+    <details>
+        <summary>stderr</summary>
+        <pre>{{ job.result.stderr[-1500:] }}</pre>
+    </details>
+    {% endif %}
+    {% if job.result.output_dir %}
+    <p><strong>Output directory:</strong> <code>{{ job.result.output_dir }}</code></p>
+    {% endif %}
+    {% endif %}
+
+    {% if job.error %}
+    <h4>Error</h4>
+    <pre class="error-output">{{ job.error }}</pre>
+    {% endif %}
+</article>

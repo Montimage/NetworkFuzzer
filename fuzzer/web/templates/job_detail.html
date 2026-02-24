@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job.id }} — NetworkFuzzer{% endblock %}
+
+{% block content %}
+<hgroup>
+    <h1>Job {{ job.id }}</h1>
+    <p>{{ job.type }} &mdash; {{ job.status }}</p>
+</hgroup>
+
+<div id="job-detail-content"
+     {% if job.status == 'running' or job.status == 'pending' %}
+     hx-get="/ui/partials/jobs/{{ job.id }}"
+     hx-trigger="load, every 3s"
+     hx-swap="innerHTML"
+     {% endif %}>
+    {% include "partials/_job_detail_card.html" %}
+</div>
+
+<p><a href="/ui/jobs">&larr; Back to Jobs</a></p>
+{% endblock %}

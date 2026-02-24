@@ -1,0 +1,33 @@
+{% if jobs %}
+{% for job in jobs %}
+<tr class="job-row" style="cursor:pointer" onclick="window.location='/ui/jobs/{{ job.id }}'">
+    <td><code>{{ job.id }}</code></td>
+    <td>{{ job.type }}</td>
+    <td>
+        <span class="status-badge status-{{ job.status }}">{{ job.status }}</span>
+    </td>
+    <td>{{ job.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td>
+        {% if job.completed_at and job.started_at %}
+            {{ "%.1f" | format((job.completed_at - job.started_at).total_seconds()) }}s
+        {% elif job.started_at %}
+            running...
+        {% else %}
+            —
+        {% endif %}
+    </td>
+    <td>
+        {% if job.status in ('pending', 'running') %}
+        <button class="outline secondary small-btn"
+                onclick="event.stopPropagation(); fetch('/jobs/{{ job.id }}', {method:'DELETE'}).then(()=>htmx.ajax('GET','/ui/partials/jobs','#job-table-body'))">
+            Cancel
+        </button>
+        {% endif %}
+    </td>
+</tr>
+{% endfor %}
+{% else %}
+<tr>
+    <td colspan="6" style="text-align:center">No jobs found.</td>
+</tr>
+{% endif %}

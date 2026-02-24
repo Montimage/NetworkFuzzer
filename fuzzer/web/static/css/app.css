@@ -1,0 +1,167 @@
+/* NetworkFuzzer Web UI — custom styles */
+
+/* Dashboard stat cards */
+.stat {
+    font-size: 2.5rem;
+    font-weight: bold;
+    text-align: center;
+    margin: 0;
+}
+
+/* Status badges */
+.status-badge {
+    padding: 0.15em 0.5em;
+    border-radius: 4px;
+    font-size: 0.85em;
+    font-weight: 600;
+}
+.status-pending { background: #6c757d; color: #fff; }
+.status-running { background: #0d6efd; color: #fff; }
+.status-completed { background: #198754; color: #fff; }
+.status-failed { background: #dc3545; color: #fff; }
+.status-cancelled { background: #ffc107; color: #000; }
+
+/* Health badge */
+.health-badge {
+    font-size: 0.8em;
+    padding: 0.2em 0.6em;
+    border-radius: 4px;
+}
+.health-ok { background: #198754; color: #fff; }
+.health-error { background: #dc3545; color: #fff; }
+
+/* Chat container */
+.chat-container {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 200px);
+    min-height: 400px;
+}
+
+.chat-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+.chat-header h1 {
+    margin: 0;
+}
+
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+}
+
+.chat-empty {
+    text-align: center;
+    opacity: 0.6;
+    padding: 3rem 1rem;
+}
+
+/* Chat bubbles */
+.chat-bubble {
+    margin-bottom: 0.75rem;
+    display: flex;
+}
+.chat-bubble.user {
+    justify-content: flex-end;
+}
+.chat-bubble.assistant,
+.chat-bubble.tool {
+    justify-content: flex-start;
+}
+
+.bubble-content {
+    max-width: 75%;
+    padding: 0.6rem 1rem;
+    border-radius: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.user-bubble {
+    background: #0d6efd;
+    color: #fff;
+    border-bottom-right-radius: 4px;
+}
+
+.assistant-bubble {
+    background: var(--pico-card-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    border-bottom-left-radius: 4px;
+}
+
+/* Tool call/result cards */
+.tool-call,
+.tool-result {
+    max-width: 75%;
+    font-size: 0.85em;
+}
+.tool-call summary {
+    color: #6c757d;
+    cursor: pointer;
+}
+.tool-result summary {
+    color: #198754;
+    cursor: pointer;
+}
+.tool-call pre,
+.tool-result pre {
+    font-size: 0.85em;
+    max-height: 200px;
+    overflow-y: auto;
+    margin: 0.25rem 0;
+}
+
+/* Chat input */
+.chat-input {
+    display: flex;
+    gap: 0.5rem;
+}
+.chat-input input {
+    flex: 1;
+    margin-bottom: 0;
+    min-width: 0;
+}
+.chat-input button {
+    margin-bottom: 0;
+    white-space: nowrap;
+    width: auto;
+    flex-shrink: 0;
+    padding-inline: 1.2rem;
+}
+
+/* Job row hover */
+.job-row:hover {
+    background: var(--pico-card-background-color);
+}
+
+/* Small button */
+.small-btn {
+    padding: 0.2em 0.6em;
+    font-size: 0.8em;
+}
+
+/* Capabilities grid */
+.capabilities-grid {
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.capability-card {
+    text-align: center;
+    padding: 1rem;
+}
+
+/* Error output */
+.error-output {
+    color: #dc3545;
+}
+
+/* Job filter buttons */
+.job-filters [role="group"] {
+    margin-bottom: 1rem;
+}

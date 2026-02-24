@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Jobs — NetworkFuzzer{% endblock %}
+
+{% block content %}
+<h1>Jobs</h1>
+
+<div x-data="{ filter: '' }" class="job-filters">
+    <div role="group">
+        <button :class="filter === '' ? '' : 'outline'" @click="filter = ''; htmx.ajax('GET', '/ui/partials/jobs', '#job-table-body')">All</button>
+        <button :class="filter === 'pending' ? '' : 'outline'" @click="filter = 'pending'; htmx.ajax('GET', '/ui/partials/jobs?status=pending', '#job-table-body')">Pending</button>
+        <button :class="filter === 'running' ? '' : 'outline'" @click="filter = 'running'; htmx.ajax('GET', '/ui/partials/jobs?status=running', '#job-table-body')">Running</button>
+        <button :class="filter === 'completed' ? '' : 'outline'" @click="filter = 'completed'; htmx.ajax('GET', '/ui/partials/jobs?status=completed', '#job-table-body')">Completed</button>
+        <button :class="filter === 'failed' ? '' : 'outline'" @click="filter = 'failed'; htmx.ajax('GET', '/ui/partials/jobs?status=failed', '#job-table-body')">Failed</button>
+    </div>
+</div>
+
+<figure>
+    <table role="grid">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Duration</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="job-table-body"
+               hx-get="/ui/partials/jobs"
+               hx-trigger="load, every 5s"
+               hx-swap="innerHTML">
+        </tbody>
+    </table>
+</figure>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // WebSocket for instant job updates
+    (function() {
+        let ws;
+        function connect() {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(proto + '//' + location.host + '/ui/ws/jobs');
+            ws.onmessage = function() {
+                // On any change, trigger htmx refresh
+                htmx.ajax('GET', '/ui/partials/jobs', '#job-table-body');
+            };
+            ws.onclose = function() { setTimeout(connect, 5000); };
+        }
+        connect();
+    })();
+</script>
+{% endblock %}

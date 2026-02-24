@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}NetworkFuzzer{% endblock %}</title>
+
+    <!-- Pico CSS (~10KB) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <!-- Custom styles -->
+    <link rel="stylesheet" href="/ui/static/css/app.css">
+
+    <!-- htmx (~14KB) -->
+    <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+    <!-- Alpine.js (~15KB) -->
+    <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body>
+    <nav class="container-fluid">
+        <ul>
+            <li><strong>NetworkFuzzer</strong></li>
+        </ul>
+        <ul>
+            <li><a href="/ui/">Dashboard</a></li>
+            <li><a href="/ui/chat">Chat</a></li>
+            <li><a href="/ui/jobs">Jobs</a></li>
+            <li><a href="/ui/capabilities">Capabilities</a></li>
+            <li>
+                <span hx-get="/ui/partials/health"
+                      hx-trigger="load, every 30s"
+                      hx-swap="innerHTML">
+                </span>
+            </li>
+        </ul>
+    </nav>
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="container">
+        <small>NetworkFuzzer &mdash; Montimage</small>
+    </footer>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

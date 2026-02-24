@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Agent Chat — NetworkFuzzer{% endblock %}
+
+{% block content %}
+<div x-data="chatApp()" x-init="scrollToBottom()" class="chat-container">
+    <div class="chat-header">
+        <h1>Agent Chat</h1>
+        <button class="outline secondary" @click="clearChat()">Clear</button>
+    </div>
+
+    <div class="chat-messages" x-ref="messages">
+        <template x-if="messages.length === 0">
+            <div class="chat-empty">
+                <p>Ask the NetworkFuzzer agent anything.</p>
+                <p><small>Try: "List available attack profiles" or "Start RL fuzzing against localhost:4242"</small></p>
+            </div>
+        </template>
+
+        <template x-for="(msg, i) in messages" :key="i">
+            <div :class="'chat-bubble ' + msg.role">
+                <template x-if="msg.role === 'user'">
+                    <div class="bubble-content user-bubble" x-text="msg.content"></div>
+                </template>
+                <template x-if="msg.role === 'assistant' && !msg.tool">
+                    <div class="bubble-content assistant-bubble" x-text="msg.content"></div>
+                </template>
+                <template x-if="msg.role === 'assistant' && msg.tool">
+                    <details class="tool-call">
+                        <summary x-text="'Tool: ' + msg.tool"></summary>
+                        <pre x-text="msg.tool_input"></pre>
+                    </details>
+                </template>
+                <template x-if="msg.role === 'tool'">
+                    <details class="tool-result">
+                        <summary x-text="'Result: ' + (msg.tool || 'tool')"></summary>
+                        <pre x-text="msg.content"></pre>
+                    </details>
+                </template>
+            </div>
+        </template>
+
+        <template x-if="loading">
+            <div class="chat-bubble assistant">
+                <div class="bubble-content assistant-bubble" aria-busy="true">Thinking...</div>
+            </div>
+        </template>
+    </div>
+
+    <form @submit.prevent="send()" class="chat-input">
+        <input type="text"
+               x-model="input"
+               placeholder="Ask the fuzzer agent..."
+               :disabled="loading"
+               autofocus>
+        <button type="submit" :disabled="loading || !input.trim()">Send</button>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/ui/static/js/chat.js"></script>
+{% endblock %}
