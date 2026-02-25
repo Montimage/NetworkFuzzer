@@ -269,3 +269,98 @@ class FuzzerRunner:
     def list_fuzz_modes(self) -> list[str]:
         """List available RL fuzzing modes."""
         return ["semantic", "aggressive", "state", "hybrid"]
+
+    # ------------------------------------------------------------------
+    # Pentest operations
+    # ------------------------------------------------------------------
+
+    def run_discovery(
+        self,
+        host: str,
+        port: int,
+        calling_ae: str = "NETWORKFUZZER",
+        called_ae: str = "ANY-SCP",
+        enum_ae: bool = False,
+        map_capabilities: bool = False,
+        timeout: float = 5.0,
+    ) -> RunResult:
+        """Run DICOM service discovery (probe + optional AE enum + capability map)."""
+        cmd = [
+            self.python_bin, "-m", "fuzzer.pentest.discovery.dicom_probe",
+            "--host", host,
+            "--port", str(port),
+            "--calling-ae", calling_ae,
+            "--called-ae", called_ae,
+            "--timeout", str(timeout),
+        ]
+        if enum_ae:
+            cmd.append("--enum-ae")
+
+        result = self._run(cmd, timeout=int(timeout * 30))
+
+        # Optionally run capability mapping as a second pass
+        if map_capabilities and result.success:
+            cap_cmd = [
+                self.python_bin, "-m", "fuzzer.pentest.discovery.capability_map",
+                "--host", host,
+                "--port", str(port),
+                "--calling-ae", calling_ae,
+                "--called-ae", called_ae,
+                "--timeout", str(timeout),
+            ]
+            cap_result = self._run(cap_cmd, timeout=120)
+            # Merge stdout
+            result.stdout = (
+                result.stdout.rstrip()
+                + "\n\n--- Capability Map ---\n"
+                + cap_result.stdout
+            )
+
+        return result
+
+    def run_vuln_scan(
+        self,
+        host: str,
+        port: int,
+        calling_ae: str = "NETWORKFUZZER",
+        called_ae: str = "ANY-SCP",
+        checks: str = "all",
+        timeout: float = 5.0,
+    ) -> RunResult:
+        """Run structured DICOM vulnerability checks."""
+        cmd = [
+            self.python_bin, "-m", "fuzzer.pentest.vulnscan.scanner",
+            "--host", host,
+            "--port", str(port),
+            "--calling-ae", calling_ae,
+            "--called-ae", called_ae,
+            "--checks", checks,
+            "--timeout", str(timeout),
+        ]
+        return self._run(cmd, timeout=300)
+
+    def run_report(
+        self,
+        host: str,
+        port: int,
+        findings_json: Optional[str] = None,
+        discovery_json: Optional[str] = None,
+        output_dir: str = ".",
+        formats: str = "html,json",
+    ) -> RunResult:
+        """Generate HTML/JSON security report from findings."""
+        cmd = [
+            self.python_bin, "-m", "fuzzer.pentest.reporting.generator",
+            "--host", host,
+            "--port", str(port),
+            "--output-dir", output_dir,
+            "--format", formats,
+        ]
+        if findings_json:
+            cmd.extend(["--findings", findings_json])
+        if discovery_json:
+            cmd.extend(["--discovery", discovery_json])
+
+        result = self._run(cmd, timeout=60)
+        result.output_dir = output_dir
+        return result

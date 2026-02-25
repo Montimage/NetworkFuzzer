@@ -18,6 +18,7 @@ from fuzzer.api.jobs import JobManager
 from fuzzer.api.routers.capabilities import router as capabilities_router
 from fuzzer.api.routers.fuzz import router as fuzz_router
 from fuzzer.api.routers.jobs import router as jobs_router
+from fuzzer.api.routers.pentest import router as pentest_router
 from fuzzer.api.routers.replay import router as replay_router
 from fuzzer.web import mount_web_ui
 from fuzzer.web.agent_session import AgentSessionManager
@@ -49,6 +50,7 @@ def create_app(project_root: Optional[str] = None) -> FastAPI:
     app.include_router(replay_router, prefix="", tags=["Replay"])
     app.include_router(capabilities_router, prefix="", tags=["Capabilities"])
     app.include_router(jobs_router, prefix="/jobs", tags=["Jobs"])
+    app.include_router(pentest_router, prefix="/pentest", tags=["Pentest"])
 
     @app.get("/health", tags=["Health"])
     async def health():

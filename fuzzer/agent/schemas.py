@@ -148,3 +148,66 @@ class ListCapabilitiesInput(BaseModel):
         description="What to list: 'protocols' (available protocol adapters), "
         "'attack_profiles' (GAN attack profiles), or 'fuzz_modes' (RL fuzzing modes).",
     )
+
+
+class DiscoverInput(BaseModel):
+    """Input schema for DICOM service discovery."""
+
+    host: str = Field(description="Target server hostname or IP address.")
+    port: int = Field(default=4242, description="Target DICOM port.")
+    calling_ae: str = Field(default="NETWORKFUZZER", description="Calling AE title used by the probe.")
+    called_ae: str = Field(default="ANY-SCP", description="Called AE title to try on the target.")
+    enum_ae: bool = Field(
+        default=False,
+        description="Enumerate accepted AE titles using a built-in wordlist. "
+        "Takes longer but reveals misconfigured AE title policies.",
+    )
+    map_capabilities: bool = Field(
+        default=False,
+        description="Probe which DICOM SOP classes (C-ECHO, C-FIND, C-STORE, C-MOVE) "
+        "the server supports. Adds ~30s but provides richer findings.",
+    )
+    timeout: float = Field(default=5.0, description="Per-operation timeout in seconds.")
+
+
+class VulnScanInput(BaseModel):
+    """Input schema for DICOM vulnerability scanning."""
+
+    host: str = Field(description="Target server hostname or IP address.")
+    port: int = Field(default=4242, description="Target DICOM port.")
+    calling_ae: str = Field(default="NETWORKFUZZER", description="Calling AE title used by checks.")
+    called_ae: str = Field(default="ANY-SCP", description="Called AE title to use when connecting.")
+    checks: str = Field(
+        default="all",
+        description="Comma-separated check categories to run. "
+        "Options: 'auth' (AE title validation), 'cfind' (unauthenticated C-FIND), "
+        "'dos' (denial-of-service), 'info' (information disclosure). "
+        "Use 'all' to run every check.",
+    )
+    timeout: float = Field(default=5.0, description="Per-check timeout in seconds.")
+
+
+class ReportInput(BaseModel):
+    """Input schema for security report generation."""
+
+    host: str = Field(description="Target host (for report header).")
+    port: int = Field(default=4242, description="Target port (for report header).")
+    findings_json: Optional[str] = Field(
+        default=None,
+        description="Path to a JSON file containing scan findings "
+        "(output of run_vuln_scan saved to disk). "
+        "If omitted, an empty findings section is generated.",
+    )
+    discovery_json: Optional[str] = Field(
+        default=None,
+        description="Path to a JSON file containing discovery results "
+        "(output of run_discovery saved to disk). Optional.",
+    )
+    output_dir: str = Field(
+        default=".",
+        description="Directory where the report files will be written.",
+    )
+    formats: str = Field(
+        default="html,json",
+        description="Comma-separated report formats to generate: 'html', 'json'.",
+    )

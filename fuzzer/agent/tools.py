@@ -8,17 +8,20 @@ Provides 5 tools that wrap NetworkFuzzer CLI commands:
   5. list_capabilities — List protocols, attack profiles, fuzz modes
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from langchain_core.tools import StructuredTool
 
 from fuzzer.agent.runner import FuzzerRunner
 from fuzzer.agent.schemas import (
     CompileRuleInput,
+    DiscoverInput,
     GANGenerateInput,
     ListCapabilitiesInput,
     ReplayInput,
     RLFuzzInput,
+    ReportInput,
+    VulnScanInput,
 )
 
 
@@ -88,6 +91,47 @@ def _compile_rule(runner: FuzzerRunner, **kwargs) -> str:
     return result.summary()
 
 
+def _discover(runner: FuzzerRunner, **kwargs) -> str:
+    inp = DiscoverInput(**kwargs)
+    result = runner.run_discovery(
+        host=inp.host,
+        port=inp.port,
+        calling_ae=inp.calling_ae,
+        called_ae=inp.called_ae,
+        enum_ae=inp.enum_ae,
+        map_capabilities=inp.map_capabilities,
+        timeout=inp.timeout,
+    )
+    return result.summary()
+
+
+def _vuln_scan(runner: FuzzerRunner, **kwargs) -> str:
+    inp = VulnScanInput(**kwargs)
+    result = runner.run_vuln_scan(
+        host=inp.host,
+        port=inp.port,
+        calling_ae=inp.calling_ae,
+        called_ae=inp.called_ae,
+        checks=inp.checks,
+        timeout=inp.timeout,
+    )
+    return result.summary()
+
+
+def _report(runner: FuzzerRunner, **kwargs) -> str:
+    inp = ReportInput(**kwargs)
+    formats = [f.strip() for f in inp.formats.split(",")]
+    result = runner.run_report(
+        host=inp.host,
+        port=inp.port,
+        findings_json=inp.findings_json,
+        discovery_json=inp.discovery_json,
+        output_dir=inp.output_dir,
+        formats=inp.formats,
+    )
+    return result.summary()
+
+
 def _list_capabilities(runner: FuzzerRunner, **kwargs) -> str:
     inp = ListCapabilitiesInput(**kwargs)
     category = inp.category.lower()
@@ -108,7 +152,7 @@ def _list_capabilities(runner: FuzzerRunner, **kwargs) -> str:
     return f"{label}:\n" + "\n".join(f"  - {item}" for item in items)
 
 
-def create_networkfuzzer_tools(project_root: Optional[str] = None) -> list[StructuredTool]:
+def create_networkfuzzer_tools(project_root: Optional[str] = None) -> List[StructuredTool]:
     """Create all NetworkFuzzer LangChain tools.
 
     Args:
@@ -120,6 +164,45 @@ def create_networkfuzzer_tools(project_root: Optional[str] = None) -> list[Struc
     runner = FuzzerRunner(project_root=project_root)
 
     return [
+        StructuredTool.from_function(
+            func=lambda **kw: _discover(runner, **kw),
+            name="discover_dicom_service",
+            description=(
+                "Discover and fingerprint a DICOM service. Sends a C-ECHO probe to test "
+                "reachability, extracts implementation UID/version to identify the product "
+                "(Orthanc, DCMTK, dcm4che, etc.), optionally enumerates accepted AE titles "
+                "(set enum_ae=True), and optionally maps supported SOP classes like "
+                "C-FIND/C-MOVE/C-STORE (set map_capabilities=True). "
+                "Always run this FIRST before scanning or fuzzing an unknown target."
+            ),
+            args_schema=DiscoverInput,
+        ),
+        StructuredTool.from_function(
+            func=lambda **kw: _vuln_scan(runner, **kw),
+            name="scan_vulnerabilities",
+            description=(
+                "Run structured vulnerability checks against a DICOM server. "
+                "Check categories: "
+                "'auth' — AE title validation (no-auth, wildcard, default AE titles); "
+                "'cfind' — unauthenticated C-FIND patient/study enumeration (HIPAA risk); "
+                "'dos' — denial-of-service (max_pdu overflow CVE-2024-28130, connection exhaustion); "
+                "'info' — information disclosure (version, no-TLS, verbose errors). "
+                "Use checks='all' for a full assessment. Returns findings with severity and remediation."
+            ),
+            args_schema=VulnScanInput,
+        ),
+        StructuredTool.from_function(
+            func=lambda **kw: _report(runner, **kw),
+            name="generate_pentest_report",
+            description=(
+                "Generate an HTML and/or JSON security report combining discovery and "
+                "vulnerability scan findings. Pass findings_json with the path to scan "
+                "results (JSON output from scan_vulnerabilities) and optionally discovery_json. "
+                "Outputs a professional report with severity breakdown, remediation steps, "
+                "and CVSS scores. Use this as the final step after discovery and scanning."
+            ),
+            args_schema=ReportInput,
+        ),
         StructuredTool.from_function(
             func=lambda **kw: _rl_fuzz(runner, **kw),
             name="fuzz_with_rl",

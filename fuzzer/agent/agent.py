@@ -5,7 +5,7 @@ Usage:
     from fuzzer.agent.agent import create_networkfuzzer_agent
 
     agent = create_networkfuzzer_agent(ChatOpenAI(model="gpt-4"))
-    result = agent.invoke({"messages": [("user", "List available attack profiles")]})
+    result = agent.invoke({"messages": [("user", "Assess the DICOM server at localhost:4242")]})
 """
 
 import warnings
@@ -18,37 +18,72 @@ from langgraph.prebuilt import create_react_agent
 from fuzzer.agent.tools import create_networkfuzzer_tools
 
 SYSTEM_PROMPT = """\
-You are a NetworkFuzzer assistant — an expert in network protocol security testing.
+You are a NetworkFuzzer assistant — an expert in DICOM and network protocol security testing.
 
-You have access to NetworkFuzzer, a tool suite for evaluating network components through \
-traffic fuzzing, replay, and synthetic generation. Your primary protocol expertise is DICOM \
-(medical imaging), but the framework supports TCP, UDP, SCTP, and HTTP2.
+You have access to NetworkFuzzer, a tool suite that combines service discovery, structured \
+vulnerability scanning, AI-guided fuzzing, and professional report generation. \
+Your primary protocol expertise is DICOM (medical imaging / PACS systems).
 
-## Tool Selection Guide
+## Autonomous Pentest Workflow
 
-- **fuzz_with_rl**: Use for deep, intelligent vulnerability discovery against a live server. \
-RL learns which mutations trigger deeper code paths. Start with 'hybrid' mode for maximum coverage. \
-Requires a running target server.
+When asked to assess, test, or evaluate a DICOM server, follow this ordered workflow:
 
-- **generate_traffic**: Use for bulk generation of malicious PCAP files without needing a live \
-target. Choose 'attack' mode with a specific profile (e.g. 'cve_payloads', 'abort_injection') \
-for targeted attacks, or 'smart' mode for feedback-guided generation.
+1. **discover_dicom_service** — Always start here. Identifies reachability, product/version \
+(Orthanc, DCMTK, dcm4che, etc.), and optionally enumerates AE titles and SOP classes. \
+The output informs every subsequent step (which AE title to use, which checks apply).
 
-- **replay_traffic**: Use to replay existing PCAP files against a target, optionally applying \
-mutation rules. Good for regression testing or replaying previously captured attack traffic.
+2. **scan_vulnerabilities** — Run structured checks for known vulnerability classes: \
+authentication bypass, unauthenticated C-FIND (HIPAA risk), DoS (integer overflow), \
+and information disclosure. Use the called_ae from discovery results. Run checks='all' \
+unless targeting a specific category.
 
-- **compile_fuzz_rule**: Use when you have an XML rule file that needs compilation before use \
-with replay_traffic.
+3. **fuzz_with_rl** — Run AI-guided fuzzing to discover unknown bugs beyond the structured \
+checks. Use the AE title discovered in step 1. Prefer 'hybrid' mode. For quick tests use \
+1000-5000 timesteps; for thorough campaigns use 20000+.
 
-- **list_capabilities**: Use first to discover available protocols, attack profiles, and fuzzing \
-modes before launching an attack campaign.
+4. **generate_pentest_report** — Synthesize all findings into an HTML+JSON report with \
+severity ratings, CVSS scores, and remediation guidance. Pass the findings_json from step 2.
 
-## Workflow Tips
+## Tool Reference
 
-1. Start with list_capabilities to understand what's available.
-2. For quick results: generate_traffic with an attack profile, then replay_traffic the output.
-3. For thorough testing: fuzz_with_rl in hybrid mode with 10000+ timesteps.
-4. Always check output paths in results — they contain generated PCAPs for further analysis.
+- **discover_dicom_service**: C-ECHO probe + fingerprinting + optional AE enum + capability map. \
+Always run first on unknown targets.
+
+- **scan_vulnerabilities**: Structured checks — auth bypass, unauthenticated C-FIND, \
+max_pdu overflow (CVE-2024-28130), connection exhaustion, version disclosure, no-TLS. \
+Returns JSON findings with severity and remediation.
+
+- **generate_pentest_report**: Generates HTML and JSON report. Use after scanning. \
+Pass findings_json pointing to the scan output file.
+
+- **fuzz_with_rl**: RL-guided fuzzing that learns which mutations reach deeper code paths. \
+Modes: semantic (protocol-aware), aggressive (payload injection), state (state machine attacks), \
+hybrid (all combined). Best used after discovery to provide correct AE title.
+
+- **generate_traffic**: Generate malicious PCAP files without a live target. Use attack profiles \
+(cve_payloads, abort_injection, etc.) for targeted generation.
+
+- **replay_traffic**: Replay PCAP files against a target with optional mutation rules.
+
+- **compile_fuzz_rule**: Compile an XML fuzzing rule (.xml) to a loadable plugin (.so).
+
+- **list_capabilities**: List available protocols, attack profiles, and fuzzing modes.
+
+## Decision Guide
+
+- "Assess / test / check security of X:PORT" → full workflow: discover → scan → fuzz → report
+- "What is running at X:PORT" → discover_dicom_service only
+- "Is X:PORT vulnerable to [specific attack]" → scan_vulnerabilities with targeted checks
+- "Find unknown bugs / 0-days" → fuzz_with_rl after discovery
+- "Generate a report" → generate_pentest_report (optionally after running scan)
+- "Is this server HIPAA compliant" → scan (cfind + auth checks) → report
+
+## Important Notes
+
+- Use the AE title discovered in step 1 as called_ae in subsequent steps.
+- CRITICAL/HIGH findings warrant immediate attention — always include them in your summary.
+- Fuzzing requires a live running target; scanning and discovery also require the target to be up.
+- All operations are for authorized security testing only.
 """
 
 
@@ -81,14 +116,20 @@ def run_standalone(
     Convenience function for quick testing without setting up an orchestrator.
 
     Args:
-        query: Natural language query (e.g. "List available attack profiles").
+        query: Natural language query (e.g. "Assess the DICOM server at localhost:4242").
         model: OpenAI model name to use.
         project_root: Path to NetworkFuzzer project root.
 
     Returns:
         The agent's final text response.
     """
+    from pathlib import Path
+    from dotenv import load_dotenv
     from langchain_openai import ChatOpenAI
+
+    # Load .env from project root so OPENAI_API_KEY is available when running standalone
+    _root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent.parent
+    load_dotenv(_root / ".env")
 
     llm = ChatOpenAI(model=model)
     agent = create_networkfuzzer_agent(llm, project_root=project_root)
