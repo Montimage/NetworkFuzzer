@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "networkfuzzer"
+version = "0.1.0"
+description = "NetworkFuzzer — AI-guided network protocol security testing (DICOM/PACS)"
+requires-python = ">=3.8"
+dependencies = [
+    "pydicom",
+    "pynetdicom>=2.0.0",
+    "python-dotenv",
+    "pandas",
+    "numpy",
+    "scapy",
+    "mcp>=1.0.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+# Full agent stack (LangGraph, OpenAI)
+agent = [
+    "langchain-core",
+    "langchain-openai",
+    "langgraph",
+    "fastapi",
+    "uvicorn",
+]
+# ML fuzzing models
+ml = [
+    "gymnasium>=0.29.0",
+    "stable-baselines3",
+    "ctgan==0.11.0",
+]
+all = ["networkfuzzer[agent,ml]"]
+
+[project.scripts]
+# Install this command: networkfuzzer-mcp
+# Usage: networkfuzzer-mcp  (runs the MCP server on stdio)
+networkfuzzer-mcp = "fuzzer.mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fuzzer*"]
