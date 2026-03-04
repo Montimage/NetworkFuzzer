@@ -25,6 +25,7 @@ import time
 import argparse
 import logging
 import glob
+import json
 
 import numpy as np
 
@@ -290,6 +291,7 @@ def main():
             ssh_coverage_dir=args.ssh_coverage_dir,
             seed_dir=hybrid_seed_dir,
             disable_slow_attacks=args.fast,
+            corpus_dir=args.output_dir,
         )
         print(f"Hybrid mode: {env.n_actions} pre-defined attack combinations")
         print("  Combines: semantic mutations + payload injection + protocol state attacks")
@@ -377,6 +379,45 @@ def main():
         return
 
     # Test
+    def _save_corpus_entry(output_dir, kind, idx, pdu_bytes, ep_reward, info):
+        """Save a crash or hang input to a dedicated subdirectory with a metadata sidecar.
+
+        Args:
+            kind:      'crash', 'hang', or 'interesting'
+            idx:       episode index (for unique filenames)
+            pdu_bytes: raw bytes that triggered the finding
+            ep_reward: episode reward at time of finding
+            info:      episode info dict
+        """
+        subdir = os.path.join(output_dir, f"{kind}s")
+        os.makedirs(subdir, exist_ok=True)
+        ts = int(time.time())
+        stem = f"{kind}_{idx:04d}_{ts}"
+        # Raw bytes
+        bin_path = os.path.join(subdir, f"{stem}.bin")
+        with open(bin_path, "wb") as f:
+            f.write(pdu_bytes)
+        # Metadata sidecar for triage
+        meta = {
+            "kind": kind,
+            "episode": idx,
+            "timestamp": ts,
+            "reward": ep_reward,
+            "response": info.get("response") or info.get("live_response") or info.get("final_response"),
+            "combo": info.get("combo_name"),
+            "semantic": info.get("semantic"),
+            "payload": info.get("payload"),
+            "sequence": info.get("sequence"),
+            "response_time_ms": info.get("response_time_ms"),
+            "asan_bugs": info.get("asan_bugs", 0),
+            "proc_rss_growth_mb": info.get("proc_rss_growth_mb"),
+            "new_locations": info.get("new_locations"),
+        }
+        json_path = os.path.join(subdir, f"{stem}.json")
+        with open(json_path, "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+        return bin_path
+
     if args.test:
         print(f"\n{'=' * 90}")
         print(f"TEST RUN ({args.n_test} episodes)")
@@ -396,6 +437,10 @@ def main():
                 resp = info.get('final_response', 'none')
                 rtime = info.get('response_time_ms', 0)
                 crash = "YES!" if info.get('crash', False) else ""
+
+                if info.get('crash') and pdu_bytes:
+                    p = _save_corpus_entry(args.output_dir, 'crash', i, pdu_bytes, ep_reward, info)
+                    print(f"      [SAVED CRASH] {p}")
 
                 print(f"{i+1:>3} {ep_reward:>7.1f} {seq:<20} {resp:<12} "
                       f"{rtime:>5.0f}ms {crash:>6}")
@@ -438,8 +483,14 @@ def main():
 
                 if info.get('crash'):
                     total_crashes += 1
+                    if pdu_bytes:
+                        p = _save_corpus_entry(args.output_dir, 'crash', i, pdu_bytes, ep_reward, info)
+                        print(f"      [SAVED CRASH] {p}")
                 if info.get('hang'):
                     total_hangs += 1
+                    if pdu_bytes:
+                        p = _save_corpus_entry(args.output_dir, 'hang', i, pdu_bytes, ep_reward, info)
+                        print(f"      [SAVED HANG]  {p}")
 
                 if strategy not in strategy_results:
                     strategy_results[strategy] = {"count": 0, "crashes": 0, "hangs": 0, "reward": 0}
@@ -489,8 +540,14 @@ def main():
 
                 if info.get('crash'):
                     total_crashes += 1
+                    if pdu_bytes:
+                        p = _save_corpus_entry(args.output_dir, 'crash', i, pdu_bytes, ep_reward, info)
+                        print(f"      [SAVED CRASH] {p}")
                 if info.get('hang'):
                     total_hangs += 1
+                    if pdu_bytes:
+                        p = _save_corpus_entry(args.output_dir, 'hang', i, pdu_bytes, ep_reward, info)
+                        print(f"      [SAVED HANG]  {p}")
 
                 asan_bugs = info.get('asan_bugs', 0)
                 rss_g = info.get('proc_rss_growth_mb', 0)
@@ -719,6 +776,10 @@ def main():
                 out_path = os.path.join(args.output_dir, f"rl_fuzzed_{i:04d}.bin")
                 with open(out_path, 'wb') as f:
                     f.write(pdu_bytes)
+                if info.get('crash') and pdu_bytes:
+                    _save_corpus_entry(args.output_dir, 'crash', i, pdu_bytes, ep_reward, info)
+                elif info.get('live_response') == 'true_hang' and pdu_bytes:
+                    _save_corpus_entry(args.output_dir, 'hang', i, pdu_bytes, ep_reward, info)
 
                 div = info.get('divergence', 0)
                 resp = info.get('live_response', 'n/a')

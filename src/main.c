@@ -17,13 +17,14 @@ int list(    int argc, char** argv );
 int extract( int argc, char ** argv);
 int generate( int argc, char ** argv);
 int fuzz( int argc, char **argv );
+int report( int argc, char **argv );
 
 char *str_hex2str(char *hstr, int start_index, int end_index);
 
 void _usage( const char *prog ){
 	char *s = str_hex2str(NULL, 0, 0);
 	fprintf( stderr, "Usage: %s command [option]", prog );
-	fprintf( stderr, "\n - command : is one of the following: compile, info, extract, replay, generate, fuzz");
+	fprintf( stderr, "\n - command : is one of the following: compile, info, extract, replay, generate, fuzz, report");
 	fprintf( stderr, "\n - option  : run \"%s command -h\" to get option of each command", prog );
 	fprintf( stderr, "\n");
 }
@@ -62,6 +63,8 @@ int main( int argc, char** argv ){
 		ret = generate( argc, argv );
 	else if( strcmp( command, "fuzz" ) == 0 )
 		ret = fuzz( argc, argv );
+	else if( strcmp( command, "report" ) == 0 )
+		ret = report( argc, argv );
 	else if( strcmp( command, "-h") == 0 ){
 		_usage( prog );
 		return EXIT_SUCCESS;

@@ -26,6 +26,7 @@ async def fuzz_rl(body: RLFuzzInput, request: Request):
             n_test=body.n_test,
             exploration_rate=body.exploration_rate,
             output_dir=body.output_dir,
+            seed_dir=body.seed_dir,
         )
 
     job = jobs.submit("rl_fuzz", run, body.model_dump())

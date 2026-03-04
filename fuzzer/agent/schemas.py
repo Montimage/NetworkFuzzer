@@ -57,6 +57,10 @@ class RLFuzzInput(BaseModel):
         default=None,
         description="Output directory for generated PCAPs. Defaults to fuzzer/data/pcap_output/rl_generated.",
     )
+    seed_dir: Optional[str] = Field(
+        default=None,
+        description="Directory with prior corpus .json files to seed field mutations (15% replay probability).",
+    )
 
 
 class GANGenerateInput(BaseModel):

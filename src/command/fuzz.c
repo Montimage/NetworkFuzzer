@@ -18,7 +18,7 @@
 #define DEFAULT_FUZZ_MODE "hybrid"
 #define DEFAULT_PROTOCOL "dicom"
 #define DEFAULT_CALLED_AE "ORTHANC"
-#define DEFAULT_CALLING_AE "FUZZER"
+#define DEFAULT_CALLING_AE "NETWORKFUZZER"
 
 int fuzz(int argc, char **argv) {
     // Custom help
@@ -149,6 +149,8 @@ int fuzz(int argc, char **argv) {
             do_train = 1;
         } else if (strcmp(argv[i], "--template-pcap") == 0 && i+1 < argc) {
             ++i; // accepted for backward compat, unused in protocol/attack modes
+        } else if (strcmp(argv[i], "--output-dir") == 0 && i+1 < argc) {
+            pcap_output_dir = argv[++i];  // --output-dir is the user-facing alias
         } else if (strcmp(argv[i], "--pcap-output") == 0 && i+1 < argc) {
             pcap_output_dir = argv[++i];
         } else if (strcmp(argv[i], "--samples") == 0 && i+1 < argc) {

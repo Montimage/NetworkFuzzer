@@ -36,6 +36,7 @@ class StateTransition:
     message_sequence: List[str]  # List of message type names
     description: str = ""
     is_valid: bool = True        # Whether this is a valid protocol sequence
+    flood: bool = False          # Send intermediate PDUs without waiting for response
 
 
 @dataclass
@@ -45,6 +46,7 @@ class PayloadTarget:
     field_name: str              # Which field to inject into
     max_size: Optional[int]      # Maximum size allowed (None = unlimited)
     encoding: str = "bytes"      # How to encode the payload
+    preferred_sequence: Optional[str] = None  # State transition name that delivers this payload
 
 
 @dataclass

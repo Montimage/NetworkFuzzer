@@ -208,6 +208,7 @@ def networkfuzzer_fuzz(
     n_test: int = 10,
     exploration_rate: float = 0.15,
     output_dir: Optional[str] = None,
+    seed_dir: Optional[str] = None,
 ) -> str:
     """Run RL-guided protocol fuzzing against a live DICOM server.
 
@@ -237,6 +238,7 @@ def networkfuzzer_fuzz(
         n_test: Number of test episodes (when test=True).
         exploration_rate: Novel combination exploration rate (0.0-1.0).
         output_dir: Output directory for generated PCAPs.
+        seed_dir: Optional directory with prior corpus .json files to seed field mutations.
 
     Returns:
         Training summary with coverage stats, crashes found, and PCAP paths.
@@ -254,6 +256,7 @@ def networkfuzzer_fuzz(
         n_test=n_test,
         exploration_rate=exploration_rate,
         output_dir=output_dir,
+        seed_dir=seed_dir,
     )
     return result.summary()
 

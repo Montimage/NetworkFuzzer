@@ -3,7 +3,7 @@
 PDU Replay & Response Classifier for NetworkFuzzer.
 
 Replays raw .bin PDU files against a DICOM server and classifies responses:
-  CRASH  — Server unresponsive after send (health check fails)
+  DOS    — Server unresponsive after send (health check fails — thread pool exhaustion or crash)
   HANG   — No response after timeout + retry
   ABORT  — Server sent A-ABORT (PDU type 0x07)
   ACCEPT — Server accepted association (PDU type 0x02)
@@ -22,6 +22,7 @@ Usage:
 import argparse
 import csv
 import glob
+import json
 import os
 import select
 import socket
@@ -33,7 +34,7 @@ import time
 # Verdict severity order (higher = more interesting)
 # ---------------------------------------------------------------------------
 VERDICT_SEVERITY = {
-    "CRASH": 0,
+    "DOS": 0,
     "HANG": 1,
     "ABORT": 2,
     "ACCEPT": 3,
@@ -279,6 +280,31 @@ def health_check(host, port, called_ae="ORTHANC", timeout=3.0):
 
 
 # ---------------------------------------------------------------------------
+# DICOM PDU splitter
+# ---------------------------------------------------------------------------
+
+def split_dicom_pdus(data: bytes):
+    """Split a raw byte stream into individual DICOM PDUs.
+
+    Each DICOM PDU has a 6-byte header: [type:1][reserved:1][length:4 big-endian].
+    Returns a list of (pdu_type_byte, raw_pdu_bytes) tuples.
+    """
+    pdus = []
+    i = 0
+    while i + 6 <= len(data):
+        pdu_type = data[i]
+        if pdu_type not in PDU_TYPE_NAMES:
+            break  # Not a valid PDU type — stop parsing
+        length = struct.unpack('>I', data[i + 2:i + 6])[0]
+        total = 6 + length
+        if i + total > len(data):
+            break  # Truncated — stop
+        pdus.append((pdu_type, data[i:i + total]))
+        i += total
+    return pdus
+
+
+# ---------------------------------------------------------------------------
 # Core replay logic
 # ---------------------------------------------------------------------------
 
@@ -433,12 +459,165 @@ def replay_pdu(pdu_bytes, host, port, called_ae="ORTHANC", calling_ae="REPRO",
     return result
 
 
+def replay_sequence(pdu_bytes, host, port, timeout=8.0, retry_timeout=12.0):
+    """Send each DICOM PDU in the stream individually and classify per-PDU responses.
+
+    Detects which specific PDU caused a hang/abort, so corpus replay is accurate.
+
+    Returns a result dict like replay_pdu(), plus:
+      "pdu_responses": list of per-PDU {type, verdict, time_ms, details}
+      "hang_pdu":      PDU type name that caused the hang (if any)
+    """
+    pdus = split_dicom_pdus(pdu_bytes)
+
+    result = {
+        "verdict": "ERROR",
+        "response_time_ms": 0.0,
+        "response_type": "",
+        "details": "",
+        "reject_source": "",
+        "reject_reason": "",
+        "bytes_received": 0,
+        "pdu_responses": [],
+        "hang_pdu": "",
+    }
+
+    if not pdus:
+        # Fallback: send as single blob (pre-split corpus or unknown format)
+        r = replay_pdu(pdu_bytes, host, port, timeout=timeout, retry_timeout=retry_timeout)
+        result.update(r)
+        result["details"] = "(single-blob) " + result["details"]
+        return result
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+    except ConnectionRefusedError:
+        result["details"] = "Connection refused"
+        return result
+    except socket.timeout:
+        result["details"] = "Connect timeout"
+        return result
+    except Exception as e:
+        result["details"] = str(e)
+        return result
+
+    last_verdict = "ERROR"
+    total_time_ms = 0.0
+
+    try:
+        for pdu_type_byte, pdu in pdus:
+            pdu_name = PDU_TYPE_NAMES.get(pdu_type_byte, f"0x{pdu_type_byte:02x}")
+            t_start = time.monotonic()
+
+            try:
+                sock.sendall(pdu)
+                response, closed, elapsed = wait_for_response_or_closure(
+                    sock, timeout * 1000)
+                total_time_ms += elapsed
+
+                if closed and not response:
+                    pdu_verdict = "REJECTED"
+                    pdu_detail = f"Server closed after {elapsed:.0f}ms"
+                elif response:
+                    rt = response[0]
+                    pdu_verdict = {
+                        0x07: "ABORT",
+                        0x03: "REJECT",
+                        0x02: "ACCEPT",
+                        0x04: "ACCEPT",
+                        0x06: "ACCEPT",
+                    }.get(rt, "ACCEPT")
+                    pdu_detail = PDU_TYPE_NAMES.get(rt, f"0x{rt:02x}")
+                    result["bytes_received"] += len(response)
+                    result["response_type"] = PDU_TYPE_NAMES.get(rt, f"0x{rt:02x}")
+                    if rt == 0x07:
+                        src, reason = parse_abort_pdu(response)
+                        result["reject_source"] = src
+                        result["reject_reason"] = reason
+                        pdu_detail = f"ABORT source={src} reason={reason}"
+                    elif rt == 0x03:
+                        src, reason = parse_reject_pdu(response)
+                        result["reject_source"] = src
+                        result["reject_reason"] = reason
+                        pdu_detail = f"REJECT source={src} reason={reason}"
+                else:
+                    # No response and socket alive — retry once
+                    response2, closed2, elapsed2 = wait_for_response_or_closure(
+                        sock, retry_timeout * 1000)
+                    total_time_ms += elapsed2
+                    if closed2 and not response2:
+                        pdu_verdict = "REJECTED"
+                        pdu_detail = f"Closed after retry ({elapsed + elapsed2:.0f}ms)"
+                    elif response2:
+                        rt = response2[0]
+                        pdu_verdict = "ACCEPT"
+                        pdu_detail = f"Late response: {PDU_TYPE_NAMES.get(rt, f'0x{rt:02x}')}"
+                        result["bytes_received"] += len(response2)
+                    else:
+                        pdu_verdict = "HANG"
+                        pdu_detail = f"No response after {elapsed + elapsed2:.0f}ms (socket alive)"
+                        result["hang_pdu"] = pdu_name
+
+            except socket.timeout:
+                elapsed = (time.monotonic() - t_start) * 1000
+                total_time_ms += elapsed
+                pdu_verdict = "HANG"
+                pdu_detail = f"Timeout after {elapsed:.0f}ms"
+                result["hang_pdu"] = pdu_name
+
+            result["pdu_responses"].append({
+                "pdu": pdu_name,
+                "size": len(pdu),
+                "verdict": pdu_verdict,
+                "time_ms": round(elapsed if "elapsed" in dir() else 0, 1),
+                "detail": pdu_detail,
+            })
+            last_verdict = pdu_verdict
+
+            # Stop on hang/abort/reject — no point sending more PDUs
+            if pdu_verdict in ("HANG", "ABORT", "REJECTED"):
+                break
+
+    except ConnectionResetError:
+        last_verdict = "REJECTED"
+        result["details"] = "Connection reset by server"
+    except BrokenPipeError:
+        last_verdict = "REJECTED"
+        result["details"] = "Broken pipe"
+    except Exception as e:
+        last_verdict = "ERROR"
+        result["details"] = str(e)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    result["verdict"] = last_verdict
+    result["response_time_ms"] = round(total_time_ms, 1)
+    if not result["details"]:
+        if result["hang_pdu"]:
+            result["details"] = f"Hung on {result['hang_pdu']} after {total_time_ms:.0f}ms"
+        elif result["pdu_responses"]:
+            last = result["pdu_responses"][-1]
+            result["details"] = f"{last['pdu']}: {last['detail']}"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # File collection
 # ---------------------------------------------------------------------------
 
-def collect_files(input_path=None, input_dir=None, pcap_mode=False):
-    """Collect .bin (or .pcap in pcap-mode) files to replay."""
+def collect_files(input_path=None, input_dir=None, corpus_dir=None,
+                  pcap_mode=False, kinds=("crashes", "hangs")):
+    """Collect .bin (or .pcap in pcap-mode) files to replay.
+
+    corpus_dir: path produced by the RL fuzzer (contains crashes/ and hangs/ subdirs).
+    kinds: which subdirectories to include (default: both crashes and hangs).
+    """
     files = []
 
     if input_path:
@@ -451,15 +630,37 @@ def collect_files(input_path=None, input_dir=None, pcap_mode=False):
         if not os.path.isdir(input_dir):
             print(f"Error: directory not found: {input_dir}", file=sys.stderr)
         else:
-            if pcap_mode:
-                patterns = ["*.pcap", "*.bin"]
-            else:
-                patterns = ["*.bin"]
+            patterns = ["*.pcap", "*.bin"] if pcap_mode else ["*.bin"]
             for pat in patterns:
-                found = sorted(glob.glob(os.path.join(input_dir, pat)))
-                files.extend(found)
+                files.extend(sorted(glob.glob(os.path.join(input_dir, pat))))
+
+    if corpus_dir:
+        if not os.path.isdir(corpus_dir):
+            print(f"Error: corpus directory not found: {corpus_dir}", file=sys.stderr)
+        else:
+            for kind in kinds:
+                subdir = os.path.join(corpus_dir, kind)
+                if os.path.isdir(subdir):
+                    patterns = ["*.pcap", "*.bin"] if pcap_mode else ["*.bin"]
+                    for pat in patterns:
+                        files.extend(sorted(glob.glob(os.path.join(subdir, pat))))
 
     return files
+
+
+def load_sidecar(bin_path):
+    """Load the .json sidecar for a .bin corpus file, if present.
+
+    Returns a dict (possibly empty) with attack metadata.
+    """
+    json_path = os.path.splitext(bin_path)[0] + ".json"
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 
 def load_pdu_from_file(filepath, pcap_mode=False):
@@ -486,7 +687,6 @@ def load_pdu_from_file(filepath, pcap_mode=False):
 
 def format_table(results, target_host, target_port, duration_s):
     """Format results as a console table sorted by severity."""
-    # Sort: primary by severity (CRASH first), secondary by response time (desc)
     results.sort(key=lambda r: (
         VERDICT_SEVERITY.get(r["verdict"], 99),
         -r["response_time_ms"],
@@ -503,22 +703,38 @@ def format_table(results, target_host, target_port, duration_s):
                  f"PDUs tested: {total}  |  "
                  f"Duration: {dur_min}m {dur_sec:02d}s")
     lines.append("")
-    lines.append(f" {'#':>3}  {'File':<30} {'Verdict':<10} {'Time':>10}  {'Details'}")
-    lines.append(f" {'---':>3}  {'-'*30} {'-'*9} {'-'*10}  {'-'*50}")
+    lines.append(f" {'#':>3}  {'File':<32} {'Verdict':<8} {'Time':>8}  {'Details'}")
+    lines.append(f" {'---':>3}  {'-'*32} {'-'*8} {'-'*8}  {'-'*55}")
 
     for i, r in enumerate(results, 1):
         fname = os.path.basename(r["file"])
-        if len(fname) > 30:
-            fname = fname[:27] + "..."
+        if len(fname) > 32:
+            fname = fname[:29] + "..."
         verdict = r["verdict"]
-        if verdict == "CRASH":
-            verdict = "CRASH!"
+        if verdict == "DOS":
+            verdict = "DOS!"
         time_str = f"{r['response_time_ms']:.0f}ms"
         details = r["details"]
-        # Don't truncate details for ABORT/REJECT - show full reason
-        if verdict not in ["ABORT", "REJECT"] and len(details) > 50:
-            details = details[:47] + "..."
-        lines.append(f" {i:>3}  {fname:<30} {verdict:<10} {time_str:>10}  {details}")
+        if verdict not in ["ABORT", "REJECT"] and len(details) > 55:
+            details = details[:52] + "..."
+        lines.append(f" {i:>3}  {fname:<32} {verdict:<8} {time_str:>8}  {details}")
+
+        # Show sidecar attack metadata indented below the row
+        sc = r.get("sidecar", {})
+        if sc:
+            parts = []
+            if sc.get("combo_name"):
+                parts.append(f"combo={sc['combo_name']}")
+            if sc.get("semantic"):
+                parts.append(f"sem={sc['semantic']}")
+            if sc.get("payload"):
+                parts.append(f"pay={sc['payload']}")
+            if sc.get("sequence"):
+                parts.append(f"seq={sc['sequence']}")
+            if sc.get("asan_bugs"):
+                parts.append(f"asan={sc['asan_bugs']}")
+            if parts:
+                lines.append(f"       └─ {' | '.join(parts)}")
 
     # Summary
     counts = {}
@@ -528,14 +744,14 @@ def format_table(results, target_host, target_port, duration_s):
 
     lines.append("")
     lines.append("=== SUMMARY ===")
-    for verdict in ["CRASH", "HANG", "ABORT", "ACCEPT", "REJECT", "REJECTED", "ERROR", "CLOSED"]:
+    for verdict in ["DOS", "HANG", "ABORT", "ACCEPT", "REJECT", "REJECTED", "ERROR", "CLOSED"]:
         count = counts.get(verdict, 0)
-        if count > 0 or verdict in ("CRASH", "HANG"):
+        if count > 0 or verdict in ("DOS", "HANG"):
             pct = 100.0 * count / total if total > 0 else 0
             marker = ""
-            if verdict == "CRASH" and count > 0:
+            if verdict == "DOS" and count > 0:
                 crash_files = [os.path.basename(r["file"])
-                               for r in results if r["verdict"] == "CRASH"]
+                               for r in results if r["verdict"] == "DOS"]
                 marker = f"  <- {', '.join(crash_files[:3])}"
             lines.append(f"  {verdict:<8} {count:>3} ({pct:>5.1f}%){marker}")
 
@@ -548,13 +764,22 @@ def write_csv(results, output_path):
     fieldnames = [
         "file", "verdict", "response_time_ms", "pdu_type_sent", "pdu_size",
         "response_type", "reject_source", "reject_reason", "bytes_received",
-        "health_before", "health_after", "health_delta", "details",
+        "health_before", "health_after", "health_delta",
+        "combo_name", "semantic", "payload", "sequence", "asan_bugs",
+        "details",
     ]
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for r in results:
-            writer.writerow(r)
+            sc = r.get("sidecar", {})
+            row = dict(r)
+            row["combo_name"] = sc.get("combo_name", "")
+            row["semantic"] = sc.get("semantic", "")
+            row["payload"] = sc.get("payload", "")
+            row["sequence"] = sc.get("sequence", "")
+            row["asan_bugs"] = sc.get("asan_bugs", "")
+            writer.writerow(row)
     print(f"CSV report written to: {output_path}")
 
 
@@ -584,11 +809,17 @@ Examples:
 
     parser.add_argument("--input", "-i", help="Single .bin file to replay")
     parser.add_argument("--input-dir", "-d", help="Directory of .bin files to replay")
+    parser.add_argument("--corpus-dir", "-C",
+                        help="RL fuzzer output dir with crashes/ and hangs/ subdirectories "
+                             "(e.g. fuzzer/data/pcap_output/rl_generated)")
     parser.add_argument("--target-host", "-H", required=True, help="Target DICOM server host")
     parser.add_argument("--target-port", "-P", type=int, default=4242,
                         help="Target DICOM server port (default: 4242)")
     parser.add_argument("--associate", "-a", action="store_true",
                         help="Send valid ASSOC_RQ before each PDU")
+    parser.add_argument("--no-sequence", action="store_true",
+                        help="Send the whole .bin as one blob instead of splitting "
+                             "into individual PDUs (legacy behaviour)")
     parser.add_argument("--health-check", action="store_true",
                         help="Run C-ECHO health checks before/after each PDU (slower)")
     parser.add_argument("--timeout", "-t", type=float, default=3.0,
@@ -608,14 +839,22 @@ Examples:
                         help="Max seconds to wait for server recovery after crash (default: 30)")
     parser.add_argument("--crash-poll", type=float, default=2.0,
                         help="Polling interval during crash recovery (default: 2.0)")
+    parser.add_argument("--kinds", default="crashes,hangs",
+                        help="Comma-separated subdirectory kinds to replay from --corpus-dir "
+                             "(default: crashes,hangs)")
 
     args = parser.parse_args()
 
-    if not args.input and not args.input_dir:
-        parser.error("At least one of --input or --input-dir is required")
+    if not args.input and not args.input_dir and not args.corpus_dir:
+        parser.error("At least one of --input, --input-dir, or --corpus-dir is required")
+
+    kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
 
     # Collect files
-    files = collect_files(args.input, args.input_dir, args.pcap_mode)
+    files = collect_files(args.input, args.input_dir,
+                          corpus_dir=args.corpus_dir,
+                          pcap_mode=args.pcap_mode,
+                          kinds=kinds)
     if not files:
         print("No files found to replay.", file=sys.stderr)
         sys.exit(1)
@@ -635,11 +874,12 @@ Examples:
         fname = os.path.basename(filepath)
         progress = f"[{idx+1}/{len(files)}]"
 
-        # Load PDU bytes
+        # Load PDU bytes and optional sidecar metadata
         pdu_bytes = load_pdu_from_file(filepath, args.pcap_mode)
         if pdu_bytes is None or len(pdu_bytes) == 0:
             print(f"  {progress} {fname}: SKIP (empty or unreadable)")
             continue
+        sidecar = load_sidecar(filepath)
 
         # Detect PDU type from first byte
         pdu_type_byte = pdu_bytes[0] if pdu_bytes else 0
@@ -652,13 +892,28 @@ Examples:
             health_before_ok, health_before_ms, _ = health_check(
                 args.target_host, args.target_port, args.called_ae)
 
-        # Replay
-        r = replay_pdu(
-            pdu_bytes, args.target_host, args.target_port,
-            called_ae=args.called_ae, calling_ae=args.calling_ae,
-            associate=args.associate,
-            timeout=args.timeout, retry_timeout=args.retry_timeout,
-        )
+        # Replay — use per-PDU sequential mode by default for accurate hang detection
+        if args.no_sequence or args.associate:
+            r = replay_pdu(
+                pdu_bytes, args.target_host, args.target_port,
+                called_ae=args.called_ae, calling_ae=args.calling_ae,
+                associate=args.associate,
+                timeout=args.timeout, retry_timeout=args.retry_timeout,
+            )
+        else:
+            pdus = split_dicom_pdus(pdu_bytes)
+            if len(pdus) > 1:
+                r = replay_sequence(
+                    pdu_bytes, args.target_host, args.target_port,
+                    timeout=args.timeout, retry_timeout=args.retry_timeout,
+                )
+            else:
+                r = replay_pdu(
+                    pdu_bytes, args.target_host, args.target_port,
+                    called_ae=args.called_ae, calling_ae=args.calling_ae,
+                    associate=args.associate,
+                    timeout=args.timeout, retry_timeout=args.retry_timeout,
+                )
 
         # Post-health check → detect CRASH
         health_after_ok = None
@@ -670,7 +925,7 @@ Examples:
                 args.target_host, args.target_port, args.called_ae)
 
             if health_before_ok and not health_after_ok:
-                r["verdict"] = "CRASH"
+                r["verdict"] = "DOS"
                 r["details"] = f"Server unresponsive after send ({health_err})"
 
             if health_before_ms > 0 and health_after_ms > 0:
@@ -683,6 +938,7 @@ Examples:
         r["health_before"] = health_before_ok if health_before_ok is not None else ""
         r["health_after"] = health_after_ok if health_after_ok is not None else ""
         r["health_delta"] = round(health_delta, 1) if args.health_check else ""
+        r["sidecar"] = sidecar  # attack metadata from RL fuzzer corpus
 
         results.append(r)
 
@@ -690,12 +946,27 @@ Examples:
         verdict_display = r["verdict"]
         if verdict_display == "CRASH":
             verdict_display = "CRASH!"
-        print(f"  {progress} {fname:<30} {verdict_display:<8} "
+        print(f"  {progress} {fname:<32} {verdict_display:<8} "
               f"{r['response_time_ms']:>7.0f}ms  {r['details'][:40]}")
+        # Show per-PDU breakdown when using sequence replay
+        for pr in r.get("pdu_responses", []):
+            marker = " <-- HANG" if pr["verdict"] == "HANG" else \
+                     " <-- ABORT" if pr["verdict"] == "ABORT" else ""
+            print(f"         {pr['pdu']:<12} {pr['verdict']:<8} {pr['time_ms']:>7.0f}ms  "
+                  f"{pr['detail'][:35]}{marker}")
+        if sidecar.get("mutation") or sidecar.get("action_type"):
+            sc_parts = []
+            if sidecar.get("action_type"):
+                sc_parts.append(sidecar["action_type"])
+            if sidecar.get("mutation"):
+                sc_parts.append(sidecar["mutation"])
+            if sidecar.get("payload"):
+                sc_parts.append(sidecar["payload"])
+            print(f"         └─ {' | '.join(sc_parts)}")
 
         # Crash recovery: wait for server to come back
-        if r["verdict"] == "CRASH":
-            print(f"        >> Server crashed! Waiting up to {args.crash_wait:.0f}s for recovery...")
+        if r["verdict"] == "DOS":
+            print(f"        >> Server unresponsive (DoS)! Waiting up to {args.crash_wait:.0f}s for recovery...")
             recovered = False
             t_wait_start = time.monotonic()
             while (time.monotonic() - t_wait_start) < args.crash_wait:
@@ -726,7 +997,7 @@ Examples:
         write_csv(results, args.output)
 
     # Exit code: 1 if any crashes found
-    crashes = sum(1 for r in results if r["verdict"] == "CRASH")
+    crashes = sum(1 for r in results if r["verdict"] == "DOS")
     if crashes > 0:
         sys.exit(1)
 

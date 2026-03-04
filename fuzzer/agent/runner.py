@@ -115,6 +115,7 @@ class FuzzerRunner:
         n_test: int = 10,
         exploration_rate: float = 0.15,
         output_dir: Optional[str] = None,
+        seed_dir: Optional[str] = None,
         timeout: int = 1800,
     ) -> RunResult:
         """Run RL-guided protocol fuzzing via train_protocol.py."""
@@ -135,6 +136,8 @@ class FuzzerRunner:
             cmd.extend(["--n-test", str(n_test)])
         if output_dir:
             cmd.extend(["--output-dir", output_dir])
+        if seed_dir:
+            cmd.extend(["--seed-dir", seed_dir])
 
         result = self._run(cmd, timeout=timeout)
         result.output_dir = output_dir or "fuzzer/data/pcap_output/rl_generated"

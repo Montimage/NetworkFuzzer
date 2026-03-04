@@ -40,6 +40,7 @@ def _rl_fuzz(runner: FuzzerRunner, **kwargs) -> str:
         n_test=inp.n_test,
         exploration_rate=inp.exploration_rate,
         output_dir=inp.output_dir,
+        seed_dir=inp.seed_dir,
     )
     return result.summary()
 

@@ -20,6 +20,7 @@ Usage:
         --called-ae ORTHANC --mode semantic --timesteps 10000
 """
 
+import json
 import os
 import sys
 import time
@@ -77,7 +78,7 @@ Examples:
     # Protocol-specific options
     parser.add_argument("--called-ae", type=str, default="ORTHANC",
                         help="DICOM: Called AE title")
-    parser.add_argument("--calling-ae", type=str, default="FUZZER",
+    parser.add_argument("--calling-ae", type=str, default="NETWORKFUZZER",
                         help="DICOM: Calling AE title")
 
     # Fuzzing mode
@@ -109,6 +110,10 @@ Examples:
     # Exploration
     parser.add_argument("--exploration-rate", type=float, default=0.15,
                         help="Novel combo exploration rate 0.0-1.0 (default: 0.15)")
+
+    # Seed corpus
+    parser.add_argument("--seed-dir", type=str, default=None,
+                        help="Directory with prior corpus .json files to seed field mutations")
 
     args = parser.parse_args()
 
@@ -196,6 +201,8 @@ Examples:
         target_port=target_port,
         max_steps=args.max_steps,
         mode=args.mode,
+        corpus_dir=args.output_dir,
+        seed_dir=args.seed_dir,
     )
 
     print(f"Environment created with {env.n_actions} actions")
@@ -237,8 +244,14 @@ Examples:
 
                 if info.get('crash'):
                     total_crashes += 1
+                    if pdu_bytes:
+                        p = env.save_corpus_entry('crash', i, pdu_bytes, ep_reward, info)
+                        print(f"      [SAVED CRASH] {p}")
                 if info.get('hang'):
                     total_hangs += 1
+                    if pdu_bytes:
+                        p = env.save_corpus_entry('hang', i, pdu_bytes, ep_reward, info)
+                        print(f"      [SAVED HANG]  {p}")
 
                 # Track action effectiveness
                 action_key = f"{action_type}"

@@ -30,7 +30,7 @@ def create_agent(env, algorithm="DQN", policy_kwargs=None, **kwargs):
         policy_kwargs = dict(net_arch=[256, 128])
 
     defaults = {
-        "verbose": 1,
+        "verbose": 0,   # suppress SB3 per-episode output
         "policy_kwargs": policy_kwargs,
     }
     defaults.update(kwargs)
@@ -71,20 +71,26 @@ def create_agent(env, algorithm="DQN", policy_kwargs=None, **kwargs):
 
 
 class ProgressCallback:
-    """Callback to show training progress with hangs/crashes."""
+    """Time-based progress callback (prints every 60s regardless of step count)."""
 
-    def __init__(self, log_interval=500, total_timesteps=10000):
-        self.log_interval = log_interval
+    def __init__(self, log_interval=500, total_timesteps=10000, print_every_sec=60,
+                 fuzz_env=None):
+        self.log_interval = log_interval        # kept for compat, not used for printing
         self.total_timesteps = total_timesteps
+        self.print_every_sec = print_every_sec
         self.hangs = 0
         self.crashes = 0
-        self.last_log = 0
+        self.saved = 0
+        self.skipped = 0
         self.num_timesteps = 0
         self.start_time = time.monotonic()
+        self.last_print_time = time.monotonic()
+        # Direct reference to the underlying GenericFuzzEnv — avoids fragile
+        # SB3 locals_ introspection which fails silently across SB3 versions.
+        self._fuzz_env = fuzz_env
 
     def __call__(self, locals_, globals_):
         """Called after each step."""
-        # Count hangs and crashes from info
         if 'infos' in locals_:
             for info in locals_['infos']:
                 if isinstance(info, dict):
@@ -93,12 +99,38 @@ class ProgressCallback:
                     if info.get('crash'):
                         self.crashes += 1
 
-        self.num_timesteps = locals_.get('num_timesteps', 0)
-        if self.num_timesteps - self.last_log >= self.log_interval:
+        # SB3 exposes num_timesteps via the model object in locals_['self'],
+        # not as a top-level key — fall back through several access patterns.
+        ts = locals_.get('num_timesteps')
+        if ts is None:
+            sb3_self = locals_.get('self')
+            if sb3_self is not None:
+                ts = getattr(sb3_self, 'num_timesteps',
+                             getattr(getattr(sb3_self, 'model', None), 'num_timesteps', None))
+        self.num_timesteps = ts or self.num_timesteps  # don't regress to 0 on bad reads
+
+        # Read saved/skipped directly from the GenericFuzzEnv reference.
+        if self._fuzz_env is not None:
+            self.saved = self._fuzz_env._corpus_idx
+            self.skipped = self._fuzz_env._skipped_duplicates
+
+        # Print every print_every_sec wall-clock seconds
+        now = time.monotonic()
+        if now - self.last_print_time >= self.print_every_sec:
+            elapsed = now - self.start_time
             progress = self.num_timesteps / self.total_timesteps * 100
-            logger.info(f"Progress: {self.num_timesteps}/{self.total_timesteps} ({progress:.1f}%) | "
-                       f"Hangs: {self.hangs} | Crashes: {self.crashes}")
-            self.last_log = self.num_timesteps
+            rate = self.num_timesteps / elapsed if elapsed > 0 else 0
+            eta_s = (self.total_timesteps - self.num_timesteps) / rate if rate > 0 else 0
+            eta_str = f"{eta_s/3600:.1f}h" if eta_s > 3600 else f"{eta_s/60:.0f}m"
+            elapsed_str = f"{elapsed/3600:.1f}h" if elapsed > 3600 else f"{elapsed/60:.0f}m"
+            sps = rate  # steps per second
+            print(
+                f"[{elapsed_str} / {progress:5.1f}%] step={self.num_timesteps}/{self.total_timesteps}"
+                f"  hangs={self.hangs} saved={self.saved} skip={self.skipped}"
+                f"  {sps:.2f}stp/s  ETA={eta_str}",
+                flush=True,
+            )
+            self.last_print_time = now
 
         return True
 
@@ -129,10 +161,23 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
 
     logger.info(f"Training for {total_timesteps} timesteps...")
 
-    # Create progress callback
+    # Unwrap the SB3 VecEnv/Monitor layers to reach the raw GenericFuzzEnv,
+    # then hand a direct reference to the callback so it can read _corpus_idx.
+    fuzz_env = None
+    try:
+        vec_env = model.env
+        inner = vec_env.envs[0] if hasattr(vec_env, 'envs') else vec_env
+        while hasattr(inner, 'env') and not hasattr(inner, '_corpus_idx'):
+            inner = inner.env
+        if hasattr(inner, '_corpus_idx'):
+            fuzz_env = inner
+    except Exception:
+        pass
+
     callback = ProgressCallback(
-        log_interval=max(500, total_timesteps // 20),  # Log ~20 times during training
-        total_timesteps=total_timesteps
+        log_interval=max(200, total_timesteps // 40),
+        total_timesteps=total_timesteps,
+        fuzz_env=fuzz_env,
     )
 
     interrupted = False

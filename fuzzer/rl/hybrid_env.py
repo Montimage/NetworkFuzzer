@@ -745,8 +745,10 @@ class HybridFuzzEnv(gym.Env):
         if info.get("crash"):
             reward += 100.0
             logger.warning(f"CRASH detected! Combo: {combo_key}")
+            self._save_corpus_entry("crash", info)
         if info.get("hang"):
             reward += 30.0
+            self._save_corpus_entry("hang", info)
         if info.get("slow"):
             reward += 5.0
 
@@ -759,6 +761,35 @@ class HybridFuzzEnv(gym.Env):
         terminated = info.get("crash", False)
 
         return self._get_obs(), reward, terminated, truncated, info
+
+    def _save_corpus_entry(self, kind, info):
+        """Save a crash or hang input to corpus_dir for later triage/replay."""
+        if not self.corpus_dir:
+            return
+        import json
+        subdir = os.path.join(self.corpus_dir, f"{kind}s")
+        os.makedirs(subdir, exist_ok=True)
+        ts = int(time.time())
+        idx = getattr(self, "_corpus_idx", 0)
+        self._corpus_idx = idx + 1
+        stem = f"{kind}_{idx:04d}_{ts}"
+        sent_pdus = info.get("sent_pdus", [])
+        raw = b"".join(pdu for _, pdu in sent_pdus) if sent_pdus else b""
+        if raw:
+            bin_path = os.path.join(subdir, f"{stem}.bin")
+            with open(bin_path, "wb") as f:
+                f.write(raw)
+        meta = {
+            "kind": kind, "index": idx, "timestamp": ts,
+            "response": info.get("response"), "episode_reward": info.get("episode_reward"),
+            "fields": dict(getattr(self, "current_fields", {})),
+            "sent_pdu_types": [pt for pt, _ in sent_pdus],
+            "sent_pdu_sizes": [len(p) for _, p in sent_pdus],
+        }
+        json_path = os.path.join(subdir, f"{stem}.json")
+        with open(json_path, "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+        logger.warning(f"[CORPUS] Saved {kind} input → {json_path}")
 
     def render(self, mode="human"):
         print(f"Step {self.step_count}")
@@ -1136,7 +1167,8 @@ class SimplifiedHybridEnv(gym.Env):
                  docker_container=None, server_type="orthanc", exploration_rate=0.15,
                  diversity_bonus=1.0, ssh_process=None,
                  ssh_asan_log_pattern=None, ssh_coverage_dir=None,
-                 seed_dir=None, seed_pdus=None, disable_slow_attacks=False):
+                 seed_dir=None, seed_pdus=None, disable_slow_attacks=False,
+                 corpus_dir=None):
         """
         Initialize hybrid fuzzing environment.
 
@@ -1169,6 +1201,7 @@ class SimplifiedHybridEnv(gym.Env):
         self.called_ae = called_ae.encode() if isinstance(called_ae, str) else called_ae
         self.max_steps = max_steps
         self.disable_slow_attacks = disable_slow_attacks
+        self.corpus_dir = corpus_dir  # If set, save crash/hang inputs here during training
 
         # Seed corpus: real captured PDUs for seed-based mutations
         self.seed_assoc_rq = []  # List of raw ASSOC_RQ bytes
@@ -2739,6 +2772,8 @@ class SimplifiedHybridEnv(gym.Env):
         response_type_counts = {}
         n_responses = 0
 
+        sent_pdus = []  # accumulate for corpus saving
+
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -2747,6 +2782,7 @@ class SimplifiedHybridEnv(gym.Env):
 
             for pdu_type in sequence:
                 pdu = self._build_pdu(pdu_type)
+                sent_pdus.append((pdu_type, pdu))
                 t_start = time.monotonic()
 
                 try:
@@ -2851,6 +2887,7 @@ class SimplifiedHybridEnv(gym.Env):
         if n_responses > 1:
             total_reward /= math.sqrt(n_responses)
 
+        info["sent_pdus"] = sent_pdus  # list of (pdu_type, raw_bytes) for corpus saving
         self.response_history.append(info["response"])
         return total_reward, info
 
@@ -3208,10 +3245,68 @@ class SimplifiedHybridEnv(gym.Env):
         self.episode_reward += reward
         info["episode_reward"] = self.episode_reward
 
+        if info.get("crash"):
+            self._save_corpus_entry("crash", info)
+        elif info.get("hang"):
+            self._save_corpus_entry("hang", info)
+
         truncated = self.step_count >= self.max_steps
         terminated = info.get("crash", False)
 
         return self._get_obs(), reward, terminated, truncated, info
+
+    def _save_corpus_entry(self, kind, info):
+        """Save a crash or hang input to corpus_dir for later triage/replay.
+
+        Writes two files per finding:
+          <corpus_dir>/<kind>s/<kind>_NNNN_<ts>.bin   — concatenated raw PDU bytes
+          <corpus_dir>/<kind>s/<kind>_NNNN_<ts>.json  — attack metadata + replay recipe
+        """
+        if not self.corpus_dir:
+            return
+        import json
+        subdir = os.path.join(self.corpus_dir, f"{kind}s")
+        os.makedirs(subdir, exist_ok=True)
+
+        ts = int(time.time())
+        idx = getattr(self, "_corpus_idx", 0)
+        self._corpus_idx = idx + 1
+        stem = f"{kind}_{idx:04d}_{ts}"
+
+        # Concatenate all sent PDU bytes into a single .bin file
+        sent_pdus = info.get("sent_pdus", [])
+        raw = b"".join(pdu for _, pdu in sent_pdus) if sent_pdus else b""
+        if raw:
+            bin_path = os.path.join(subdir, f"{stem}.bin")
+            with open(bin_path, "wb") as f:
+                f.write(raw)
+
+        # Write JSON metadata for triage and replay reproduction
+        meta = {
+            "kind": kind,
+            "index": idx,
+            "timestamp": ts,
+            "combo_name": info.get("combo_name"),
+            "semantic": info.get("semantic"),
+            "payload": info.get("payload"),
+            "sequence": info.get("sequence"),
+            "dimse_attack": info.get("dimse_attack"),
+            "special_attack": info.get("special_attack"),
+            "response": info.get("response"),
+            "response_time_ms": info.get("response_time_ms"),
+            "episode_reward": info.get("episode_reward"),
+            "asan_bugs": info.get("asan_bugs", 0),
+            "new_locations": info.get("new_locations"),
+            "sent_pdu_types": [pt for pt, _ in sent_pdus],
+            "sent_pdu_sizes": [len(p) for _, p in sent_pdus],
+            "fields": dict(getattr(self, "current_fields", {})),
+            "payloads_keys": list(getattr(self, "current_payloads", {}).keys()),
+        }
+        json_path = os.path.join(subdir, f"{stem}.json")
+        with open(json_path, "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+
+        logger.warning(f"[CORPUS] Saved {kind} input → {json_path}")
 
     def get_combo_stats(self, top_n=None):
         """Return attack combination statistics (predefined combos)."""
