@@ -178,7 +178,7 @@ int inject_sctp_send_packet( inject_sctp_context_t *context, const uint8_t *pack
 	uint16_t nb_pkt_sent = 0;
 	int ret, i;
 
-	_clear_sctp_buffer_if_need( context );
+	//_clear_sctp_buffer_if_need( context );
 
 	for( i=0; i<context->nb_copies; i++ ){
 		//returns the number of bytes written on success and -1 on failure.
@@ -195,8 +195,8 @@ int inject_sctp_send_packet( inject_sctp_context_t *context, const uint8_t *pack
 			nb_pkt_sent ++;
 			context->total_sent_pkt ++;
 			//clear the reception buffer for each X sending packets
-			if( nb_pkt_sent % 10 == 0 )
-				_clear_sctp_buffer_if_need( context );
+			//if( nb_pkt_sent % 10 == 0 )
+			//	_clear_sctp_buffer_if_need( context );
 		} else if(! context->shown_error ){
 			context->shown_error = true;
 			log_write( LOG_ERR, "SCTP error when injecting %zu-th packet %d: %s (please check sctp parameters)",
