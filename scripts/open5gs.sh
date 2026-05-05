@@ -68,6 +68,17 @@ _running_pid() {
     kill -0 "$pid" 2>/dev/null && echo "$pid" || return 1
 }
 
+# Kill any lingering process by binary name (fallback when PID file is absent/stale)
+_kill_by_name() {
+    local nf="$1"
+    local bin="open5gs-${nf}d"
+    pgrep -f "$bin" >/dev/null 2>&1 || return 0
+    pkill -TERM -f "$bin" 2>/dev/null || true
+    local w=0
+    while pgrep -f "$bin" >/dev/null 2>&1 && (( w < 30 )); do sleep 0.1; (( w += 1 )); done
+    pkill -KILL -f "$bin" 2>/dev/null || true
+}
+
 _print_status() {
     echo ""
     echo "=== open5GS ${VERSION} NF Status ==="
@@ -223,7 +234,7 @@ cmd_start() {
             echo "  [${nf}] ERROR: config not found at ${cfg}" >&2; continue
         fi
 
-        # Stop any existing instance before starting fresh
+        # Stop any existing instance before starting fresh (PID file or stale process)
         local existing_pid; existing_pid="$(_running_pid "$nf" 2>/dev/null)" || true
         if [[ -n "$existing_pid" ]]; then
             printf "  [%s] stopping existing (pid %s) ...\n" "$nf" "$existing_pid"
@@ -235,6 +246,7 @@ cmd_start() {
             kill -KILL "$existing_pid" 2>/dev/null || true
             rm -f "$pf"
         fi
+        _kill_by_name "$nf"  # catch any stale process not tracked by a PID file
 
         "$bin" -c "$cfg" -l "$log" >> "$log" 2>&1 &
         local pid=$!
@@ -280,7 +292,14 @@ cmd_stop() {
     for nf in "${reversed[@]}"; do
         local pid; pid="$(_running_pid "$nf" 2>/dev/null)" || true
         if [[ -z "$pid" ]]; then
-            printf "  [%s] not running\n" "$nf"; continue
+            # No PID file — kill by name in case a stale process is still holding the port
+            if pgrep -f "open5gs-${nf}d" >/dev/null 2>&1; then
+                printf "  [%s] no PID file but process found — killing by name\n" "$nf"
+                _kill_by_name "$nf"
+            else
+                printf "  [%s] not running\n" "$nf"
+            fi
+            continue
         fi
 
         kill -TERM "$pid" 2>/dev/null || true
