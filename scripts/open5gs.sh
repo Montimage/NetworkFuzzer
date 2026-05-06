@@ -55,6 +55,15 @@ NFS=(nrf udr udm ausf bsf pcf nssf amf smf upf)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Guard against running apt-get update more than once per script invocation.
+_APT_UPDATED=0
+_apt_update() {
+    (( _APT_UPDATED )) && return 0
+    apt-get update -qq
+    _APT_UPDATED=1
+}
+
 _binary()  { echo "${BIN_DIR}/$1/open5gs-${1}d"; }
 _config()  { echo "${CFG_DIR}/$1.yaml"; }
 _logfile() { echo "${LOG_DIR}/$1.log"; }
@@ -92,7 +101,95 @@ _print_status() {
     done
 }
 
+_install_mongodb() {
+    if command -v mongod >/dev/null 2>&1; then
+        echo "  [mongodb] mongod already installed ($(mongod --version 2>&1 | head -1))"
+        return 0
+    fi
+
+    if [[ $EUID -ne 0 ]]; then
+        echo "ERROR: root privileges required to install MongoDB. Re-run with sudo." >&2
+        exit 1
+    fi
+
+    # Detect distro and codename to select the right MongoDB repo.
+    local distro codename
+    distro="$(. /etc/os-release && echo "${ID}")"
+    codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+    if [[ -z "$codename" ]]; then
+        codename="$(lsb_release -cs 2>/dev/null || true)"
+    fi
+
+    # MongoDB 7.0 supports: ubuntu focal/jammy/noble, debian bullseye/bookworm.
+    # Fall back to the nearest supported release for unknown codenames.
+    local mongo_ver="7.0"
+    local repo_distro repo_codename
+    case "$distro" in
+        ubuntu)
+            repo_distro="ubuntu"
+            case "$codename" in
+                focal|jammy|noble) repo_codename="$codename" ;;
+                *)
+                    echo "  [mongodb] WARNING: unknown Ubuntu codename '${codename}', using jammy"
+                    repo_codename="jammy" ;;
+            esac
+            ;;
+        debian)
+            repo_distro="debian"
+            case "$codename" in
+                bullseye|bookworm) repo_codename="$codename" ;;
+                *)
+                    echo "  [mongodb] WARNING: unknown Debian codename '${codename}', using bookworm"
+                    repo_codename="bookworm" ;;
+            esac
+            ;;
+        *)
+            echo "  [mongodb] ERROR: unsupported distro '${distro}' — install MongoDB manually." >&2
+            return 1
+            ;;
+    esac
+
+    echo "  [mongodb] Installing MongoDB ${mongo_ver} for ${repo_distro}/${repo_codename} ..."
+
+    apt-get install -y -qq gnupg curl ca-certificates
+
+    local keyring="/usr/share/keyrings/mongodb-server-${mongo_ver}.gpg"
+    curl -fsSL "https://www.mongodb.org/static/pgp/server-${mongo_ver}.asc" \
+        | gpg --dearmor -o "$keyring"
+
+    local sources_file="/etc/apt/sources.list.d/mongodb-org-${mongo_ver}.list"
+    echo "deb [ arch=amd64,arm64 signed-by=${keyring} ] \
+https://repo.mongodb.org/apt/${repo_distro} ${repo_codename}/mongodb-org/${mongo_ver} multiverse" \
+        > "$sources_file"
+
+    _apt_update
+    apt-get install -y mongodb-org
+
+    # Enable the service so it survives reboots and starts on first use.
+    systemctl enable mongod
+    systemctl start  mongod
+    sleep 1
+
+    if ! command -v mongosh >/dev/null 2>&1; then
+        echo "  [mongodb] WARNING: mongosh not found after install — ping check skipped"
+        return 0
+    fi
+    if mongosh --quiet --eval 'db.runCommand({ping:1})' \
+               mongodb://localhost/open5gs >/dev/null 2>&1; then
+        echo "  [mongodb] installed and running"
+    else
+        echo "  [mongodb] WARNING: installed but not yet reachable — UDR/PCF may need a moment"
+    fi
+}
+
 _ensure_mongodb() {
+    # If mongod is not installed at all, install it now (setup should have done
+    # this, but handle the case where start is called on a fresh machine too).
+    if ! command -v mongod >/dev/null 2>&1; then
+        echo "  [mongodb] not installed — running installer ..."
+        _install_mongodb
+    fi
+
     if mongosh --quiet --eval 'db.runCommand({ping:1})' \
                mongodb://localhost/open5gs >/dev/null 2>&1; then
         return 0
@@ -138,7 +235,7 @@ _install_deps() {
         echo "ERROR: root privileges required to install packages. Re-run with sudo." >&2
         exit 1
     fi
-    apt-get update -qq
+    _apt_update
     apt-get install -y "${missing[@]}"
 }
 
@@ -147,6 +244,9 @@ _install_deps() {
 # ---------------------------------------------------------------------------
 cmd_setup() {
     echo "=== Setting up open5GS ${VERSION} ==="
+
+    echo "--- Checking / installing MongoDB ---"
+    _install_mongodb
 
     echo "--- Checking build dependencies ---"
     _install_deps
