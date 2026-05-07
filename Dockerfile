@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install --yes \
 
 WORKDIR /tmp
 
-# Clone and build MMT-DPI (dicom branch)
-RUN git clone --depth 1 --branch dicom https://github.com/Montimage/mmt-dpi.git && \
+# Clone and build MMT-DPI
+RUN git clone --depth 1 --branch main https://github.com/Montimage/mmt-dpi.git && \
     cd mmt-dpi/sdk && \
     make -j2 && make install && ldconfig && \
     cd /tmp && rm -rf mmt-dpi
