@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
-# open5gs.sh — Clone, build (ASAN), and manage open5GS network functions
+# open5gs.sh — Clone, build (ASAN or gcov), and manage open5GS network functions
 #
 # Usage:
-#   ./open5gs.sh setup   [version]             clone + checkout + ASAN build
-#   ./open5gs.sh start   [version]             start all NFs  (requires root)
+#   ./open5gs.sh setup   [version] [--gcov]    clone + checkout + ASAN build
+#                                               --gcov: build with gcov coverage instead of ASAN
+#   ./open5gs.sh start   [version] [--gcov]    start all NFs  (requires root)
+#                                               --gcov: preload gcov_ctrl.so for signal-driven reset/dump
 #   ./open5gs.sh stop    [version]             stop all NFs
-#   ./open5gs.sh restart [version]             stop then start
+#   ./open5gs.sh restart [version] [--gcov]    stop then start
 #   ./open5gs.sh status  [version]             show running/down status
 #   ./open5gs.sh watch   [version] [--errors]  tail all NF logs
+#   ./open5gs.sh gcov-report [version]         generate lcov HTML coverage report
 #
 # version defaults to the latest release on GitHub.  open5GS is cloned to ~/open5gs.
+#
+# gcov notes:
+#   --gcov is mutually exclusive with ASAN (instrumentation conflict).
+#   .gcda files are written to BUILD_DIR/src/<nf>/ as each NF runs.
+#   Use NfMonitor.gcov_reset() / gcov_dump() to snapshot coverage per request.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Use the invoking user's home even when run via sudo
 if [[ -n "${SUDO_USER:-}" ]]; then
@@ -31,7 +41,11 @@ _latest_version() {
 COMMAND="${1:-}"
 VERSION="${2:-}"
 
-if [[ -z "$VERSION" ]]; then
+# --gcov flag: scan all arguments (can appear in any position after command)
+GCOV_BUILD=0
+for _arg in "$@"; do [[ "$_arg" == "--gcov" ]] && GCOV_BUILD=1; done
+
+if [[ -z "$VERSION" || "$VERSION" == "--gcov" ]]; then
     echo "  Fetching latest open5GS version from GitHub ..."
     VERSION="$(_latest_version)"
     if [[ -z "$VERSION" ]]; then
@@ -46,6 +60,10 @@ BIN_DIR="${BUILD_DIR}/src"
 CFG_DIR="${BUILD_DIR}/configs/open5gs"
 LOG_DIR="/tmp/open5gs-${VERSION}-logs"
 PID_DIR="/tmp/open5gs-${VERSION}-pids"
+
+# gcov artefacts
+GCOV_SO="${BUILD_DIR}/gcov_ctrl.so"
+GCOV_GCDA_DIR="${BUILD_DIR}/src"       # where .gcda files accumulate at runtime
 
 # ---------------------------------------------------------------------------
 # NF startup order (NRF first, UPF last)
@@ -217,10 +235,14 @@ _DEPS=(
     libmongoc-dev libbson-dev libyaml-dev libnghttp2-dev libmicrohttpd-dev
     libcurl4-gnutls-dev libtins-dev libtalloc-dev meson
 )
+_DEPS_GCOV=(lcov)
 
 _install_deps() {
+    local want=("${_DEPS[@]}")
+    (( GCOV_BUILD )) && want+=("${_DEPS_GCOV[@]}")
+
     local missing=()
-    for pkg in "${_DEPS[@]}"; do
+    for pkg in "${want[@]}"; do
         dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" \
             || missing+=("$pkg")
     done
@@ -240,10 +262,15 @@ _install_deps() {
 }
 
 # ---------------------------------------------------------------------------
-# setup — clone, checkout version, build with ASAN
+# setup — clone, checkout version, build (ASAN by default; gcov with --gcov)
 # ---------------------------------------------------------------------------
 cmd_setup() {
-    echo "=== Setting up open5GS ${VERSION} ==="
+    if (( GCOV_BUILD )); then
+        echo "=== Setting up open5GS ${VERSION} [gcov + UBSan build] ==="
+        echo "    NOTE: ASAN disabled (gcov/ASAN conflict). UBSan retained for crash detection."
+    else
+        echo "=== Setting up open5GS ${VERSION} [ASAN + UBSan build] ==="
+    fi
 
     echo "--- Checking / installing MongoDB ---"
     _install_mongodb
@@ -268,19 +295,24 @@ cmd_setup() {
     echo "  Configuring ${BUILD_DIR} ..."
     (
         cd "${OPEN5GS_DIR}"
+        if (( GCOV_BUILD )); then
+            # ASAN conflicts with gcov (allocator init order); UBSan is compatible.
+            # UBSan with halt_on_error=1 aborts on UB → pgrep detects the crash.
+            _MESON_EXTRA=(-Db_coverage=true -Db_sanitize=undefined -Db_lundef=false)
+        else
+            _MESON_EXTRA=(-Db_sanitize=address,undefined -Db_lundef=false)
+        fi
         if [[ -f "${BUILD_DIR}/build.ninja" ]]; then
             meson setup "build_${VERSION}" \
                 --buildtype=debug \
-                -Db_sanitize=address,undefined \
-                -Db_lundef=false \
+                "${_MESON_EXTRA[@]}" \
                 --prefix="$(pwd)/install" \
                 --reconfigure
         else
             mkdir -p "build_${VERSION}"
             meson setup "build_${VERSION}" \
                 --buildtype=debug \
-                -Db_sanitize=address,undefined \
-                -Db_lundef=false \
+                "${_MESON_EXTRA[@]}" \
                 --prefix="$(pwd)/install"
         fi
     )
@@ -293,9 +325,41 @@ cmd_setup() {
     echo "  Installing to $(pwd)/install ..."
     ninja -C "${BUILD_DIR}" install
 
+    # Build gcov_ctrl.so (signal-driven counter reset/dump for per-request coverage)
+    if (( GCOV_BUILD )); then
+        _build_gcov_ctrl
+    fi
+
+    # Return build directory ownership to the invoking user so gcov can write
+    # temporary .gcov files during gcovr analysis (build ran as root via sudo).
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        echo "  Fixing build directory ownership → ${SUDO_USER} ..."
+        chown -R "${SUDO_USER}:${SUDO_USER}" "${BUILD_DIR}"
+        chown -R "${SUDO_USER}:${SUDO_USER}" "${OPEN5GS_DIR}/install" 2>/dev/null || true
+    fi
+
     echo ""
-    echo "=== Build complete: ${BUILD_DIR} ==="
-    echo "    Run: sudo $0 start ${VERSION}"
+    if (( GCOV_BUILD )); then
+        echo "=== gcov build complete: ${BUILD_DIR} ==="
+        echo "    .gcda files will accumulate in: ${GCOV_GCDA_DIR}/"
+        echo "    gcov_ctrl.so: ${GCOV_SO}"
+        echo "    Run: sudo $0 start ${VERSION} --gcov"
+        echo "    Coverage report: $0 gcov-report ${VERSION}"
+    else
+        echo "=== Build complete: ${BUILD_DIR} ==="
+        echo "    Run: sudo $0 start ${VERSION}"
+    fi
+}
+
+_build_gcov_ctrl() {
+    local src="${SCRIPT_DIR}/gcov_ctrl.c"
+    if [[ ! -f "$src" ]]; then
+        echo "  WARNING: gcov_ctrl.c not found at ${src} — skipping gcov_ctrl.so build" >&2
+        return 0
+    fi
+    echo "  Building gcov_ctrl.so → ${GCOV_SO} ..."
+    gcc -shared -fPIC -O0 -o "${GCOV_SO}" "${src}" -lgcov
+    echo "  gcov_ctrl.so built successfully"
 }
 
 # ---------------------------------------------------------------------------
@@ -313,13 +377,38 @@ cmd_start() {
         exit 1
     fi
 
-    echo "=== Starting open5GS ${VERSION} NFs ==="
+    if (( GCOV_BUILD )); then
+        echo "=== Starting open5GS ${VERSION} NFs [gcov mode] ==="
+    else
+        echo "=== Starting open5GS ${VERSION} NFs ==="
+    fi
     mkdir -p "${LOG_DIR}" "${PID_DIR}"
     _ensure_mongodb || true
 
-    # ASAN: log crashes to file, don't halt so all NFs keep running
-    export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=0:abort_on_error=0:detect_leaks=0:log_path=${LOG_DIR}/asan}"
-    export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=0:print_stacktrace=1:log_path=${LOG_DIR}/ubsan}"
+    if (( GCOV_BUILD )); then
+        if [[ ! -f "${GCOV_SO}" ]]; then
+            echo "  WARNING: gcov_ctrl.so not found at ${GCOV_SO}" >&2
+            echo "           Run: $0 setup ${VERSION} --gcov   (to build it first)" >&2
+        else
+            export LD_PRELOAD="${GCOV_SO}${LD_PRELOAD:+:${LD_PRELOAD}}"
+            echo "  LD_PRELOAD=${LD_PRELOAD}"
+            echo "  .gcda dir : ${GCOV_GCDA_DIR}"
+        fi
+        # UBSan: abort on undefined behaviour so pgrep-based detect_crash() fires.
+        # halt_on_error=1 turns UB into SIGABRT; print_stacktrace writes to log.
+        unset ASAN_OPTIONS 2>/dev/null || true
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=${LOG_DIR}/ubsan"
+        # Enable core dumps for post-hoc analysis of any crash
+        ulimit -c unlimited 2>/dev/null || true
+        echo "  UBSan     : halt_on_error=1 (log: ${LOG_DIR}/ubsan.*)"
+        echo "  Core dumps: enabled ($(cat /proc/sys/kernel/core_pattern))"
+    else
+        # ASAN: log crashes to file, don't halt so all NFs keep running
+        # detect_odr_violation=0: suppress freeDiameter false positive (multiple .fdx plugins
+        # each define fd_ext_depends; ASAN flags it as ODR violation but it is harmless).
+        export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=0:abort_on_error=0:detect_leaks=0:detect_odr_violation=0:log_path=${LOG_DIR}/asan}"
+        export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=0:print_stacktrace=1:log_path=${LOG_DIR}/ubsan}"
+    fi
 
     for nf in "${NFS[@]}"; do
         local bin; bin="$(_binary "$nf")"
@@ -362,6 +451,11 @@ cmd_start() {
             rm -f "$pf"
         fi
     done
+
+    # Make ASAN log files world-readable so the fuzzer can read stack traces.
+    # ASAN writes logs as root:root 640; a background loop chmod-fixes new files.
+    (while sleep 2; do chmod 644 "${LOG_DIR}"/asan.* 2>/dev/null || true; done) &
+    disown $! 2>/dev/null || true
 
     # Give slow-to-crash NFs a grace period, then report any that died
     sleep 1
@@ -482,6 +576,166 @@ cmd_restart() { cmd_stop; sleep 1; cmd_start; }
 cmd_status()  { _print_status; }
 
 # ---------------------------------------------------------------------------
+# gcov-watch — live terminal coverage summary, updating as .gcda files change
+# ---------------------------------------------------------------------------
+cmd_gcov_watch() {
+    local nf_filter="${3:-}"   # optional: nrf, amf, smf, … — defaults to all NFs
+    local interval="${4:-10}"  # refresh interval in seconds (default 10)
+
+    if ! command -v lcov >/dev/null 2>&1; then
+        echo "ERROR: lcov not found. Install with: sudo apt-get install lcov" >&2
+        exit 1
+    fi
+    if [[ ! -d "${GCOV_GCDA_DIR}" ]]; then
+        echo "ERROR: .gcda directory not found: ${GCOV_GCDA_DIR}" >&2
+        echo "       Run: sudo $0 setup ${VERSION} --gcov && sudo $0 start ${VERSION} --gcov" >&2
+        exit 1
+    fi
+
+    # Restrict watch directory to the NF subdirectory when requested
+    local watch_dir="${GCOV_GCDA_DIR}"
+    [[ -n "$nf_filter" ]] && watch_dir="${GCOV_GCDA_DIR}/${nf_filter}"
+
+    if [[ -n "$nf_filter" ]]; then
+        echo "=== gcov live watch — NF: ${nf_filter}  (Ctrl+C to stop) ==="
+    else
+        echo "=== gcov live watch — all NFs  (Ctrl+C to stop) ==="
+    fi
+
+    local gcda_count
+    gcda_count=$(find "${watch_dir}" -name '*.gcda' 2>/dev/null | wc -l)
+    if (( gcda_count == 0 )); then
+        echo ""
+        echo "  WARNING: no .gcda files in ${watch_dir}"
+        echo "  Ensure open5GS was built and started with --gcov, then run the fuzzer."
+        echo "  Waiting for .gcda files..."
+        echo ""
+    else
+        echo "  found ${gcda_count} .gcda file(s) in ${watch_dir}"
+        echo ""
+    fi
+
+    # Export vars used by _lcov_print_summary inside the pipe subshell
+    export _GCOV_BUILD_DIR="${BUILD_DIR}"
+    export _GCOV_ROOT="${OPEN5GS_DIR}"
+    export _GCOV_NF_FILTER="${nf_filter}"
+
+    if command -v inotifywait >/dev/null 2>&1; then
+        echo "  mode: inotifywait (rerenders on each .gcda write)"
+        echo ""
+        _lcov_print_summary
+        inotifywait -m -r -e close_write "${watch_dir}" \
+            --include '.*\.gcda$' -q \
+        | while read -r _ _ _; do
+            _lcov_print_summary
+        done
+    else
+        echo "  mode: polling every ${interval}s"
+        echo ""
+        while true; do
+            _lcov_print_summary
+            sleep "${interval}"
+        done
+    fi
+}
+
+_lcov_print_summary() {
+    printf '─%.0s' {1..78}; echo ""
+    echo "  $(date '+%H:%M:%S')  gcov coverage — open5GS ${VERSION:-}"
+    printf '─%.0s' {1..78}; echo ""
+
+    # Use PID-unique temp file to avoid conflicts with parallel runs
+    local info="/tmp/gcov-watch-live-$$.info"
+    local obj_dir="${_GCOV_BUILD_DIR}"
+    [[ -n "${_GCOV_NF_FILTER:-}" ]] && obj_dir="${_GCOV_BUILD_DIR}/src/${_GCOV_NF_FILTER}"
+
+    # Capture coverage — suppress verbose progress but show errors
+    local lcov_err
+    lcov_err="$(lcov --capture \
+         --directory    "${obj_dir}" \
+         --base-directory "${_GCOV_ROOT}" \
+         --output-file  "${info}" \
+         --gcov-tool    gcov \
+         --ignore-errors source,gcov \
+         2>&1 >/dev/null)" || true
+
+    if [[ ! -s "${info}" ]]; then
+        echo "  No coverage data — NF may not be running with --gcov, or no SIGUSR2 dump yet."
+        [[ -n "${lcov_err}" ]] && echo "  lcov: ${lcov_err}" | tail -2
+        rm -f "${info}"
+        return
+    fi
+
+    # Filter to NF source files only when requested
+    if [[ -n "${_GCOV_NF_FILTER:-}" ]]; then
+        lcov --extract "${info}" \
+             "*/src/${_GCOV_NF_FILTER}/*" \
+             --output-file "${info}" \
+             --ignore-errors source \
+             >/dev/null 2>&1 || true
+        if [[ ! -s "${info}" ]]; then
+            echo "  No data for '${_GCOV_NF_FILTER}' after filter — SIGUSR2 not yet received?"
+            rm -f "${info}"
+            return
+        fi
+    fi
+
+    # Display summary — || true prevents pipefail exit when grep has no output
+    lcov --summary "${info}" 2>&1 | grep -v '^Reading' || true
+    rm -f "${info}"
+}
+
+# ---------------------------------------------------------------------------
+# gcov-report — generate lcov HTML coverage report from accumulated .gcda data
+# ---------------------------------------------------------------------------
+cmd_gcov_report() {
+    if ! command -v lcov >/dev/null 2>&1; then
+        echo "ERROR: lcov not found. Install with: sudo apt-get install lcov" >&2
+        exit 1
+    fi
+    if [[ ! -d "${GCOV_GCDA_DIR}" ]]; then
+        echo "ERROR: .gcda directory not found: ${GCOV_GCDA_DIR}" >&2
+        echo "       Run setup and start with --gcov first." >&2
+        exit 1
+    fi
+
+    local report_dir="/tmp/open5gs-${VERSION}-gcov-report"
+    local info_file="/tmp/open5gs-${VERSION}.info"
+
+    echo "=== Generating gcov coverage report for open5GS ${VERSION} ==="
+    echo "  Capturing coverage data from ${GCOV_GCDA_DIR} ..."
+    lcov --capture \
+         --directory "${GCOV_GCDA_DIR}" \
+         --base-directory "${OPEN5GS_DIR}" \
+         --output-file "${info_file}" \
+         --gcov-tool gcov \
+         --ignore-errors source 2>/dev/null || true
+
+    if [[ ! -s "${info_file}" ]]; then
+        echo "ERROR: lcov produced no coverage data. Are the NFs running with --gcov?" >&2
+        exit 1
+    fi
+
+    # Strip system headers and test files to keep the report focused on NF code
+    lcov --remove "${info_file}" \
+         '/usr/*' '*/tests/*' '*/build/_deps/*' \
+         --output-file "${info_file}" --ignore-errors source 2>/dev/null || true
+
+    echo "  Generating HTML report → ${report_dir}/index.html ..."
+    genhtml "${info_file}" \
+            --output-directory "${report_dir}" \
+            --title "open5GS ${VERSION} coverage" \
+            --legend --show-details 2>/dev/null || true
+
+    echo ""
+    echo "  Coverage info : ${info_file}"
+    echo "  HTML report   : ${report_dir}/index.html"
+    echo ""
+    echo "  Quick summary:"
+    lcov --summary "${info_file}" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # start-nf — restart a single NF (used by the fuzzer's --amf-restart-cmd)
 # ---------------------------------------------------------------------------
 cmd_start_nf() {
@@ -518,13 +772,27 @@ cmd_start_nf() {
     fi
 
     mkdir -p "${LOG_DIR}" "${PID_DIR}"
-    export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=0:abort_on_error=0:detect_leaks=0:log_path=${LOG_DIR}/asan}"
-    export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=0:print_stacktrace=1:log_path=${LOG_DIR}/ubsan}"
+    if (( GCOV_BUILD )); then
+        if [[ -f "${GCOV_SO}" ]]; then
+            export LD_PRELOAD="${GCOV_SO}${LD_PRELOAD:+:${LD_PRELOAD}}"
+        fi
+        unset ASAN_OPTIONS 2>/dev/null || true
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=${LOG_DIR}/ubsan"
+        ulimit -c unlimited 2>/dev/null || true
+    else
+        export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=0:abort_on_error=0:detect_leaks=0:detect_odr_violation=0:log_path=${LOG_DIR}/asan}"
+        export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=0:print_stacktrace=1:log_path=${LOG_DIR}/ubsan}"
+    fi
 
     "$bin" -c "$cfg" -l "$log" >> "$log" 2>&1 &
     local pid=$!
     disown "$pid" 2>/dev/null || true
     echo "$pid" > "$pf"
+
+    if ! (( GCOV_BUILD )); then
+        (while sleep 2; do chmod 644 "${LOG_DIR}"/asan.* 2>/dev/null || true; done) &
+        disown $! 2>/dev/null || true
+    fi
 
     sleep 0.3
     if kill -0 "$pid" 2>/dev/null; then
@@ -541,32 +809,44 @@ cmd_start_nf() {
 # Main
 # ---------------------------------------------------------------------------
 case "${COMMAND}" in
-    setup)    cmd_setup              ;;
-    start)    cmd_start              ;;
-    stop)     cmd_stop               ;;
-    restart)  cmd_restart            ;;
-    status)   cmd_status             ;;
-    watch)    cmd_watch "$@"         ;;
-    start-nf) cmd_start_nf "$@"     ;;
+    setup)       cmd_setup              ;;
+    start)       cmd_start              ;;
+    stop)        cmd_stop               ;;
+    restart)     cmd_restart            ;;
+    status)      cmd_status             ;;
+    watch)       cmd_watch "$@"         ;;
+    start-nf)    cmd_start_nf "$@"      ;;
+    gcov-report) cmd_gcov_report        ;;
+    gcov-watch)  cmd_gcov_watch  "$@"  ;;
     *)
         cat <<EOF
-Usage: $0 <command> [version]
+Usage: $0 <command> [version] [--gcov]
 
 Commands:
-  setup      [version]             clone open5GS, checkout version, build with ASAN
-  start      [version]             start all NFs (requires root)
-  stop       [version]             stop all NFs
-  restart    [version]             stop then start
-  status     [version]             show running/down status
-  watch      [version] [--errors]  tail all NF logs (Ctrl+C to stop)
-  start-nf   <version> <nf>        restart a single NF (for fuzzer --amf-restart-cmd)
+  setup        [version] [--gcov]  clone open5GS, checkout version, build
+                                   default: ASAN+UBSan build
+                                   --gcov:  gcov coverage build (no ASAN)
+  start        [version] [--gcov]  start all NFs (requires root)
+                                   --gcov: preload gcov_ctrl.so (SIGUSR1=reset, SIGUSR2=dump)
+  stop         [version]           stop all NFs
+  restart      [version] [--gcov]  stop then start
+  status       [version]           show running/down status
+  watch        [version] [--errors] tail all NF logs (Ctrl+C to stop)
+  start-nf     <version> <nf> [--gcov]  restart a single NF
+  gcov-report  [version]           generate lcov HTML report from accumulated .gcda data
+  gcov-watch   [version] [nf] [interval]  live terminal coverage summary (Ctrl+C to stop)
+                                   nf: nrf|amf|smf|udm|… (default: all)
+                                   interval: seconds between refreshes (default: 10)
 
 version defaults to the latest release on GitHub.  open5GS is cloned to ${OPEN5GS_DIR}.
 
 Examples:
-  sudo $0 setup
-  sudo $0 setup v2.7.7
-  sudo $0 start
+  sudo $0 setup                          # ASAN build (default)
+  sudo $0 setup v2.7.7 --gcov            # gcov coverage build
+  sudo $0 start --gcov                   # start NFs with coverage instrumentation
+  $0 gcov-report v2.7.7                  # generate HTML coverage report
+  $0 gcov-watch  v2.7.7 nrf              # live NRF coverage in terminal
+  $0 gcov-watch  v2.7.7 nrf 5           # refresh every 5 seconds
   $0 watch --errors
   $0 status
   sudo $0 start-nf v2.7.5 nrf
