@@ -40,11 +40,11 @@ def create_agent(env, algorithm="DQN", policy_kwargs=None, **kwargs):
         agent_defaults = {
             "learning_rate": 1e-4,
             "buffer_size": 50000,
-            "learning_starts": 200,
+            "learning_starts": 500,
             "batch_size": 64,
-            "exploration_fraction": 0.5,
-            "exploration_final_eps": 0.1,
-            "gamma": 0.99,
+            "exploration_fraction": 0.7,   # Explore for 70% of training timesteps
+            "exploration_final_eps": 0.05, # Then keep 5% random exploration
+            "gamma": 0.95,                 # Slightly less future-discounting for fuzzing
             "target_update_interval": 500,
         }
         agent_defaults.update(defaults)
@@ -54,12 +54,13 @@ def create_agent(env, algorithm="DQN", policy_kwargs=None, **kwargs):
         from stable_baselines3 import PPO
         agent_defaults = {
             "learning_rate": 3e-4,
-            "n_steps": 256,
-            "batch_size": 64,
+            "n_steps": 512,       # 128→512: ~17 episodes/rollout; richer advantage estimates → fixes EV≈0
+            "batch_size": 128,    # scale batch with n_steps
             "n_epochs": 10,
-            "ent_coef": 0.05,     # Entropy bonus to encourage exploration
+            "ent_coef": 0.01,     # entropy bonus; keep diversity across 1900+ action space
             "clip_range": 0.2,
             "gamma": 0.99,
+            "target_kl": 0.15,   # 0.05 was too tight — cut updates after 5 steps; 0.15 uses all 10 epochs
         }
         agent_defaults.update(defaults)
         model = PPO("MlpPolicy", env, **agent_defaults)
@@ -139,6 +140,8 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
     try:
         model.learn(total_timesteps=total_timesteps, log_interval=log_interval, callback=callback)
     except KeyboardInterrupt:
+        import signal as _signal
+        _signal.signal(_signal.SIGINT, _signal.SIG_IGN)   # block further Ctrl+C during cleanup
         interrupted = True
         logger.info(f"\nTraining interrupted after {callback.num_timesteps}/{total_timesteps} timesteps "
                     f"({callback.elapsed_seconds:.1f}s)")
@@ -218,11 +221,12 @@ def run_agent(model, env, n_episodes=10):
             logger.info(f"Episode {ep+1}: reward={episode_reward:.1f} "
                          f"strategy={strategy} response={resp} crash={crash} hang={hang}")
         else:
-            # State machine mode
-            seq = last_info.get('sequence', 'unknown')
-            resp = last_info.get('final_response', 'none')
+            # GenericFuzzEnv / state machine mode
+            seq = last_info.get('sequence', last_info.get('action_type', 'unknown'))
+            resp = last_info.get('response', last_info.get('final_response', 'none'))
             crash = last_info.get('crash', False)
+            hang = last_info.get('hang', False)
             logger.info(f"Episode {ep+1}: reward={episode_reward:.1f} "
-                         f"sequence={seq} response={resp} crash={crash}")
+                         f"sequence={seq} response={resp} crash={crash} hang={hang}")
 
     return results

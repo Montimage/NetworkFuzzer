@@ -48,6 +48,30 @@ class PayloadTarget:
 
 
 @dataclass
+class FuzzScenario:
+    """A targeted fuzzing scenario with an explicit setup phase.
+
+    Unlike StateTransition (all messages share the same fuzz fields),
+    a FuzzScenario separates:
+      setup_messages — sent first with baseline/valid fields to establish the
+                       prerequisite server state (e.g. register an NF before
+                       querying it).
+      fuzz_message   — the specific API call to fuzz; field mutations and
+                       payload injections are applied only to this message.
+
+    target_api groups scenarios by API surface so the agent can specialise.
+    relevant_fields lists the field names most meaningful to mutate for this
+    specific API operation; keeps the action space focused.
+    """
+    name: str
+    target_api: str                    # e.g. 'NRF_NFM', 'NRF_DISC', 'AMF_UE', 'SMF_SM'
+    setup_messages: List[str]          # sent with valid baseline fields
+    fuzz_message: str                  # the target message to fuzz
+    description: str = ''
+    relevant_fields: List[str] = field(default_factory=list)
+
+
+@dataclass
 class HealthCheckResult:
     """Result of a protocol health check."""
     is_healthy: bool
@@ -167,6 +191,48 @@ class ProtocolAdapter(ABC):
         """
         pass
 
+    def get_priority_payload_types(self) -> List[str]:
+        """Return payload type names (keys in GENERIC_PAYLOADS) to use for
+        seq_payload actions.  Override for protocols where NAS payloads make no
+        sense (e.g. HTTP/2 SBI should return JSON-focused types instead)."""
+        return ["nas_5gmm", "buffer_overflow", "null_injection"]
+
+    def get_scenarios(self) -> List['FuzzScenario']:
+        """Return predefined fuzzing scenarios for this protocol.
+
+        Each scenario pairs a prerequisite setup sequence with a single fuzz
+        target message.  Returns empty list for protocols without scenarios.
+        """
+        return []
+
+    def get_body_fuzz_actions(self, baseline_fields: Dict[str, Any]) -> List[tuple]:
+        """Return (template, field_path, mutation_label, mutation_idx) tuples.
+
+        Override in protocol adapters that support generic body leaf-field
+        mutation.  The default returns an empty list (no body_fuzz actions).
+        """
+        return []
+
+    def get_baseline_fields(self) -> Dict[str, Any]:
+        """Return a dict of valid baseline field values for setup messages.
+
+        These are applied to setup_messages in a FuzzScenario so they succeed
+        and establish the required server state before the fuzz_message runs.
+        Override to provide protocol-specific defaults.
+        """
+        return {}
+
+    def get_field_message_type(self, field_name: str) -> Optional[str]:
+        """
+        Return the single message type that carries this field, or None.
+
+        Override in protocol adapters where a semantic field only appears in one
+        specific message type (e.g., rrc_cause only in InitialUEMessage for NGAP).
+        When None is returned, the generic environment falls back to the first
+        valid state transition.
+        """
+        return None
+
     # Connection handling
     def get_connection_params(self) -> Dict[str, Any]:
         """
@@ -179,6 +245,19 @@ class ProtocolAdapter(ABC):
             'use_ssl': False,
             'tcp_nodelay': True,
         }
+
+    def recv_data(self, sock: Any, timeout: float, buf_size: int = 4096) -> bytes:
+        """Receive one response from *sock*.
+
+        The default implementation does a single blocking recv with the given
+        timeout.  Override for protocols (e.g. HTTP/2) that need a multi-read
+        loop or mid-stream ACKs before the full response arrives.
+        """
+        sock.settimeout(timeout)
+        try:
+            return sock.recv(buf_size)
+        except Exception:
+            return b''
 
     # Reward computation
     def compute_reward(self, response: Dict[str, Any], response_time_ms: float,
