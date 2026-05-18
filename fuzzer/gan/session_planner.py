@@ -295,13 +295,22 @@ class SessionPlanGenerator:
 
     def _train_ctgan(self):
         """Train CTGAN on accumulated scored plans."""
+        import logging
         import pandas as pd
         from ctgan import CTGAN
+        # Suppress sdv/ctgan library noise ("Guidance: There are no missing values...")
+        for _noisy in ("ctgan", "sdv", "rdt", "copulas"):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-        # Weight plans by score: duplicate high-scoring plans
+        # Use only the most recent 500 plans to keep training time bounded.
+        # Older plans are already encoded in the model's previous weights;
+        # recent plans carry fresher signal about what the server responds to.
+        recent = self.scored_plans[-500:]
+
+        # Weight by score but cap copies at 3 to avoid dataset explosion
         weighted = []
-        for plan in self.scored_plans:
-            copies = max(1, int(plan.score / 5.0))
+        for plan in recent:
+            copies = max(1, min(3, int(plan.score / 10.0)))
             weighted.extend([plan.to_dict()] * copies)
 
         df = pd.DataFrame(weighted)
@@ -335,13 +344,19 @@ class SessionPlanGenerator:
     # Feedback integration
     # ------------------------------------------------------------------
 
-    def update_with_scores(self, scored_plans):
+    def update_with_scores(self, scored_plans, retrain_ctgan: bool = False):
         """
         Update Thompson Sampling priors and store plans for CTGAN.
 
         For each scored plan, updates the Beta(alpha, beta) prior:
           - depth > 2.0 → treat as success (alpha += scaled_depth)
           - depth <= 2.0 → treat as failure (beta += 1)
+
+        Args:
+            retrain_ctgan: if True, invalidate the cached CTGAN model so it
+                           gets retrained on the next generate_ctgan() call.
+                           Pass True every ~100 steps; False every step to keep
+                           TS priors current without paying the retrain cost.
         """
         for plan in scored_plans:
             self.scored_plans.append(plan)
@@ -351,16 +366,14 @@ class SessionPlanGenerator:
                 continue
 
             if plan.depth > 2.0:
-                # Success: increase alpha proportional to depth
                 self.ts_priors[cat][0] += min(plan.depth, 10.0) / 2.0
             else:
-                # Failure: increase beta
                 self.ts_priors[cat][1] += 1.0
 
-        # Invalidate CTGAN model so it gets retrained on next use
-        self._ctgan_model = None
+        if retrain_ctgan:
+            self._ctgan_model = None
 
-        logger.info(
+        logger.debug(
             f"Updated priors with {len(scored_plans)} plans. "
             f"Total scored: {len(self.scored_plans)}")
 

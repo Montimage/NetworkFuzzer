@@ -232,7 +232,7 @@ class DicomSemanticEnv(gym.Env):
                         elif data_resp[0] == 0x07:
                             info["response"] = "abort"
                             self.abort_count += 1
-                            reward = 10.0  # Abort is interesting
+                            reward = 50.0  # Abort: server hit error-handling path
                         elif data_resp[0] == 0x06:
                             info["response"] = "release"
                             reward = 8.0
@@ -250,7 +250,7 @@ class DicomSemanticEnv(gym.Env):
                         info["response"] = "timeout"
                         info["hang"] = True
                         self.hang_count += 1
-                        reward = 40.0  # Timeout is very interesting
+                        reward = 20.0  # Hang: resource exhaustion potential
 
                 elif assoc_resp and assoc_resp[0] == 0x03:
                     info["response"] = "reject"
@@ -258,7 +258,7 @@ class DicomSemanticEnv(gym.Env):
                 elif assoc_resp and assoc_resp[0] == 0x07:
                     info["response"] = "abort"
                     self.abort_count += 1
-                    reward = 8.0
+                    reward = 50.0  # Abort on association: error path triggered
                 else:
                     info["response"] = "unknown_assoc"
                     reward = 5.0
@@ -267,7 +267,7 @@ class DicomSemanticEnv(gym.Env):
                 info["response"] = "assoc_timeout"
                 info["hang"] = True
                 self.hang_count += 1
-                reward = 30.0
+                reward = 15.0  # Hang on association
 
             sock.close()
 

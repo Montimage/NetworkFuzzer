@@ -404,21 +404,26 @@ class DicomFuzzEnv(gym.Env):
         """Evaluate the final mutated PDU once at episode end with server metrics."""
         self.episode_count += 1  # v4: Track episode number
 
+        effective_len = self.seed_length
+        if self.mutated_positions:
+            effective_len = max(effective_len, max(self.mutated_positions) + 1)
+        effective_len = min(effective_len, self.max_pdu_len)
+        pdu_bytes = bytes(self.current_pdu[:effective_len])
+
+        # Scapy packet building is optional — failure must not block live testing
+        packets = None
         try:
             packets = self._pdu_to_packets()
-            effective_len = self.seed_length
-            if self.mutated_positions:
-                effective_len = max(effective_len, max(self.mutated_positions) + 1)
-            effective_len = min(effective_len, self.max_pdu_len)
-            pdu_bytes = bytes(self.current_pdu[:effective_len])
+        except Exception as e:
+            logger.debug("_pdu_to_packets failed (scapy): %s", e)
 
-            # v4: Pass mutated_positions for field bonus calculation
+        try:
             reward, info = self.reward_computer.compute_reward(
                 packets, pdu_bytes, mutated_positions=self.mutated_positions
             )
         except Exception as e:
             reward = 0.0
-            info = {"error": str(e)}
+            info = {"error": str(e), "live_response": "none"}
 
         # Undo the -1 step penalty from compute_reward
         reward = reward + 1.0
@@ -431,17 +436,21 @@ class DicomFuzzEnv(gym.Env):
         parser_depth = info.get("parser_depth", 0)
         response_ms = info.get("response_time_ms", 0)
 
-        resp_score = max(parser_depth * 3.0, 1.0)
-
-        if response == "accept" and divergence > 0.15:
-            resp_score = 25.0
-        elif response == "accept" and divergence > 0.05:
-            resp_score = 10.0
-        elif response == "accept" and divergence <= 0.05:
-            resp_score = 1.0
-
+        # Reward hierarchy: crash > abort > hang > accept > other
         if info.get("crash", False):
             resp_score = 100.0
+        elif response in ("abort", "true_hang"):
+            resp_score = 50.0
+        elif response == "true_hang":
+            resp_score = 20.0
+        elif response == "accept" and divergence > 0.15:
+            resp_score = 15.0   # accept with high divergence: validation bypass
+        elif response == "accept" and divergence > 0.05:
+            resp_score = 8.0
+        elif response == "accept":
+            resp_score = 2.0
+        else:
+            resp_score = max(parser_depth * 3.0, 1.0)
 
         time_bonus = 0.0
         if response_ms > 100:

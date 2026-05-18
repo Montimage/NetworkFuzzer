@@ -338,7 +338,7 @@ class DicomStateMachineEnv(gym.Env):
                             "time_ms": 2000.0
                         })
                         info["final_response"] = "timeout"
-                        reward += 30.0  # Timeout is interesting
+                        reward += 10.0  # per-PDU timeout: mild bonus
 
                 except (ConnectionResetError, BrokenPipeError):
                     info["responses"].append({
@@ -371,24 +371,24 @@ class DicomStateMachineEnv(gym.Env):
         except Exception as e:
             info["final_response"] = f"error:{e}"
 
-        # Compute reward based on response
+        # Compute reward based on response — abort > hang > accept hierarchy
         response = info["final_response"]
-        if response == "timeout":
-            reward += 40.0
-        elif response == "abort":
-            reward += 15.0
-        elif response == "reject":
-            reward += 5.0
+        if response == "abort":
+            reward += 50.0  # primary security signal: server hit error-handling code
+        elif response == "timeout":
+            reward += 20.0  # DoS potential, less exploitable than crash/abort
         elif response == "accept":
             # Unexpected accept is interesting for some sequences
             if sequence_name not in ["normal"]:
-                reward += 25.0
+                reward += 15.0
+        elif response == "reject":
+            reward += 5.0
         elif response == "reset":
             reward += 2.0
         elif response == "closed":
             reward += 3.0
         elif response.startswith("type_"):
-            reward += 20.0  # Unknown response type
+            reward += 20.0  # Unknown PDU type from server
 
         # Novelty bonus for new sequence
         if sequence_name not in self.sequences_tried:

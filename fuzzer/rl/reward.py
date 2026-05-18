@@ -27,6 +27,7 @@ import select
 import socket
 
 from scapy.all import wrpcap
+from fuzzer.reproduce import wait_for_response_or_closure, is_socket_alive
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -51,10 +52,10 @@ RESPONSE_BASE_REWARDS = {
     "closed": 0.5,          # Connection closed normally - not interesting
     "silent_close": 1.0,    # Server closed without response - expected for malformed input
     "reject": 4.0,          # Server parsed and rejected - somewhat interesting
-    "abort": 12.0,          # Server entered abort state - interesting!
-    "true_hang": 50.0,      # TRUE hang: socket alive, no response - VERY interesting!
+    "abort": 50.0,          # Server hit error-handling code path — primary security signal
+    "true_hang": 20.0,      # Resource exhaustion / DoS potential — less exploitable than abort
     "timeout": 8.0,         # Generic timeout (may be silent close) - low reward
-    "accept": 20.0,         # Accepted despite mutations - interesting!
+    "accept": 15.0,         # Accepted despite mutations - validation bypass
     "refused": 3.0,         # Connection refused
     "connect_timeout": 8.0, # Couldn't connect - may indicate DoS
 }
@@ -493,8 +494,8 @@ class RewardComputer:
                 reward += time_bonus
                 info["time_bonus"] = round(time_bonus, 1)
             elif info.get("true_hang"):
-                # True hangs get extra time bonus
-                time_bonus = min(elapsed / 4.0, 40.0)
+                # True hangs get a modest time bonus
+                time_bonus = min(elapsed / 8.0, 20.0)
                 reward += time_bonus
                 info["time_bonus"] = round(time_bonus, 1)
 

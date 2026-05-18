@@ -594,7 +594,7 @@ class HybridFuzzEnv(gym.Env):
                         reward = 8.0
                     elif resp_data[0] == 0x07:
                         resp_type = "abort"
-                        reward = 15.0  # Interesting
+                        reward = 50.0  # Abort: server hit error-handling path
                     else:
                         resp_type = f"type_{resp_data[0]:02x}"
                         reward = 20.0  # Unknown is interesting
@@ -2380,7 +2380,7 @@ class SimplifiedHybridEnv(gym.Env):
                         reward = 25.0
                     elif resp_data[0] == 0x07:
                         resp_type = "abort"
-                        reward = 15.0
+                        reward = 50.0  # Abort: server hit error-handling path
                     else:
                         resp_type = f"type_{resp_data[0]:02x}"
                         reward = 20.0
@@ -2808,7 +2808,7 @@ class SimplifiedHybridEnv(gym.Env):
                         reward = 25.0
                     elif resp_data[0] == 0x07:
                         resp_type = "abort"
-                        reward = 15.0
+                        reward = 50.0  # Abort: server hit error-handling path
                     else:
                         resp_type = f"type_{resp_data[0]:02x}"
                         reward = 20.0
