@@ -351,19 +351,24 @@ cmd_setup() {
     echo "--- Installing gtp5g kernel module (for UPF) ---"
     _install_gtp5g
 
-    # Clone if not present; otherwise fetch new tags
+    # Clone if not present; otherwise fetch all refs (tags + branches)
     if [[ ! -d "${FREE5GC_DIR}/.git" ]]; then
         echo "  Cloning ${FREE5GC_REPO} → ${FREE5GC_DIR} ..."
         git clone --recurse-submodules "${FREE5GC_REPO}" "${FREE5GC_DIR}"
     else
-        echo "  Repo already exists at ${FREE5GC_DIR} — fetching tags ..."
-        git -C "${FREE5GC_DIR}" fetch --tags --quiet
+        echo "  Repo already exists at ${FREE5GC_DIR} — fetching all refs ..."
+        git -C "${FREE5GC_DIR}" fetch --all --tags --quiet
         git -C "${FREE5GC_DIR}" submodule update --init --recursive --quiet
     fi
 
-    # Checkout requested version
+    # Checkout requested version (tag, branch, or commit SHA)
     echo "  Checking out ${VERSION} ..."
     git -C "${FREE5GC_DIR}" checkout "${VERSION}"
+    # If VERSION is a remote branch, fast-forward to its latest commit
+    if git -C "${FREE5GC_DIR}" show-ref --verify --quiet "refs/remotes/origin/${VERSION}"; then
+        echo "  Fast-forwarding branch ${VERSION} to origin/${VERSION} ..."
+        git -C "${FREE5GC_DIR}" reset --hard "origin/${VERSION}"
+    fi
     git -C "${FREE5GC_DIR}" submodule update --init --recursive
 
     # The Makefile hardcodes CGO_ENABLED=0 inline in each recipe, which cannot be

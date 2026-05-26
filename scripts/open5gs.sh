@@ -284,12 +284,17 @@ cmd_setup() {
         git clone "${OPEN5GS_REPO}" "${OPEN5GS_DIR}"
     else
         echo "  Repo already exists at ${OPEN5GS_DIR} — skipping clone"
-        git -C "${OPEN5GS_DIR}" fetch --tags --quiet
+        git -C "${OPEN5GS_DIR}" fetch --all --tags --quiet
     fi
 
-    # Checkout requested version
+    # Checkout requested version (tag, branch, or commit SHA)
     echo "  Checking out ${VERSION} ..."
     git -C "${OPEN5GS_DIR}" checkout "${VERSION}"
+    # If VERSION is a remote branch, fast-forward to its latest commit
+    if git -C "${OPEN5GS_DIR}" show-ref --verify --quiet "refs/remotes/origin/${VERSION}"; then
+        echo "  Fast-forwarding branch ${VERSION} to origin/${VERSION} ..."
+        git -C "${OPEN5GS_DIR}" reset --hard "origin/${VERSION}"
+    fi
 
     # Configure with meson (reconfigure if build dir already exists)
     echo "  Configuring ${BUILD_DIR} ..."

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-GitHub issue scraper for open5GS and free5GC security intelligence.
+GitHub issue scraper for open5GS, free5GC, and ella-core security intelligence.
 
-Fetches issues (open + closed) from both repos, extracts target NFs,
+Fetches issues (open + closed) from all repos, extracts target NFs,
 vulnerable API paths, root causes, PoC payloads, affected versions, and
 generates fuzzer hints that map to existing RL scenarios.
 
@@ -19,6 +19,9 @@ Usage
 
     # Limit per repo (for quick tests):
     python scripts/scrape_issues.py --max-pages 3
+
+    # Filter ella to specific versions:
+    python scripts/scrape_issues.py --ella-versions v1.10.2,v1.10.1
 
 Environment
 -----------
@@ -68,8 +71,9 @@ _load_dotenv()
 # ---------------------------------------------------------------------------
 
 REPOS = [
-    {"owner": "open5gs",  "repo": "open5gs",  "core": "open5gs"},
-    {"owner": "free5gc",  "repo": "free5gc",  "core": "free5gc"},
+    {"owner": "open5gs",       "repo": "open5gs",  "core": "open5gs"},
+    {"owner": "free5gc",       "repo": "free5gc",  "core": "free5gc"},
+    {"owner": "ellanetworks",  "repo": "core",     "core": "ella"},
 ]
 
 # Also scrape per-NF repos in free5GC organisation
@@ -87,6 +91,10 @@ OPEN5GS_VERSIONS = re.compile(
 )
 FREE5GC_VERSIONS = re.compile(
     r"v[34]\.\d+\.\d+",         # v3.x.x, v4.x.x
+    re.IGNORECASE,
+)
+ELLA_VERSIONS = re.compile(
+    r"v1\.\d+\.\d+",            # v1.x.x
     re.IGNORECASE,
 )
 
@@ -121,6 +129,10 @@ _API_PATH_RE = re.compile(
 _BARE_PATH_RE = re.compile(
     r"(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+(/[a-zA-Z0-9/_\-{}?=&]+)",
     re.IGNORECASE,
+)
+# Match ella operator API paths: /api/v1/subscribers, /api/v1/bgp/peers, etc.
+_ELLA_API_PATH_RE = re.compile(
+    r"(/api/v\d+/[a-zA-Z0-9/_\-{}?=&]+)",
 )
 
 # ---------------------------------------------------------------------------
@@ -220,6 +232,36 @@ _HINT_MAP: list[tuple[tuple[str, ...], tuple[str, ...], list[str], list[str]]] =
      [],
      ["large_payload", "oversized_array", "nested_json_depth",
       "rapid_concurrent_requests"]),
+
+    # --- ella-core specific ---
+    # Issue #1352: AMF nil pointer deref on Registration Request with missing
+    # UE Security Capability IE — directly triggerable via NGAP fuzzing.
+    (("AMF",), ("null_deref", "missing_check", "crash", "panic"),
+     ["ella_ngap_registration_missing_security_cap",
+      "ella_ngap_registration_missing_ies",
+      "amf_fuzz_ngap_reg_no_ue_security_cap"],
+     ["omit_ue_security_capability", "omit_supported_codecs",
+      "omit_ue_network_capability", "partial_registration_request"]),
+
+    # Ella operator API: SQL type confusion (BGP filter UUID→int cast),
+    # boundary issues in slices/policies/data-networks.
+    (("AMF", "SMF", "UPF"), ("type_confusion", "logic_error", "injection"),
+     ["ella_api_bgp_peer_remote_as_overflow",
+      "ella_api_data_network_cidr_malformed",
+      "ella_api_slice_sst_sd_boundary"],
+     ["bgp_remote_as_max_plus_one", "bgp_hold_time_zero",
+      "uuid_in_integer_field", "cidr_malformed", "mtu_overflow",
+      "sst_boundary_255", "sd_boundary_ffffff"]),
+
+    # Ella operator API: subscriber and slice endpoint missing-validation issues.
+    (("UDM", "UDR", "AMF"), ("missing_check", "protocol_error", "crash"),
+     ["ella_api_subscriber_imsi_boundary",
+      "ella_api_subscriber_missing_key_fields",
+      "ella_api_policy_5qi_boundary",
+      "ella_api_nas_security_algo_enum"],
+     ["imsi_too_short", "imsi_non_numeric", "opc_wrong_length",
+      "5qi_boundary_0", "5qi_boundary_255", "arp_boundary_0", "arp_boundary_16",
+      "nas_integrity_algo_unknown", "nas_cipher_algo_unknown"]),
 ]
 
 
@@ -347,14 +389,11 @@ def _extract_nfs(text: str) -> list[str]:
 
 def _extract_api_paths(text: str) -> list[str]:
     paths: set[str] = set()
-    for m in _API_PATH_RE.finditer(text):
-        p = m.group(1).rstrip(".")
-        if len(p) > 3:
-            paths.add(p)
-    for m in _BARE_PATH_RE.finditer(text):
-        p = m.group(1).rstrip(".")
-        if len(p) > 3:
-            paths.add(p)
+    for pat in (_API_PATH_RE, _BARE_PATH_RE, _ELLA_API_PATH_RE):
+        for m in pat.finditer(text):
+            p = m.group(1).rstrip(".")
+            if len(p) > 3:
+                paths.add(p)
     return sorted(paths)
 
 
@@ -383,6 +422,8 @@ def _extract_payloads(text: str) -> list[str]:
 def _extract_versions(text: str, core: str) -> list[str]:
     if core == "open5gs":
         return list(dict.fromkeys(OPEN5GS_VERSIONS.findall(text)))
+    if core == "ella":
+        return list(dict.fromkeys(ELLA_VERSIONS.findall(text)))
     return list(dict.fromkeys(FREE5GC_VERSIONS.findall(text)))
 
 
@@ -405,6 +446,8 @@ def _is_version_relevant(versions: list[str], core: str,
         return True
     if core == "open5gs":
         return any(v.startswith(("v2.6", "v2.7")) for v in versions)
+    if core == "ella":
+        return any(v.startswith("v1.") for v in versions)
     return any(v.startswith(("v3.", "v4.")) for v in versions)
 
 
@@ -485,10 +528,14 @@ def main() -> int:
                         help="Comma-separated free5GC versions to match "
                              "(e.g. v4.2.2,v4.2.1,v4.2.0). "
                              "Default: any v3.x or v4.x")
+    parser.add_argument("--ella-versions", default="", metavar="VERSIONS",
+                        help="Comma-separated ella-core versions to match "
+                             "(e.g. v1.10.2,v1.10.1). "
+                             "Default: any v1.x.x")
     parser.add_argument("--strict-versions", action="store_true",
                         help="Exclude issues that mention no version at all "
                              "(only applies when --open5gs-versions / "
-                             "--free5gc-versions are set)")
+                             "--free5gc-versions / --ella-versions are set)")
     args = parser.parse_args()
 
     if not args.token:
@@ -507,6 +554,7 @@ def main() -> int:
     version_filters: dict[str, set[str] | None] = {
         "open5gs": _parse_versions(args.open5gs_versions),
         "free5gc":  _parse_versions(args.free5gc_versions),
+        "ella":     _parse_versions(args.ella_versions),
     }
     strict = args.strict_versions
 
@@ -591,6 +639,7 @@ def main() -> int:
             "by_core": {
                 "open5gs":  sum(1 for r in deduped if r["core"] == "open5gs"),
                 "free5gc":  sum(1 for r in deduped if r["core"] == "free5gc"),
+                "ella":     sum(1 for r in deduped if r["core"] == "ella"),
             },
             "by_state": {
                 "open":   sum(1 for r in deduped if r["state"] == "open"),
@@ -622,6 +671,7 @@ def main() -> int:
     print(f"\nWrote {len(deduped)} issues → {args.output}", file=sys.stderr)
     print(f"  open5GS:  {output['summary']['by_core']['open5gs']}", file=sys.stderr)
     print(f"  free5GC:  {output['summary']['by_core']['free5gc']}", file=sys.stderr)
+    print(f"  ella:     {output['summary']['by_core']['ella']}", file=sys.stderr)
     print(f"  critical: {output['summary']['by_priority']['critical']}", file=sys.stderr)
     print(f"  high:     {output['summary']['by_priority']['high']}", file=sys.stderr)
     print(f"  likely_incomplete_patch: "
