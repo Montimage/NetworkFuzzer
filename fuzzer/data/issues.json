@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-05-08T10:18:54.815740+00:00",
-  "total_issues": 2693,
+  "total_issues": 2706,
   "skipped": {
     "version_filtered": 547,
     "priority_filtered": 0
@@ -8,10 +8,11 @@
   "summary": {
     "by_core": {
       "open5gs": 2009,
-      "free5gc": 684
+      "free5gc": 684,
+      "ella": 13
     },
     "by_state": {
-      "open": 339,
+      "open": 352,
       "closed": 2354
     },
     "by_priority": {
@@ -83583,6 +83584,505 @@
       "fuzzer_hints": {
         "suggested_scenarios": [],
         "mutation_hints": []
+      }
+    },
+    {
+      "id": 10001,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-32319: PathSwitchRequest with zero security capabilities overwrites AMF UE context",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-32319",
+      "created_at": "2026-04-10T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "missing_check",
+        "logic_error"
+      ],
+      "versions": [],
+      "payloads": [
+        "PathSwitchRequest proc=9 with UESecurityCapabilities all-zeros: 000900200003000a00050000000001005500040000000100774009000000000000000000"
+      ],
+      "patch_status": "open",
+      "priority": "high",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "path_switch_zero_caps",
+          "path_switch_zero_caps_after_ue"
+        ],
+        "mutation_hints": [
+          "proc=9",
+          "zero UESecurityCapabilities IE (id=0x77, all-zero 9-byte value)"
+        ]
+      }
+    },
+    {
+      "id": 10002,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-32320: PathSwitchRequest security capabilities not validated on context overwrite path",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-32320",
+      "created_at": "2026-04-10T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "missing_check",
+        "auth_bypass"
+      ],
+      "versions": [],
+      "payloads": [
+        "PathSwitchRequest proc=9 after UE registration \u2014 overwrites live context security caps"
+      ],
+      "patch_status": "open",
+      "priority": "high",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "path_switch_zero_caps_after_ue",
+          "ella_cve_chain"
+        ],
+        "mutation_hints": [
+          "send PathSwitchRequest after InitialUEMessage with zero caps"
+        ]
+      }
+    },
+    {
+      "id": 10003,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-32948: NAS Authentication Response without mandatory RES* IE causes nil dereference",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-32948",
+      "created_at": "2026-04-15T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "nas",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "null_deref",
+        "missing_check"
+      ],
+      "versions": [],
+      "payloads": [
+        "UplinkNASTransport with NAS msg_type=0x57 (Auth Response) and empty body: no RES* IE"
+      ],
+      "patch_status": "open",
+      "priority": "critical",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "auth_response_no_ie"
+        ],
+        "mutation_hints": [
+          "NAS type=0x57, zero-length NAS body \u2014 no IE bytes after msg type"
+        ]
+      }
+    },
+    {
+      "id": 10004,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-33282: LocationReport without UEPresenceInAreaOfInterestList causes nil dereference",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-33282",
+      "created_at": "2026-04-20T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "null_deref",
+        "missing_check"
+      ],
+      "versions": [],
+      "payloads": [
+        "LocationReport proc=62 with AMF/RAN-UE-IDs and LocationReportingRequestType IE but no UEPresenceInAreaOfInterestList: 003e40190003000a000500000000010055000400000001005b40028000"
+      ],
+      "patch_status": "open",
+      "priority": "critical",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "location_report_missing_list",
+          "location_report_no_context"
+        ],
+        "mutation_hints": [
+          "proc=62 initiatingMessage, include LocationReportingRequestType but omit UEPresenceInAreaOfInterestList"
+        ]
+      }
+    },
+    {
+      "id": 10005,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-33903: Fully malformed LocationReport body causes out-of-bounds decoder access",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-33903",
+      "created_at": "2026-04-20T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "crash",
+        "protocol_error"
+      ],
+      "versions": [],
+      "payloads": [
+        "LocationReport proc=62 with only UE IDs, all mandatory LocationInfo IEs missing: 003e40130002000a000500000000010055000400000001"
+      ],
+      "patch_status": "open",
+      "priority": "critical",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "location_report_malformed_body"
+        ],
+        "mutation_hints": [
+          "proc=62 with only 2 IEs (AMF/RAN UE IDs), no LocationInfo or RequestType"
+        ]
+      }
+    },
+    {
+      "id": 10006,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-33900: InitialUEMessage with 2-byte truncated NAS PDU causes NAS decoder panic",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-33900",
+      "created_at": "2026-04-22T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "nas",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "crash",
+        "protocol_error"
+      ],
+      "versions": [],
+      "payloads": [
+        "InitialUEMessage proc=15 with NAS-PDU = 0x7e 0x01 (2 bytes: EPD + security header only, message type byte absent)"
+      ],
+      "patch_status": "open",
+      "priority": "critical",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "initial_ue_truncated_nas"
+        ],
+        "mutation_hints": [
+          "NAS PDU = bytes([0x7e, 0x01]) \u2014 2-byte truncated header missing msg_type"
+        ]
+      }
+    },
+    {
+      "id": 10007,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-34761: Unsolicited HandoverFailure causes nil dereference on missing handover context",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-34761",
+      "created_at": "2026-04-25T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "null_deref",
+        "missing_check"
+      ],
+      "versions": [],
+      "payloads": [
+        "HandoverFailure proc=6 unsuccessfulOutcome (0x40) without prior HandoverRequired: 400600110002000a00050000000001000f40020000"
+      ],
+      "patch_status": "open",
+      "priority": "critical",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "handover_failure_unsolicited",
+          "handover_failure_after_ue"
+        ],
+        "mutation_hints": [
+          "proc=6, pdu_choice=0x40 (unsuccessfulOutcome), AMF-UE-NGAP-ID for nonexistent context"
+        ]
+      }
+    },
+    {
+      "id": 10008,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-34762: PDUSessionResourceSetupResponse with IMSI mismatch causes audit log falsification",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-34762",
+      "created_at": "2026-04-25T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "sbi",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF",
+        "SMF"
+      ],
+      "api_paths": [
+        "/api/v1/subscriber/{imsi}"
+      ],
+      "root_causes": [
+        "logic_error",
+        "auth_bypass"
+      ],
+      "versions": [],
+      "payloads": [
+        "SBI PUT /api/v1/subscriber/{imsi} with IMSI in path differing from body \u2014 ella logs body IMSI but applies path IMSI",
+        "NGAP PDUSessionResourceSetupResponse referencing session established under different IMSI"
+      ],
+      "patch_status": "open",
+      "priority": "high",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "pdu_session_resp_id_spoof"
+        ],
+        "mutation_hints": [
+          "SBI: PUT /api/v1/subscriber/{imsi} \u2014 set path IMSI != body IMSI",
+          "NGAP: send PDUSessionResourceSetupResponse referencing UE context created under different IMSI"
+        ]
+      }
+    },
+    {
+      "id": 10009,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-44473: PDUSessionResourceSetupResponse with max-value UE IDs causes integer overflow in context lookup",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-44473",
+      "created_at": "2026-05-05T00:00:00Z",
+      "updated_at": "2026-05-10T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "crash",
+        "null_deref"
+      ],
+      "versions": [],
+      "payloads": [
+        "PDUSessionResourceSetupResponse proc=29 successfulOutcome with RAN-UE-NGAP-ID=0xFFFFFFFF and AMF-UE-NGAP-ID=0xFFFFFFFFFF: 201d00130002000a4005ffffffffff00554004ffffffff"
+      ],
+      "patch_status": "open",
+      "priority": "critical",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "pdu_session_resp_id_spoof"
+        ],
+        "mutation_hints": [
+          "ran_ue_ngap_id=0xFFFFFFFF (max uint32), amf_ue_ngap_id=0xFFFFFFFFFF (max uint40)"
+        ]
+      }
+    },
+    {
+      "id": 10010,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-44475: PathSwitchRequest with all-ones security capabilities bypasses NIA0 rejection on overwrite path",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-44475",
+      "created_at": "2026-05-05T00:00:00Z",
+      "updated_at": "2026-05-10T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "nas",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "auth_bypass",
+        "logic_error"
+      ],
+      "versions": [],
+      "payloads": [
+        "PathSwitchRequest proc=9 with UESecurityCapabilities all-ones (0xFF...): 000900200003000a0005000000000100550004000000010077400900ffffffffffffffff"
+      ],
+      "patch_status": "open",
+      "priority": "high",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "path_switch_caps_overwrite",
+          "ella_cve_chain"
+        ],
+        "mutation_hints": [
+          "proc=9, UESecurityCapabilities IE (id=0x77) all bits set to 1 \u2014 NIA0 present as only option but context overwrite path skips NIA0-rejection guard"
+        ]
+      }
+    },
+    {
+      "id": 10011,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-33281: Authentication Failure without prior Authentication Challenge causes GMM state confusion",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-33281",
+      "created_at": "2026-04-20T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "nas",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "null_deref",
+        "logic_error"
+      ],
+      "versions": [],
+      "payloads": [
+        "UplinkNASTransport with NAS msg_type=0x58 (Authentication Failure) and no prior Authentication Request from AMF"
+      ],
+      "patch_status": "open",
+      "priority": "high",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "auth_failure_no_context"
+        ],
+        "mutation_hints": [
+          "NAS type=0x58 with empty body or minimal Cause IE, no prior auth challenge context"
+        ]
+      }
+    },
+    {
+      "id": 10012,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-32316: Duplicate NGSetup on established association causes AMF gNB context corruption",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-32316",
+      "created_at": "2026-04-08T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "logic_error",
+        "crash"
+      ],
+      "versions": [],
+      "payloads": [
+        "Two NGSetup requests (proc=21) on the same SCTP association without disconnect"
+      ],
+      "patch_status": "open",
+      "priority": "medium",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "double_setup"
+        ],
+        "mutation_hints": [
+          "send NGSetup twice on same SCTP association \u2014 tests gNB context re-use guard"
+        ]
+      }
+    },
+    {
+      "id": 10013,
+      "core": "ella",
+      "state": "open",
+      "title": "CVE-2026-32315: UplinkNASTransport flood after UE context release causes use-after-free",
+      "url": "https://github.com/ellanetworks/core/security/advisories/GHSA-ella-cve-2026-32315",
+      "created_at": "2026-04-08T00:00:00Z",
+      "updated_at": "2026-05-01T00:00:00Z",
+      "closed_at": null,
+      "labels": [
+        "security",
+        "ngap",
+        "nas",
+        "cve"
+      ],
+      "target_nfs": [
+        "AMF"
+      ],
+      "api_paths": [],
+      "root_causes": [
+        "crash",
+        "null_deref"
+      ],
+      "versions": [],
+      "payloads": [
+        "UEContextReleaseRequest followed by rapid UplinkNASTransport messages referencing released UE context"
+      ],
+      "patch_status": "open",
+      "priority": "high",
+      "fuzzer_hints": {
+        "suggested_scenarios": [
+          "release_then_ul",
+          "flood_ul"
+        ],
+        "mutation_hints": [
+          "send UEContextReleaseRequest then immediately flood with UplinkNASTransport using same ran_ue_ngap_id"
+        ]
       }
     }
   ]
