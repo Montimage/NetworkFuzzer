@@ -13,6 +13,9 @@ pyshark
 gymnasium>=0.29.0
 stable-baselines3
 
+# SBI spec parsing (OpenAPI YAML)
+pyyaml
+
 # GAN for traffic generation (CPU-only)
 ctgan==0.11.0
 
