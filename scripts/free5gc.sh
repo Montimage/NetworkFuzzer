@@ -51,6 +51,8 @@ BIN_DIR="${FREE5GC_DIR}/bin"
 CFG_DIR="${FREE5GC_DIR}/config"
 LOG_DIR="/tmp/free5gc-${VERSION}-logs"
 PID_DIR="/tmp/free5gc-${VERSION}-pids"
+# Go-coverage output dir (one subdir per NF).  Used by build-cover/start-cover/coverage.
+COV_DIR="/tmp/free5gc-${VERSION}-cov"
 
 # ---------------------------------------------------------------------------
 # NF startup order (NRF first, UPF last among core NFs)
@@ -70,6 +72,16 @@ _apt_update() {
 }
 
 _binary()    { echo "${BIN_DIR}/$1"; }
+_cover_binary() { echo "${BIN_DIR}/${1}_cover"; }   # Go-coverage-instrumented build
+
+# COVER_NFS: space/comma-separated NF list to launch from their -cover binary
+# (with GOCOVERDIR set) when running `start`.  Lets one `start` bring the whole
+# stack up with just the target NF(s) instrumented, e.g.:
+#   COVER_NFS=udm sudo ./free5gc.sh start main
+_is_cover_nf() {
+    local nf="$1"; local list=" ${COVER_NFS:-} "; list="${list//,/ }"
+    [[ "$list" == *" ${nf} "* ]]
+}
 _config()    { echo "${CFG_DIR}/${1}cfg.yaml"; }
 _logfile()   { echo "${LOG_DIR}/$1.log"; }
 _pidfile()   { echo "${PID_DIR}/$1.pid"; }
@@ -426,13 +438,24 @@ cmd_start() {
     [[ -x "$(_binary chf)" ]] && nfs_list+=(chf)
 
     for nf in "${nfs_list[@]}"; do
-        local bin; bin="$(_binary "$nf")"
+        # COVERAGE: launch this NF from its -cover binary with a per-NF GOCOVERDIR.
+        local bin gcd=""
+        if _is_cover_nf "$nf"; then
+            bin="$(_cover_binary "$nf")"
+            gcd="${COV_DIR}/${nf}"
+            mkdir -p "$gcd"
+            printf "  [%s] COVERAGE binary + GOCOVERDIR=%s\n" "$nf" "$gcd"
+        else
+            bin="$(_binary "$nf")"
+        fi
         local cfg; cfg="$(_config "$nf")"
         local log; log="$(_logfile "$nf")"
         local pf;  pf="$(_pidfile "$nf")"
 
         if ! [[ -x "$bin" ]]; then
-            echo "  [${nf}] ERROR: binary not found at ${bin}" >&2; continue
+            echo "  [${nf}] ERROR: binary not found at ${bin}" >&2
+            _is_cover_nf "$nf" && echo "       run: sudo $0 build-cover ${VERSION} ${nf}" >&2
+            continue
         fi
         if ! [[ -f "$cfg" ]]; then
             echo "  [${nf}] ERROR: config not found at ${cfg}" >&2; continue
@@ -457,7 +480,9 @@ cmd_start() {
         # SMF also needs --uerouting; all NFs accept --config and -l.
         local extra_args=()
         [[ "$nf" == "smf" && -f "$(_uerouting)" ]] && extra_args+=(--uerouting "$(_uerouting)")
-        (cd "${FREE5GC_DIR}" && exec "$bin" --config "$cfg" -l "$log" "${extra_args[@]}") >> "$log" 2>&1 &
+        # For a cover NF, export its GOCOVERDIR only in that NF's exec environment.
+        (cd "${FREE5GC_DIR}" && { [[ -n "$gcd" ]] && export GOCOVERDIR="$gcd"; }; \
+            exec "$bin" --config "$cfg" -l "$log" "${extra_args[@]}") >> "$log" 2>&1 &
         local pid=$!
         disown "$pid" 2>/dev/null || true
         echo "$pid" > "$pf"
@@ -615,7 +640,22 @@ cmd_start_nf() {
     fi
     nf="${nf,,}"  # lowercase
 
-    local bin; bin="$(_binary "$nf")"
+    # Coverage mode (F5GC_COVER=1): launch the -cover binary and point GOCOVERDIR
+    # at this NF's coverage dir.  Go writes the profile on graceful exit (SIGTERM →
+    # the NF returns from main), so 'stop'/restart flush automatically.
+    local bin
+    if [[ "${F5GC_COVER:-0}" == "1" ]]; then
+        bin="$(_cover_binary "$nf")"
+        export GOCOVERDIR="${COV_DIR}/${nf}"
+        mkdir -p "${GOCOVERDIR}"
+        echo "[${nf}] COVERAGE mode — GOCOVERDIR=${GOCOVERDIR}"
+        if ! [[ -x "$bin" ]]; then
+            echo "ERROR: cover binary not found: ${bin} — run: sudo $0 build-cover ${VERSION} ${nf}" >&2
+            exit 1
+        fi
+    else
+        bin="$(_binary "$nf")"
+    fi
     local cfg; cfg="$(_config "$nf")"
     local log; log="$(_logfile "$nf")"
     local pf;  pf="$(_pidfile "$nf")"
@@ -665,6 +705,128 @@ cmd_start_nf() {
 }
 
 # ---------------------------------------------------------------------------
+# Go coverage:  build-cover → start-cover → (run fuzzer) → stop → coverage
+#
+# free5GC is Go, so ASAN/crash-count is a poor success metric — a robust NF can
+# absorb a whole campaign with 0 crashes.  Coverage answers "how much of the NF
+# did we actually exercise?".  A -cover binary writes its profile to GOCOVERDIR
+# on graceful exit (SIGTERM), which 'stop' sends — no source changes needed.
+# NOTE: plain `-cover` (no -coverpkg) is required so the main package is
+# instrumented too; otherwise Go never registers the exit hook and nothing flushes.
+# ---------------------------------------------------------------------------
+cmd_build_cover() {
+    local nf="${3:-}"
+    if [[ -z "$nf" ]]; then
+        echo "Usage: $0 build-cover <version> <nf-name>" >&2
+        echo "  nf-name: one of ${NFS[*]} chf" >&2
+        exit 1
+    fi
+    nf="${nf,,}"
+    local src="${FREE5GC_DIR}/NFs/${nf}/cmd"
+    if ! [[ -f "${src}/main.go" ]]; then
+        echo "ERROR: ${src}/main.go not found — is free5GC set up?" >&2; exit 1
+    fi
+    export PATH="/usr/local/go/bin:${PATH}"
+
+    # Inject the on-demand coverage dumper.  Build-tagged 'coverage', so it is
+    # compiled in ONLY for cover builds (normal `make` builds exclude it and stay
+    # clean).  On SIGUSR2 it snapshots Go coverage counters to GOCOVERDIR while the
+    # NF keeps running — the Go analog of open5GS's SIGUSR2 __gcov_dump.  This is
+    # what lets the fuzzer read coverage *during* a campaign (online mode).
+    cat > "${src}/zz_cover_dump.go" <<'GOEOF'
+//go:build coverage
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"runtime/coverage"
+	"syscall"
+	"time"
+)
+
+// init registers a SIGUSR2 handler that flushes current coverage counters to
+// $GOCOVERDIR without exiting.  Meta-data is written once up front.  Each dump
+// appends a line to $GOCOVERDIR/_dump.log so the fuzzer (and humans) can confirm
+// the online dump is firing.
+func init() {
+	dir := os.Getenv("GOCOVERDIR")
+	if dir == "" {
+		return
+	}
+	logln := func(s string) {
+		if f, e := os.OpenFile(dir+"/_dump.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); e == nil {
+			fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339Nano), s)
+			f.Close()
+		}
+	}
+	if e := coverage.WriteMetaDir(dir); e != nil {
+		logln("meta ERR: " + e.Error())
+	} else {
+		logln("meta ok")
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR2)
+	go func() {
+		for range ch {
+			if e := coverage.WriteCountersDir(dir); e != nil {
+				logln("counters ERR: " + e.Error())
+			} else {
+				logln("counters ok")
+			}
+		}
+	}()
+}
+GOEOF
+
+    # -covermode=atomic is REQUIRED for on-demand WriteCountersDir mid-run (the
+    # default -covermode=set rejects it) and is the correct mode for a concurrent
+    # server.  -tags coverage pulls in the SIGUSR2 dumper above.
+    # Build the cmd PACKAGE ('.'), not 'main.go' alone — `go build main.go`
+    # compiles only that one file and ignores sibling files, so the build-tagged
+    # zz_cover_dump.go (SIGUSR2 dumper) would never be included.  Building the
+    # directory pulls in all package-main files.
+    echo "  [cover] building ${nf} with -cover -covermode=atomic -tags coverage → $(_cover_binary "$nf") ..."
+    ( cd "$src" && CGO_ENABLED=1 GOFLAGS=-mod=mod \
+        go build -cover -covermode=atomic -tags coverage -o "$(_cover_binary "$nf")" . )
+    if [[ -x "$(_cover_binary "$nf")" ]]; then
+        echo "  [cover] built $(_cover_binary "$nf")"
+        echo "  Next: sudo $0 start-cover ${VERSION} ${nf}"
+    else
+        echo "  [cover] BUILD FAILED" >&2; exit 1
+    fi
+}
+
+cmd_start_cover() {
+    # Reuse all of start-nf's start/stop/pidfile logic via the F5GC_COVER flag.
+    F5GC_COVER=1 cmd_start_nf "$@"
+}
+
+cmd_coverage() {
+    local nf="${3:-}"
+    if [[ -z "$nf" ]]; then
+        echo "Usage: $0 coverage <version> <nf-name> [--func]" >&2
+        exit 1
+    fi
+    nf="${nf,,}"
+    export PATH="/usr/local/go/bin:${PATH}"
+    local dir="${COV_DIR}/${nf}"
+    if ! ls "${dir}"/covmeta.* >/dev/null 2>&1; then
+        echo "ERROR: no coverage data in ${dir}." >&2
+        echo "  Did you 'start-cover' then 'stop' (graceful flush) this NF?" >&2
+        exit 1
+    fi
+    echo "=== ${nf} coverage  (GOCOVERDIR=${dir}) ==="
+    go tool covdata percent -i="${dir}"
+    if [[ "${4:-}" == "--func" ]]; then
+        echo "=== per-function (uncovered first) ==="
+        go tool covdata func -i="${dir}" | sort -t$'\t' -k3 -n | head -60
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 case "${COMMAND}" in
@@ -675,6 +837,9 @@ case "${COMMAND}" in
     status)   cmd_status             ;;
     watch)    cmd_watch "$@"         ;;
     start-nf) cmd_start_nf "$@"      ;;
+    build-cover) cmd_build_cover "$@" ;;
+    start-cover) cmd_start_cover "$@" ;;
+    coverage)    cmd_coverage "$@"    ;;
     *)
         cat <<EOF
 Usage: $0 <command> [version]
@@ -687,8 +852,27 @@ Commands:
   status     [version]             show running/down status
   watch      [version] [--errors]  tail all NF logs (Ctrl+C to stop)
   start-nf   <version> <nf>        restart a single NF (for fuzzer --amf-restart-cmd)
+  build-cover <version> <nf>       build a Go-coverage-instrumented <nf>_cover binary
+  start-cover <version> <nf>       run <nf>_cover with GOCOVERDIR set (for coverage runs)
+  coverage    <version> <nf> [--func]  report Go coverage % for <nf> (after stop)
 
 version defaults to the latest release on GitHub.  free5GC is cloned to ${FREE5GC_DIR}.
+
+Coverage workflow (free5GC is Go — measure code reached, not just crashes).
+UDM depends on NRF (registration) and UDR (auth lookup), so the WHOLE stack must
+run; only the target NF needs instrumenting.  Use COVER_NFS to bring the full
+stack up with just the target NF built from its -cover binary:
+  sudo $0 build-cover main udm                       # one-time instrumented build
+  sudo COVER_NFS=udm $0 start main                   # full stack, udm instrumented
+                                                     # (COVER_NFS goes AFTER sudo, else
+                                                     #  sudo strips it from the env)
+  CORE=free5gc RESTART_CMD='sudo scripts/free5gc.sh start-cover main udm' \\
+      ./scripts/fuzz_udm.sh                           # run the campaign (cover-aware restart)
+  sudo $0 stop main                                  # graceful exit flushes coverage
+  $0 coverage main udm --func                        # report % + per-function gaps
+
+  (start-cover/start-nf only (re)start ONE NF — handy to swap the target into an
+   already-running stack, but they do NOT start NRF/UDR/etc.)
 
 ASAN is always enabled.  ASAN_OPTIONS and UBSAN_OPTIONS are exported automatically
 at start time; crash reports land in ${LOG_DIR}/asan.<pid>.

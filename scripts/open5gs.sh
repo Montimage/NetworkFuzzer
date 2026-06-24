@@ -200,6 +200,37 @@ https://repo.mongodb.org/apt/${repo_distro} ${repo_codename}/mongodb-org/${mongo
     fi
 }
 
+_normalize_nrf_uri() {
+    # The open5GS NF config templates in this tree default their NRF *client* URI
+    # to http://127.0.0.200:7777 — an SCP/indirect-communication address that the
+    # 'main' profile never starts.  Left as-is, no NF can register with or be
+    # discovered through NRF (PCF/SMF policy creates then hang), and a meson
+    # rebuild regenerates the broken value.  Rewrite each NF's ACTIVE (non-
+    # commented) NRF client URI to the address NRF actually binds, so direct
+    # NF↔NRF communication works without manual edits after every rebuild.
+    local nrf_cfg; nrf_cfg="$(_config nrf)"
+    [[ -f "$nrf_cfg" ]] || return 0
+    # NRF bind address = first sbi.server 'address:' in nrf.yaml
+    local nrf_addr
+    nrf_addr="$(grep -A8 'sbi:' "$nrf_cfg" \
+        | grep -m1 -E '^[[:space:]]*-?[[:space:]]*address:' \
+        | sed -E 's/.*address:[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -n "$nrf_addr" ]] || nrf_addr="127.0.0.10"
+    local fixed=0
+    for nf in "${NFS[@]}"; do
+        local cfg; cfg="$(_config "$nf")"
+        [[ -f "$cfg" ]] || continue
+        # Only touch active lines (commented '#  - uri:' lines are not matched by
+        # the '- uri:' anchor) that point somewhere other than the real NRF addr.
+        if grep -qE "^[[:space:]]*- uri: http://127\.0\.0\.200:7777" "$cfg"; then
+            sed -i -E "s|^([[:space:]]*)- uri: http://127\.0\.0\.200:7777|\1- uri: http://${nrf_addr}:7777|" "$cfg"
+            fixed=1
+        fi
+    done
+    (( fixed )) && echo "  [config] normalized NRF client URI -> http://${nrf_addr}:7777"
+    return 0
+}
+
 _ensure_mongodb() {
     # If mongod is not installed at all, install it now (setup should have done
     # this, but handle the case where start is called on a fresh machine too).
@@ -363,7 +394,8 @@ _build_gcov_ctrl() {
         return 0
     fi
     echo "  Building gcov_ctrl.so → ${GCOV_SO} ..."
-    gcc -shared -fPIC -O0 -o "${GCOV_SO}" "${src}" -lgcov
+    # -ldl: dlsym(RTLD_NEXT, "sigaction") for the crash-flush sigaction interposer.
+    gcc -shared -fPIC -O0 -o "${GCOV_SO}" "${src}" -ldl -lgcov
     echo "  gcov_ctrl.so built successfully"
 }
 
@@ -389,6 +421,7 @@ cmd_start() {
     fi
     mkdir -p "${LOG_DIR}" "${PID_DIR}"
     _ensure_mongodb || true
+    _normalize_nrf_uri || true
 
     if (( GCOV_BUILD )); then
         if [[ ! -f "${GCOV_SO}" ]]; then

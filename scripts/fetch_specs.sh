@@ -32,15 +32,27 @@ NEEDED_FILES=(
     # SMF — TS 29.502
     "TS29502_Nsmf_PDUSession.yaml"
     "TS29502_Nsmf_EventExposure.yaml"
-    # UDM — TS 29.503
+    # UDM — TS 29.503 (all service groups free5GC routes — see NFs/udm/internal/sbi/api_*.go)
     "TS29503_Nudm_SDM.yaml"
     "TS29503_Nudm_UECM.yaml"
     "TS29503_Nudm_UEAU.yaml"
-    # UDR — TS 29.504
+    "TS29503_Nudm_EE.yaml"
+    "TS29503_Nudm_PP.yaml"
+    "TS29503_Nudm_MT.yaml"
+    "TS29503_Nudm_NIDDAU.yaml"
+    "TS29503_Nudm_RSDS.yaml"
+    "TS29503_Nudm_SSAU.yaml"
+    "TS29503_Nudm_UEID.yaml"
+    # UDR — TS 29.504 (Nudr_DR aggregates path-items from the data specs below via $ref)
     "TS29504_Nudr_DR.yaml"
-    "TS29519_5G_SubsData.yaml"
-    # AUSF — TS 29.509
+    "TS29505_Subscription_Data.yaml"
+    "TS29519_Policy_Data.yaml"
+    "TS29519_Application_Data.yaml"
+    "TS29519_Exposure_Data.yaml"
+    # AUSF — TS 29.509 (free5GC routes ueauthentication + sorprotection + upuprotection)
     "TS29509_Nausf_UEAuthentication.yaml"
+    "TS29509_Nausf_SoRProtection.yaml"
+    "TS29509_Nausf_UPUProtection.yaml"
     # PCF — TS 29.507 / 29.512 / 29.514
     "TS29507_Npcf_AMPolicyControl.yaml"
     "TS29512_Npcf_SMPolicyControl.yaml"
