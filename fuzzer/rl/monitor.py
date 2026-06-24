@@ -47,6 +47,9 @@ _PROC_NAMES: Dict[str, Dict[str, str]] = {
         'UPF':  'upf',
         'CHF':  'chf',
     },
+    # ella-core is a single snap binary; all NF types share the same process
+    'ella': {nf: 'cored' for nf in
+             ('NRF', 'AMF', 'SMF', 'UDM', 'UDR', 'PCF', 'AUSF', 'BSF', 'NSSF', 'UPF')},
 }
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,11 @@ _ERROR_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         # Raw Go/SCTP error lines that have no log-level prefix
         'SCTPConn:', 'bad file descriptor', 'connection reset by peer',
     ),
+    'ella': (
+        'panic:', 'goroutine', 'runtime error:',
+        'Segmentation fault', 'SIGSEGV', 'SIGABRT',
+        '"level":"error"', '"level":"fatal"', '"level":"warn"',
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -73,6 +81,24 @@ _ERROR_KEYWORDS: Dict[str, Tuple[str, ...]] = {
 # ---------------------------------------------------------------------------
 
 _NOISE_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    'ella': (
+        # Raft consensus chatter — normal single-node startup behaviour
+        'heartbeat timeout reached',
+        'entering candidate state',
+        'pre-vote successful',
+        'election won',
+        'entering leader state',
+        'Leadership acquired',
+        # Health / registration background noise
+        'health check',
+        'leadership_acquired',
+        # eBPF UPF loading failure on kernel <6.x — infrastructure issue, not a fuzz crash
+        'Loading bpf objects failed',
+        'upf_n3_n6_entrypoint_func',
+        'failed to load eBPF program',
+        'failed to load N3/N6 program',
+        'invalid func unknown',
+    ),
     'open5gs': (
         'Retry registration with NRF',
         "Couldn't connect to server",
@@ -91,6 +117,16 @@ _NOISE_PATTERNS: Dict[str, Tuple[str, ...]] = {
 # ---------------------------------------------------------------------------
 
 _LEVEL_SEVERITY: Dict[str, Dict[str, float]] = {
+    'ella': {
+        'panic:':              1.00,
+        'runtime error:':      0.97,
+        'Segmentation fault':  1.00,
+        'SIGSEGV':             1.00,
+        'SIGABRT':             1.00,
+        '"level":"fatal"':     1.00,
+        '"level":"error"':     0.85,
+        '"level":"warn"':      0.50,
+    },
     'open5gs': {
         'Segmentation fault': 1.00,
         'core dumped':        1.00,
@@ -394,6 +430,8 @@ _FREE5GC_SBI_DEPTH: List[Tuple[float, str]] = [
 _DEPTH_PATTERNS: Dict[str, Dict[str, List[Tuple[float, str]]]] = {
     'open5gs': {'ngap': _OPEN5GS_NGAP_DEPTH, 'sbi': _OPEN5GS_SBI_DEPTH},
     'free5gc':  {'ngap': _FREE5GC_NGAP_DEPTH, 'sbi': _FREE5GC_SBI_DEPTH},
+    # ella is Go-based; reuse free5GC depth patterns as a starting point
+    'ella':     {'ngap': _FREE5GC_NGAP_DEPTH, 'sbi': _FREE5GC_SBI_DEPTH},
 }
 
 # ---------------------------------------------------------------------------
@@ -410,7 +448,8 @@ _FREE5GC_FILE_LINE_RE = re.compile(r'([a-zA-Z0-9_/.-]+\.go):(\d+)')
 
 _FATAL_SKIP: Dict[str, re.Pattern] = {
     'open5gs': re.compile(r'backtrace\(\) returned|ogs_abort\b', re.IGNORECASE),
-    'free5gc':  re.compile(r'^$'),  # nothing to skip in free5GC goroutine dumps
+    'free5gc':  re.compile(r'^$'),
+    'ella':     re.compile(r'^$'),
 }
 
 _FATAL_RE: Dict[str, re.Pattern] = {
@@ -427,6 +466,13 @@ _FATAL_RE: Dict[str, re.Pattern] = {
         r'(Segmentation fault|SIGSEGV|SIGABRT)',
         re.IGNORECASE,
     ),
+    'ella': re.compile(
+        r'panic:\s*(.+?)\s*$|'
+        r'(runtime error:\s*.+?)\s*$|'
+        r'(nil pointer dereference|index out of range|slice bounds out of range)|'
+        r'(Segmentation fault|SIGSEGV|SIGABRT)',
+        re.IGNORECASE,
+    ),
 }
 
 
@@ -435,7 +481,7 @@ _FATAL_RE: Dict[str, re.Pattern] = {
 # ---------------------------------------------------------------------------
 
 class NfMonitor:
-    """Unified 5G NF process and log monitor for open5GS and free5GC.
+    """Unified 5G NF process and log monitor for open5GS, free5GC, and ella.
 
     Presents the same interface as the legacy Open5GSMonitor /
     Open5GsSbiMonitor classes so adapters can use it without changes to
@@ -444,6 +490,7 @@ class NfMonitor:
 
     OPEN5GS = 'open5gs'
     FREE5GC  = 'free5gc'
+    ELLA     = 'ella'
 
     def __init__(self,
                  core:        str = 'open5gs',
@@ -453,9 +500,10 @@ class NfMonitor:
                  protocol:    str = 'ngap',
                  bin_dir:     Optional[str] = None,
                  gcov_gcda_dir: Optional[str] = None,
-                 gcov_src_dir:  Optional[str] = None):
-        if core not in (self.OPEN5GS, self.FREE5GC):
-            raise ValueError(f"Unknown core '{core}'. Use 'open5gs' or 'free5gc'.")
+                 gcov_src_dir:  Optional[str] = None,
+                 go_cover_dir:  Optional[str] = None):
+        if core not in (self.OPEN5GS, self.FREE5GC, self.ELLA):
+            raise ValueError(f"Unknown core '{core}'. Use 'open5gs', 'free5gc', or 'ella'.")
         if protocol not in ('ngap', 'sbi'):
             raise ValueError(f"Unknown protocol '{protocol}'. Use 'ngap' or 'sbi'.")
 
@@ -474,6 +522,14 @@ class NfMonitor:
         # Per-episode gcov coverage set (file, lineno) — cleared in reset_episode()
         self._gcov_line_coverage: Set[Tuple[str, int]] = set()
 
+        # Go coverage mode (free5GC / ella — Go cores).  go_cover_dir is the
+        # GOCOVERDIR the -cover binary writes to; the cumulative set of covered
+        # blocks is campaign-scoped (not reset per episode), so the reward pays
+        # for blocks newly covered across the whole campaign (AFL-style).
+        self._go_cover_dir = go_cover_dir
+        self._go_cover_coverage: Set[str] = set()
+        self._go_cover_eval_counter = 0
+
         # Select per-core tables
         self._error_kw    = _ERROR_KEYWORDS[core]
         self._noise       = _NOISE_PATTERNS[core]
@@ -487,6 +543,8 @@ class NfMonitor:
             self._log_path = log_path
         elif core == self.OPEN5GS:
             self._log_path = f'/var/log/open5gs/{primary_nf.lower()}.log'
+        elif core == self.ELLA:
+            self._log_path = '/tmp/ella-logs/cored.log'
         else:
             self._log_path = f'/tmp/free5gc-logs/{primary_nf.lower()}.log'
 
@@ -515,10 +573,34 @@ class NfMonitor:
         """Return True if the NF process is running."""
         nf_up = nf.upper()
         try:
-            if self._core == self.FREE5GC and self._bin_dir:
+            if self._core == self.ELLA:
+                # Prefer the ASAN source binary when it is running
+                r = subprocess.run(['pgrep', '-x', 'ella-core-asan'],
+                                   capture_output=True, timeout=2)
+                if r.returncode == 0:
+                    return True
+                # Snap binary runs as /snap/ella-core/*/bin/core.
+                # pgrep -f is ~200x faster than `snap services ella-core.cored`
+                # (11ms vs 2s) — critical since this is called every training step.
+                r = subprocess.run(
+                    ['pgrep', '-f', r'/snap/ella-core.*/bin/core'],
+                    capture_output=True, timeout=2,
+                )
+                return r.returncode == 0
+            elif self._core == self.FREE5GC and self._bin_dir:
+                # pgrep -f on the bin path matches both '<nf>' and the coverage
+                # build '<nf>_cover' (substring of the cmdline).
                 bin_path = os.path.join(self._bin_dir, nf_up.lower())
                 r = subprocess.run(
                     ['pgrep', '-f', bin_path],
+                    capture_output=True, timeout=2,
+                )
+            elif self._core == self.FREE5GC:
+                # No bin_dir (e.g. preflight): match the process name, accepting the
+                # '<nf>_cover' coverage binary too, so coverage runs aren't reported down.
+                proc = self._proc_name(nf_up)
+                r = subprocess.run(
+                    ['pgrep', '-x', f'{proc}(_cover)?'],
                     capture_output=True, timeout=2,
                 )
             else:
@@ -555,7 +637,13 @@ class NfMonitor:
             return True
         proc = self._proc_name(nf)
         try:
-            if self._core == self.FREE5GC and self._bin_dir:
+            if self._core == self.ELLA:
+                # Stop whichever variant is running
+                subprocess.run(['pkill', '-TERM', '-x', 'ella-core-asan'],
+                               capture_output=True, timeout=5)
+                subprocess.run(['snap', 'stop', 'ella-core.cored'],
+                               capture_output=True, timeout=10)
+            elif self._core == self.FREE5GC and self._bin_dir:
                 bin_path = os.path.join(self._bin_dir, nf.lower())
                 subprocess.run(['pkill', '-TERM', '-f', bin_path],
                                capture_output=True, timeout=5)
@@ -570,7 +658,10 @@ class NfMonitor:
             if not self.is_alive(nf):
                 return True
         try:
-            if self._core == self.FREE5GC and self._bin_dir:
+            if self._core == self.ELLA:
+                subprocess.run(['pkill', '-KILL', '-x', 'cored'],
+                               capture_output=True, timeout=5)
+            elif self._core == self.FREE5GC and self._bin_dir:
                 subprocess.run(['pkill', '-KILL', '-f',
                                 os.path.join(self._bin_dir, nf.lower())],
                                capture_output=True, timeout=5)
@@ -762,6 +853,29 @@ class NfMonitor:
                 return sig.strip()
         return 'unknown'
 
+    def detect_panic_in_lines(self, lines: List[str]) -> Optional[str]:
+        """Scan the given (new) log lines for a Go panic / fatal runtime error.
+
+        Unlike detect_crash() (which only checks process liveness), this catches
+        panics that were *recovered* — e.g. free5GC's gin Recovery middleware logs
+        the panic + stack trace but keeps the process alive.  Those are real defect
+        findings that leave no dead process for detect_crash() to see.
+
+        Uses the per-core _fatal_re, so it matches panic:/runtime error:/nil-deref/
+        index-OOB (free5GC, ella) or FATAL/Assertion/SIGSEGV (open5GS) — and never
+        the ordinary [ERRO]/[WARN] flood.  Returns a short signature, or None.
+        """
+        for line in lines:
+            clean = _ANSI_ESC.sub('', line)
+            if self._fatal_skip.search(clean):
+                continue
+            m = self._fatal_re.search(clean)
+            if m:
+                sig = next((g for g in m.groups() if g), None)
+                if sig:
+                    return sig.strip()
+        return None
+
     def get_stack_trace(self, n: int = 150) -> List[str]:
         if self._core == self.OPEN5GS:
             fatal_kw = ('FATAL', 'Assertion', 'SIGSEGV', 'SIGABRT', 'Aborted',
@@ -885,6 +999,20 @@ class NfMonitor:
         to the coverage set.  Call reset_episode() to clear between episodes.
         """
         newly_seen: List[Tuple[str, int]] = []
+        for loc in self.extract_file_lines(lines):
+            if loc not in self._file_line_coverage:
+                self._file_line_coverage.add(loc)
+                newly_seen.append(loc)
+        return newly_seen
+
+    def extract_file_lines(self, lines: List[str]) -> List[Tuple[str, int]]:
+        """Extract (basename, lineno) source locations from log lines.
+
+        Read-only: unlike new_file_lines() this does NOT update the episode
+        coverage set, so it can be used to compute a per-step state signature
+        without disturbing the coverage-based reward.
+        """
+        locs: List[Tuple[str, int]] = []
         pattern = (_OPEN5GS_FILE_LINE_RE if self._core == self.OPEN5GS
                    else _FREE5GC_FILE_LINE_RE)
         for line in lines:
@@ -893,11 +1021,8 @@ class NfMonitor:
                 # Normalise to basename so ../lib/sbi/message.c and message.c
                 # map to the same coverage key.
                 fname = os.path.basename(m.group(1))
-                loc: Tuple[str, int] = (fname, int(m.group(2)))
-                if loc not in self._file_line_coverage:
-                    self._file_line_coverage.add(loc)
-                    newly_seen.append(loc)
-        return newly_seen
+                locs.append((fname, int(m.group(2))))
+        return locs
 
     @property
     def file_line_coverage_count(self) -> int:
@@ -1027,15 +1152,19 @@ class NfMonitor:
         if not self._gcov_gcda_dir or not self._gcov_src_dir:
             return []
 
-        # Always dump so .gcda stays current, even when we skip the lcov read.
-        if dump_first:
-            self.gcov_dump()
-
-        # Rate-limit the expensive lcov capture.
+        # Rate-limit BOTH the expensive lcov capture and the SIGUSR2 dump that
+        # feeds it. Dumping every .gcda for the whole program on every request is
+        # the dominant per-step cost (~0.3-0.5s/step → ~1.9 exec/s); since gcov
+        # counters are kept cumulative across requests (see adapter
+        # pre_request_snapshot — no per-request reset), a single dump right
+        # before each lcov read captures everything covered since the last read,
+        # so intermediate per-step dumps are pure overhead.
         self._gcov_eval_counter = getattr(self, '_gcov_eval_counter', 0) + 1
         if self._gcov_eval_counter % eval_every != 0:
             return []
 
+        if dump_first:
+            self.gcov_dump()
         if wait_ms > 0:
             time.sleep(wait_ms / 1000.0)
 
@@ -1120,3 +1249,158 @@ class NfMonitor:
     def gcov_coverage_count(self) -> int:
         """Number of distinct (file, line) locations covered by gcov this episode."""
         return len(self._gcov_line_coverage)
+
+    # ── Go coverage (free5GC / ella — runtime/coverage + `go tool covdata`) ──
+    # The Go analog of the gcov path above.  The -cover binary (built with
+    # -covermode=atomic, started under GOCOVERDIR) flushes a counter snapshot on
+    # SIGUSR2 without exiting (see scripts/free5gc.sh build-cover dumper).  We
+    # diff the covered blocks against the campaign-cumulative set and reward new
+    # blocks.  Coverage is block/statement-level (file:sL.sC,eL.eC), not edges.
+
+    @staticmethod
+    def _go_bin() -> str:
+        import shutil
+        return shutil.which('go') or '/usr/local/go/bin/go'
+
+    def go_cover_dump(self, nf: Optional[str] = None) -> bool:
+        """SIGUSR2 the running -cover NF so it flushes counters to GOCOVERDIR.
+
+        The NF process name is '<nf>_cover'.  free5GC NFs usually run as root
+        (started via sudo), so a same-user os.kill may be denied — fall back to
+        passwordless `sudo -n kill`.
+        """
+        import signal as _signal
+        nf = (nf or self._primary_nf).lower()
+        proc = f'{nf}_cover'
+        try:
+            out = subprocess.run(['pgrep', '-x', proc],
+                                 capture_output=True, text=True, timeout=3)
+            if out.returncode != 0 or not out.stdout.strip():
+                return False
+            pid = out.stdout.strip().split('\n')[0]
+            try:
+                os.kill(int(pid), _signal.SIGUSR2)
+                return True
+            except PermissionError:
+                r = subprocess.run(['sudo', '-n', 'kill', '-USR2', pid],
+                                   capture_output=True, timeout=5)
+                return r.returncode == 0
+        except Exception:
+            return False
+
+    def go_cover_new_lines(self,
+                           dump_first: bool = True,
+                           wait_ms: int = 120,
+                           eval_every: int = 1) -> List[str]:
+        """Return coverage blocks newly covered since campaign start.
+
+        Mirrors gcov_new_lines: campaign-scoped cumulative set, SIGUSR2 dump +
+        `go tool covdata textfmt` read, rate-limited by eval_every.  Returns the
+        list of newly-covered block ids (file:sLine.sCol,eLine.eCol).
+        """
+        if not self._go_cover_dir:
+            return []
+
+        # Cheap path on non-eval steps: do nothing at all.  Counters are
+        # cumulative in the process, so a single fresh dump right before each
+        # covdata read captures everything — intermediate per-step dumps (each a
+        # pgrep + sudo-kill) are pure overhead and are skipped.
+        self._go_cover_eval_counter += 1
+        if self._go_cover_eval_counter % eval_every != 0:
+            return []
+
+        # Eval step: dump a fresh cumulative snapshot, let it land, then read.
+        if dump_first:
+            self.go_cover_dump()
+            if wait_ms > 0:
+                time.sleep(wait_ms / 1000.0)
+
+        try:
+            covered = self._go_cover_read_covered()
+        except Exception:
+            return []
+
+        newly: List[str] = []
+        for unit in covered:
+            if unit not in self._go_cover_coverage:
+                self._go_cover_coverage.add(unit)
+                newly.append(unit)
+        return newly
+
+    def _go_cover_read_covered(self) -> List[str]:
+        """Run `go tool covdata textfmt` and return block ids with count > 0.
+
+        Counters are cumulative per process (atomic mode), so the newest snapshot
+        already contains all hits.  After reading we delete the consumed
+        covcounters files (keeping covmeta) so covdata stays fast as the campaign
+        accumulates dumps.
+        """
+        import glob as _glob
+        import tempfile
+        d = self._go_cover_dir
+        if not _glob.glob(os.path.join(d, 'covmeta.*')):
+            return []
+        if not _glob.glob(os.path.join(d, 'covcounters.*')):
+            return []
+
+        fd, prof = tempfile.mkstemp(suffix='.txt', prefix='gocov_')
+        os.close(fd)
+        try:
+            r = subprocess.run(
+                [self._go_bin(), 'tool', 'covdata', 'textfmt',
+                 f'-i={d}', f'-o={prof}'],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0:
+                return []
+            covered = self._parse_go_profile(prof)
+            # Drop consumed counter files (keep meta); next dump rewrites cumulative.
+            for f in _glob.glob(os.path.join(d, 'covcounters.*')):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+            return covered
+        finally:
+            try:
+                os.unlink(prof)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _parse_go_profile(path: str) -> List[str]:
+        """Parse a `go tool covdata textfmt` profile; return covered block ids.
+
+        Format per line: `file.go:sLine.sCol,eLine.eCol numStmts count`.
+        A block is covered iff count > 0.  The `file:range` is the unique id.
+        """
+        covered: List[str] = []
+        try:
+            with open(path) as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith('mode:'):
+                        continue
+                    # rightmost two space-separated fields are numStmts and count
+                    parts = line.rsplit(' ', 2)
+                    if len(parts) != 3:
+                        continue
+                    block_id, _stmts, count = parts
+                    try:
+                        if int(count) > 0:
+                            covered.append(block_id)
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+        return covered
+
+    def go_cover_campaign_reset(self) -> None:
+        """Clear the cumulative Go-coverage set at the start of a campaign."""
+        self._go_cover_coverage.clear()
+        self._go_cover_eval_counter = 0
+
+    @property
+    def go_cover_count(self) -> int:
+        """Number of distinct Go coverage blocks covered so far this campaign."""
+        return len(self._go_cover_coverage)

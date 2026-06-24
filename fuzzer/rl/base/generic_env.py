@@ -8,12 +8,13 @@ It combines semantic mutations, payload injection, and state machine attacks.
 
 import json
 import os
+import ssl
 import sys
 import random
 import socket
 import time
 import logging
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 
 import numpy as np
 
@@ -138,10 +139,16 @@ class GenericFuzzEnv(gym.Env):
         recv_timeout: float = 0.5,   # per-message recv timeout (seconds)
         connect_timeout: float = 3.0,  # SCTP/TCP connect timeout (seconds)
         inter_step_delay: float = 0.0,  # sleep between actions (seconds); helps with SCTP backlog
-        crash_dir: str = "fuzzer/data/crashes",  # directory to save crash-inducing PDU bytes
+        crash_dir: str = "fuzzer/data/crashes",   # directory to save crash-inducing PDU bytes
+        hang_dir: str = "fuzzer/data/hangs",      # directory to save hang-inducing PDU bytes
+        memleak_dir: str = "fuzzer/data/memory_leaks",  # directory to save memory-leak sequences
         persistent_conn: bool = False,  # reuse one SCTP association per episode
         scenario_filter: Optional[List[str]] = None,  # restrict to named scenarios
         api_filter: Optional[str] = None,  # restrict to message/scenario name prefix
+        seq_reward: bool = True,    # reward novel per-step states + state trajectories
+        anneal_steps: Optional[int] = None,  # horizon for setup-mutation explore→exploit
+        no_spec_mutations: bool = False,   # ablation: drop 3GPP-spec-derived actions
+        no_stateful_chains: bool = False,  # ablation: drop producer→consumer chaining
     ):
         super().__init__()
 
@@ -154,9 +161,45 @@ class GenericFuzzEnv(gym.Env):
         self.connect_timeout = connect_timeout
         self.inter_step_delay = inter_step_delay
         self.crash_dir = crash_dir
+        self.hang_dir = hang_dir
+        self.memleak_dir = memleak_dir
         self.persistent_conn = persistent_conn
+
+        # Periodic RSS check: track total steps and last save per NF to avoid
+        # flooding the corpus with memory-growth entries on every check interval.
+        self._total_steps: int = 0
+        self._memleak_signatures: Dict[str, int] = {}  # nf_label → save count
         self.scenario_filter = scenario_filter  # exact scenario names to include
         self.api_filter = api_filter            # message/scenario name prefix to include
+
+        # ── Ablation toggles (RQ2) ─────────────────────────────────────────────
+        # no_spec_mutations  : drop actions synthesized from the parsed 3GPP OpenAPI
+        #   spec — the 'semantic' category (spec semantic-field × spec-mutator value)
+        #   and 'seq_mutation' (spec field values inside a sequence). Hand-crafted /
+        #   schema actions (scenario, body_fuzz, payload, state) are retained.
+        # no_stateful_chains : drop producer→consumer chaining — the seq_payload /
+        #   seq_mutation / state / combo categories AND any scenario whose
+        #   setup_messages are non-empty (a create→operate chain). Single-shot
+        #   scenarios (empty setup_messages) and body_fuzz/payload are retained.
+        self.no_spec_mutations: bool = no_spec_mutations
+        self.no_stateful_chains: bool = no_stateful_chains
+
+        # ── Sequence-of-states reward (depth signal, independent of gcov) ──────
+        # A per-step state token = (msg_type, response_type, problem_cause,
+        # log_signature).  A trajectory = the tuple of tokens for one action's
+        # message sequence.  Novel tokens and novel trajectories are rewarded so
+        # the agent is steered toward reaching new sequences of server states
+        # (e.g. created→internal_server_error) rather than the 400 wall.
+        self.seq_reward: bool = seq_reward
+        self._seen_state_tokens: set = set()
+        self._seen_trajectories: set = set()
+        # ── Annealed setup-step mutation (explore→exploit) ────────────────────
+        # exploit_fraction = total_steps / anneal_steps, clamped to [0,1].  Early
+        # training mutates setup steps with full-malformed values (explore error
+        # paths); late training keeps them valid-but-hostile so the chain still
+        # creates the resource and the consumer reaches deep state.
+        self._anneal_steps: int = anneal_steps if (anneal_steps and anneal_steps > 0) else 0
+        self._exploit_fraction: float = 0.0
 
         # Persistent connection state (used when persistent_conn=True)
         self._sock: Optional[socket.socket] = None
@@ -184,9 +227,24 @@ class GenericFuzzEnv(gym.Env):
         self._last_action_record: Optional[Dict[str, Any]] = None
         self._prev_action_record: Optional[Dict[str, Any]] = None
 
-        # Crash deduplication: map crash_signature → number of times seen.
-        # Only the first occurrence of each unique signature is saved to disk.
-        self._crash_signatures: Dict[str, int] = {}
+        # Crash deduplication: (sig, trigger_category) → save count.
+        # Different trigger paths reaching the same crash signature are each
+        # saved once, so the corpus captures path diversity.  A per-signature
+        # total cap (_MAX_SAVES_PER_SIG) prevents infinite farming when the
+        # agent learns to repeatedly hit one bug.
+        _MAX_SAVES_PER_SIG = 5
+        self._MAX_SAVES_PER_SIG = _MAX_SAVES_PER_SIG
+        self._crash_signatures: Dict[Tuple[str, str], int] = {}  # (sig, category) → count
+        self._crash_sig_totals: Dict[str, int] = {}              # sig → total saved
+
+        # Hang deduplication: same logic as crashes.
+        self._hang_signatures: Dict[Tuple[str, str], int] = {}
+        self._hang_sig_totals: Dict[str, int] = {}
+
+        # Recovered-panic signatures already counted (process stayed alive, so the
+        # process-liveness crash path never sees them).  Dedup so a panic whose log
+        # lines linger in the tail window is counted/saved once, not farmed.
+        self._seen_panic_sigs: Set[str] = set()
 
         # Build action space based on mode
         self._build_action_space()
@@ -213,6 +271,7 @@ class GenericFuzzEnv(gym.Env):
             'crashes': 0,
             'successes': 0,
             'errors': 0,
+            'response_types': {},   # rtype → count, e.g. {'not_found': 782}
         }
 
         # Statistics
@@ -290,7 +349,8 @@ class GenericFuzzEnv(gym.Env):
         # ── seq_payload: invalid sequence + payload injection ─────────────
         # These are the highest-value actions: deep AMF state reached via the
         # sequence, then the payload triggers NAS-decoder / pkbuf errors.
-        if self.mode in ("aggressive", "hybrid") and invalid_states and payload_targets:
+        if (self.mode in ("aggressive", "hybrid") and invalid_states and payload_targets
+                and not self.no_stateful_chains):
             for state in invalid_states:
                 for target in payload_targets:
                     for ptype in priority_ptypes:
@@ -308,7 +368,10 @@ class GenericFuzzEnv(gym.Env):
         # ── seq_mutation: invalid sequence + semantic field mutation ───────
         # Boundary / invalid field values inside a real AMF session reach
         # gmm-handler / NAS decoder instead of being rejected at setup stage.
-        if self.mode in ("semantic", "hybrid") and invalid_states and semantic_fields:
+        # seq_mutation is BOTH spec-derived (semantic-field boundary values) AND
+        # stateful (inside an invalid sequence) — drop it if either is ablated.
+        if (self.mode in ("semantic", "hybrid") and invalid_states and semantic_fields
+                and not self.no_spec_mutations and not self.no_stateful_chains):
             for state in invalid_states:
                 for field_def in semantic_fields:
                     boundary_vals = field_def.boundary_values or []
@@ -324,7 +387,7 @@ class GenericFuzzEnv(gym.Env):
                         ))
 
         # ── state: sequence-only actions ───────────────────────────────────
-        if self.mode in ("state", "hybrid"):
+        if self.mode in ("state", "hybrid") and not self.no_stateful_chains:
             for transition in state_transitions:
                 self.actions.append((
                     "state",
@@ -336,7 +399,7 @@ class GenericFuzzEnv(gym.Env):
         # which AMF rejected with "No GlobalRANNodeID" before the mutation
         # reached its target.  Now sends the full context sequence so the
         # mutation lands in the correct AMF state.
-        if self.mode in ("semantic", "hybrid"):
+        if self.mode in ("semantic", "hybrid") and not self.no_spec_mutations:
             for field_def in semantic_fields:
                 values = self.adapter.get_mutation_values(field_def.name)
                 for val in values:
@@ -371,7 +434,10 @@ class GenericFuzzEnv(gym.Env):
 
         # ── combo: field mutation + invalid state sequence ─────────────────
         # Expanded: all invalid sequences (was: only top-3).
-        if self.mode == "hybrid" and semantic_fields and invalid_states:
+        # combo mixes a spec semantic-field mutation with an invalid sequence —
+        # drop it if either spec mutations or stateful chaining is ablated.
+        if (self.mode == "hybrid" and semantic_fields and invalid_states
+                and not self.no_spec_mutations and not self.no_stateful_chains):
             for field_def in semantic_fields[:3]:
                 for val in self.adapter.get_mutation_values(field_def.name)[:3]:
                     for state in invalid_states:          # all invalid, not top-3
@@ -393,6 +459,18 @@ class GenericFuzzEnv(gym.Env):
         scenarios = [s for s in self.adapter.get_scenarios() if _scenario_matches(s)]
         if scenarios:
             for scenario in scenarios:
+                # Ablation gates (RQ2):
+                #  - spec-mined scenarios are named 'specsem_*' (omit-required /
+                #    field-value mutations auto-generated from the parsed 3GPP spec);
+                #    drop them when spec mutations are ablated. 'fivgee_*' (schema
+                #    catalog) and hand-crafted scenarios are retained.
+                #  - a scenario with non-empty setup_messages (or stateful=True) is a
+                #    producer→consumer chain; drop it when chaining is ablated.
+                if self.no_spec_mutations and scenario.name.startswith("specsem"):
+                    continue
+                if self.no_stateful_chains and (scenario.setup_messages
+                                                or getattr(scenario, "stateful", False)):
+                    continue
                 # One action per relevant field × mutation value
                 for fname in (scenario.relevant_fields or []):
                     for val in self.adapter.get_mutation_values(fname):
@@ -405,6 +483,7 @@ class GenericFuzzEnv(gym.Env):
                                 "fuzz_message":   scenario.fuzz_message,
                                 "field":          fname,
                                 "value":          val,
+                                "stateful":       scenario.stateful,
                             }
                         ))
                 # One action per payload target (body injection) using
@@ -421,6 +500,7 @@ class GenericFuzzEnv(gym.Env):
                                     "fuzz_message":   scenario.fuzz_message,
                                     "target":         target.name,
                                     "payload_type":   ptype,
+                                    "stateful":       scenario.stateful,
                                 }
                             ))
 
@@ -539,6 +619,7 @@ class GenericFuzzEnv(gym.Env):
         # payload      — payload in valid sequence (messages pre-computed).
         # combo        — field mutation + invalid sequence.
 
+        setup_anneal = False   # stateful scenarios anneal setup-step mutations
         try:
             if action_type == "seq_payload":
                 payload_type = action_params["payload_type"]
@@ -622,6 +703,7 @@ class GenericFuzzEnv(gym.Env):
                         messages.append(f'__baseline__:{_sm}')
                 messages.append(action_params["fuzz_message"])
                 info["sequence"] = action_params.get("scenario", "scenario")
+                setup_anneal = bool(action_params.get("stateful", False))
 
             else:
                 valid_transitions = [t for t in self.adapter.get_state_transitions() if t.is_valid]
@@ -629,7 +711,7 @@ class GenericFuzzEnv(gym.Env):
                             else self.adapter.get_message_types()[:1])
 
             # Execute the message sequence
-            reward, exec_info = self._send_sequence(messages)
+            reward, exec_info = self._send_sequence(messages, setup_anneal=setup_anneal)
             info.update(exec_info)
 
         finally:
@@ -640,7 +722,8 @@ class GenericFuzzEnv(gym.Env):
 
         return reward, info
 
-    def _send_sequence(self, message_types: List[str]) -> Tuple[float, Dict[str, Any]]:
+    def _send_sequence(self, message_types: List[str],
+                       setup_anneal: bool = False) -> Tuple[float, Dict[str, Any]]:
         """Send a sequence of messages and return reward + info.
 
         Supports two connection modes:
@@ -680,32 +763,57 @@ class GenericFuzzEnv(gym.Env):
         fuzz_fields  = {**baseline_fields, **self.current_fields}
         fuzz_payloads = {k: v for k, v in self.current_payloads.items() if v is not None}
 
-        built_messages: List[Tuple[str, bytes]] = []
-        for msg_type in message_types:
-            if msg_type.startswith('__baseline__:'):
-                real_type = msg_type[len('__baseline__:'):]
+        # Build each step.  We retain the original (possibly prefixed) message
+        # type alongside the resolved real type so the send loop can, for
+        # multi-message sequences, rebuild a downstream step once a real
+        # resource id has been captured from an earlier create (lazy id
+        # propagation).  Single-message actions keep the original behaviour.
+        # Annealed setup mutation: for stateful scenarios, decide once per
+        # sequence whether setup (producer) steps are mutated to malformed bodies
+        # (explore error paths) or left valid (exploit → resource is created and
+        # the consumer can reach deep state).  P(malformed) = 1 - exploit_fraction
+        # so training shifts from exploration early to exploitation late.
+        explore_setup = False
+        if setup_anneal and self._anneal_steps > 0:
+            self._exploit_fraction = min(1.0, self._total_steps / self._anneal_steps)
+            explore_setup = random.random() > self._exploit_fraction
+
+        def _build_step(orig_type: str) -> Optional[Tuple[str, str, bytes]]:
+            if orig_type.startswith('__baseline__:'):
+                real_type = orig_type[len('__baseline__:'):]
+                setup_payloads: Dict[str, bytes] = {}
+                if explore_setup:
+                    # Malformed body on the setup step (exploration). build_message
+                    # for spec ops uses payloads['json_body'] verbatim as the body.
+                    setup_payloads = {'json_body':
+                                      random.choice(GENERIC_PAYLOADS['json_injection'])}
                 message = self.adapter.build_message(
-                    message_type=real_type,
-                    fields=baseline_fields,
-                    payloads={},
-                )
-                if message:
-                    built_messages.append((real_type, message))
+                    message_type=real_type, fields=baseline_fields,
+                    payloads=setup_payloads)
             else:
+                real_type = orig_type
                 message = self.adapter.build_message(
-                    message_type=msg_type,
-                    fields=fuzz_fields,
-                    payloads=fuzz_payloads,
-                )
-                if message:
-                    built_messages.append((msg_type, message))
+                    message_type=real_type, fields=fuzz_fields, payloads=fuzz_payloads)
+            return (orig_type, real_type, message) if message else None
+
+        # built_messages: list of (orig_type, real_type, bytes)
+        built_messages: List[Tuple[str, str, bytes]] = []
+        for msg_type in message_types:
+            step = _build_step(msg_type)
+            if step:
+                built_messages.append(step)
+        lazy = len(built_messages) > 1   # only multi-step sequences rebuild
 
         # Rotate records: prev ← last, then record the current action.
         self._prev_action_record = self._last_action_record
         self._last_action_record = {
             "fields": dict(self.current_fields),
-            "messages": [(mt, data.hex()) for mt, data in built_messages],
+            "messages": [(rt, data.hex()) for _ot, rt, data in built_messages],
         }
+
+        # Per-step state tokens accumulate into a trajectory for the
+        # sequence-of-states reward computed after the loop.
+        state_trajectory: List[tuple] = []
 
         # In persistent mode, reuse self._sock; in ephemeral mode use a local sock
         own_sock = not self.persistent_conn   # whether we close the socket after use
@@ -718,6 +826,7 @@ class GenericFuzzEnv(gym.Env):
                 sock.settimeout(self.connect_timeout)
                 try:
                     sock.connect((self.target_host, self.target_port))
+                    sock = self._tls_upgrade(sock, self.target_host, conn_params)
                     # Successful connect: server is (back) up
                     self._server_known_down = False
                 except socket.timeout:
@@ -739,6 +848,11 @@ class GenericFuzzEnv(gym.Env):
                         elif info.get("hang"):
                             total_reward += 20.0
                             self._server_known_down = True
+                            self._save_hang_corpus(
+                                info,
+                                trigger=self._prev_action_record,
+                                detection=self._last_action_record,
+                            )
                         else:
                             # Transient — small signal
                             total_reward += 5.0
@@ -765,6 +879,11 @@ class GenericFuzzEnv(gym.Env):
                         elif info.get("hang"):
                             total_reward += 20.0
                             self._server_known_down = True
+                            self._save_hang_corpus(
+                                info,
+                                trigger=self._prev_action_record,
+                                detection=self._last_action_record,
+                            )
                     self.response_history.append(info["response"])
                     self._close_sock(sock)
                     if self.persistent_conn:
@@ -779,7 +898,7 @@ class GenericFuzzEnv(gym.Env):
             # Skip if the action sequence already starts with ng_setup — sending
             # two NGSetups on the same association causes AMF to reset it.
             if self.persistent_conn and not self._association_ready:
-                first_msg = built_messages[0][0] if built_messages else ''
+                first_msg = built_messages[0][1] if built_messages else ''
                 if first_msg == 'ng_setup':
                     # The sequence will send NGSetup itself; mark ready so we
                     # don't double-send after the sequence completes.
@@ -788,13 +907,28 @@ class GenericFuzzEnv(gym.Env):
                     self._do_ng_setup(sock, conn_params)
 
             # Send each message in sequence.
-            # built_messages[i] is a (msg_type, bytes) pair.  The final message
+            # built_messages[i] is an (orig_type, msg_type, bytes) tuple.  The final message
             # in the list is always the fuzz target; earlier messages are setup
             # steps whose reward contribution we deliberately skip so the agent
             # only gets credit for the targeted API response.
             fuzz_idx = len(built_messages) - 1
-            for step_i, (msg_type, message) in enumerate(built_messages):
+            for step_i, (orig_type, msg_type, message) in enumerate(built_messages):
                 is_setup = step_i < fuzz_idx and len(built_messages) > 1
+
+                # Lazy id propagation: for multi-step sequences, if an earlier
+                # create captured a real resource id (into fuzz_fields), rebuild
+                # this step now so its path resolves to the real resource rather
+                # than the synthetic id baked in at up-front build time.  Only
+                # fuzz-field steps (the fuzz target and 'fuzz:'-origin setups)
+                # consume __location_id__; baseline steps are left untouched.
+                if (lazy and step_i > 0
+                        and not orig_type.startswith('__baseline__:')
+                        and fuzz_fields.get('__location_id__')):
+                    rebuilt = self.adapter.build_message(
+                        message_type=msg_type, fields=fuzz_fields,
+                        payloads=fuzz_payloads)
+                    if rebuilt:
+                        message = rebuilt
 
                 # HTTP/2 uses one request per connection (include_preface=True on
                 # every build_message).  Sending a second preface on an established
@@ -808,6 +942,7 @@ class GenericFuzzEnv(gym.Env):
                     sock.settimeout(self.connect_timeout)
                     try:
                         sock.connect((self.target_host, self.target_port))
+                        sock = self._tls_upgrade(sock, self.target_host, conn_params)
                     except (socket.timeout, ConnectionRefusedError) as e:
                         info["response"] = "reconnect_failed"
                         logger.debug("Scenario reconnect failed at step %d: %s", step_i, e)
@@ -846,6 +981,27 @@ class GenericFuzzEnv(gym.Env):
                     info["response"] = rtype
                     info["response_time_ms"] = resp_time
 
+                    # Capture the real resource id from a create so the next
+                    # step's path targets the resource that was just created.
+                    rid = parsed.get("resource_id")
+                    if rid:
+                        fuzz_fields['__location_id__'] = rid
+
+                    # Build this step's state token for the sequence-of-states
+                    # reward.  Components: message type, response type, problem
+                    # cause (RFC 7807), and the source file:line log signature.
+                    if self.seq_reward:
+                        log_sig = None
+                        _sig_fn = getattr(self.adapter, 'step_log_signature', None)
+                        if _sig_fn and log_snap:
+                            try:
+                                log_sig = _sig_fn(log_snap)
+                            except Exception:
+                                log_sig = None
+                        state_trajectory.append((
+                            msg_type, rtype, parsed.get("problem_cause"), log_sig,
+                        ))
+
                     # Log setup failures so scenario health is visible.
                     if is_setup and not parsed.get("success") and rtype not in (
                             "closed", "connect_timeout", "refused"):
@@ -871,8 +1027,48 @@ class GenericFuzzEnv(gym.Env):
                         if parsed.get("success"):
                             self.counters["successes"] += 1
 
+                        # Track response type distribution for diagnostics
+                        rt = self.counters["response_types"]
+                        rt[rtype] = rt.get(rtype, 0) + 1
+                        logger.debug("response: %s  status=%s  reward=%.1f  t=%.0fms",
+                                     rtype, parsed.get("status"), reward, resp_time)
+
+                        # Recovered-panic detection: a panic logged with the process
+                        # still alive (e.g. free5GC's gin Recovery middleware) is a
+                        # real crash-class finding that the process-liveness check
+                        # below never sees.  Count + save the first occurrence of each
+                        # distinct signature; the +150 reward sits below the 200 for a
+                        # full process crash.
+                        _panic_fn = getattr(self.adapter, 'detect_log_panic', None)
+                        if log_snap and _panic_fn:
+                            try:
+                                psig = _panic_fn(log_snap)
+                            except Exception:
+                                psig = None
+                            if psig and psig not in self._seen_panic_sigs:
+                                self._seen_panic_sigs.add(psig)
+                                info["crash"] = True
+                                info["crash_type"] = "recovered_panic"
+                                self.counters["crashes"] += 1
+                                total_reward += 150.0
+                                logger.warning(
+                                    "Recovered panic (process alive) on action '%s': %s",
+                                    msg_type, psig[:160])
+                                self._save_crash_corpus(
+                                    info,
+                                    trigger=self._last_action_record,
+                                    detection=self._last_action_record,
+                                )
+
                     if not resp_data:
                         break  # connection gone, stop sequence
+
+                    # After a GOAWAY or RST_STREAM the server has torn down the
+                    # connection.  A short pause before the next reconnect avoids
+                    # a burst of rapid TCP connect/disconnect cycles that can cause
+                    # TIME_WAIT accumulation and server-log spam.
+                    if rtype in ("goaway", "rst_stream") and self.inter_step_delay == 0.0:
+                        time.sleep(0.05)
 
                 except socket.timeout:
                     info["responses"].append({
@@ -887,6 +1083,7 @@ class GenericFuzzEnv(gym.Env):
                     # Only award when the server is not already known to be down.
                     if not self._server_known_down:
                         total_reward += 15.0
+                        self._save_hang_corpus(info, trigger=self._last_action_record)
                     # Persistent socket that timed out is likely broken — reset it
                     if self.persistent_conn:
                         self._close_sock(sock)
@@ -941,7 +1138,10 @@ class GenericFuzzEnv(gym.Env):
         # Save crash corpus when crash confirmed (ConnectionResetError path).
         # The PREVIOUS action is the most likely trigger; the CURRENT action
         # is the one that first observed the TCP RST (detection).
-        if info.get("crash") and self._last_action_record:
+        # Recovered panics are saved inline above (synchronous, correct trigger) —
+        # skip them here to avoid a duplicate save with the wrong (prev) trigger.
+        if (info.get("crash") and info.get("crash_type") != "recovered_panic"
+                and self._last_action_record):
             self._save_crash_corpus(
                 info,
                 trigger=self._prev_action_record,
@@ -950,6 +1150,26 @@ class GenericFuzzEnv(gym.Env):
 
         if self.inter_step_delay > 0:
             time.sleep(self.inter_step_delay)
+
+        # ── Sequence-of-states reward (depth signal, gcov-independent) ────────
+        # Reward novel per-step state tokens (a server state never reached
+        # before) and, more strongly, novel full trajectories (a new sequence of
+        # states, e.g. created→internal_server_error vs created→bad_request).
+        if self.seq_reward and state_trajectory:
+            for tok in state_trajectory:
+                if tok not in self._seen_state_tokens:
+                    self._seen_state_tokens.add(tok)
+                    total_reward += 15.0
+            traj_sig = tuple(state_trajectory)
+            if traj_sig not in self._seen_trajectories:
+                self._seen_trajectories.add(traj_sig)
+                # Only reward multi-step trajectories as "deep state"; a single
+                # token's novelty is already covered above.
+                if len(state_trajectory) > 1:
+                    total_reward += 40.0
+            info["state_trajectory"] = [
+                (mt, rt) for (mt, rt, _pc, _ls) in state_trajectory
+            ]
 
         self.response_history.append(info["response"])
         return total_reward, info
@@ -960,7 +1180,17 @@ class GenericFuzzEnv(gym.Env):
         sock_type = conn_params.get('socket_type', 'tcp')
         _IPPROTO_SCTP = 132
         if sock_type == 'udp':
-            return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            local_port = conn_params.get('udp_local_port')
+            if local_port:
+                # Bind to a fixed local port so all packets from this fuzzer
+                # appear as the same UDP peer — prevents PFCP/GTP-U node pool
+                # exhaustion when the target tracks peers by (IP, port).
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, 'SO_REUSEPORT'):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                sock.bind(('', local_port))
+            return sock
         elif sock_type == 'sctp':
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, _IPPROTO_SCTP)
             _SCTP_NODELAY = getattr(socket, 'SCTP_NODELAY', 3)
@@ -971,6 +1201,18 @@ class GenericFuzzEnv(gym.Env):
             if conn_params.get('tcp_nodelay'):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return sock
+
+    @staticmethod
+    def _tls_upgrade(sock: socket.socket, host: str, conn_params: dict) -> socket.socket:
+        """Wrap an already-connected TCP socket with TLS (skip cert verification)."""
+        if not conn_params.get('use_tls'):
+            return sock
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        # Advertise h2 via ALPN so the server switches to HTTP/2 framing
+        ctx.set_alpn_protocols(['h2'])
+        return ctx.wrap_socket(sock, server_hostname=host)
 
     @staticmethod
     def _close_sock(sock: Optional[socket.socket]):
@@ -995,19 +1237,30 @@ class GenericFuzzEnv(gym.Env):
         """
         try:
             # ── Crash signature & deduplication ───────────────────────────────
-            # Ask the monitor for the FATAL assertion text; use it as a dedup key
-            # so only the first instance of each unique root-cause is saved.
             monitor = getattr(self.adapter, '_monitor', None)
             sig  = monitor.get_crash_signature() if monitor else 'unknown'
             logs = monitor.get_stack_trace()      if monitor else []
 
-            count = self._crash_signatures.get(sig, 0) + 1
-            self._crash_signatures[sig] = count
-            if count > 1:
+            trig = trigger or self._last_action_record or {}
+            category = self._trigger_category(trig)
+            key = (sig, category)
+
+            count_key = self._crash_signatures.get(key, 0) + 1
+            self._crash_signatures[key] = count_key
+            count_sig = self._crash_sig_totals.get(sig, 0) + 1
+            self._crash_sig_totals[sig] = count_sig
+
+            if count_key > 1:
                 logger.warning(
                     "Duplicate crash skipped (sig=%r, seen=%d×). "
                     "Use replay_crash.py on the first saved corpus to reproduce.",
-                    sig, count,
+                    sig, count_sig,
+                )
+                return
+            if count_sig > self._MAX_SAVES_PER_SIG:
+                logger.warning(
+                    "Crash sig cap reached (sig=%r, total=%d saves). Skipping.",
+                    sig, count_sig,
                 )
                 return
 
@@ -1015,7 +1268,6 @@ class GenericFuzzEnv(gym.Env):
             ts = int(time.time() * 1000)
             path = os.path.join(self.crash_dir, f"crash_{ts}.json")
 
-            trig = trigger or self._last_action_record or {}
             trig_msgs = trig.get("messages", [])
 
             record: Dict[str, Any] = {
@@ -1069,6 +1321,137 @@ class GenericFuzzEnv(gym.Env):
             )
         except Exception as e:
             logger.error("Failed to save crash corpus: %s", e)
+
+    @staticmethod
+    def _trigger_category(action_record: Dict[str, Any]) -> str:
+        """Derive a stable category string from the first message type of an action.
+
+        Strips numeric suffixes from spec scenario names so that
+        'specsem_val_PostPduSessions_22' and 'specsem_val_PostPduSessions_5'
+        are treated as the same category but 'smf_ctx_create' stays distinct.
+        """
+        msgs = action_record.get("messages", [])
+        if not msgs:
+            return "unknown"
+        first = msgs[0]
+        mtype = first[0] if isinstance(first, (list, tuple)) else str(first)
+        parts = mtype.rsplit('_', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0]
+        return mtype
+
+    def _save_hang_corpus(
+        self,
+        info: Dict[str, Any],
+        trigger: Optional[Dict[str, Any]] = None,
+        detection: Optional[Dict[str, Any]] = None,
+    ):
+        """Save the hang-triggering input to fuzzer/data/hangs/ for later reproduction."""
+        try:
+            monitor = getattr(self.adapter, '_monitor', None)
+            logs = monitor.get_stack_trace() if monitor else []
+            # Use the most recent server error as hang signature, fall back to detection mode.
+            sig = logs[-1].strip() if logs else f"hang:{info.get('response','timeout')}"
+
+            trig = trigger or self._last_action_record or {}
+            category = self._trigger_category(trig)
+            key = (sig[:120], category)
+
+            count_key = self._hang_signatures.get(key, 0) + 1
+            self._hang_signatures[key] = count_key
+            count_sig = self._hang_sig_totals.get(sig[:120], 0) + 1
+            self._hang_sig_totals[sig[:120]] = count_sig
+
+            if count_key > 1:
+                logger.warning("Duplicate hang skipped (sig=%r, seen=%d×).", sig[:80], count_sig)
+                return
+            if count_sig > self._MAX_SAVES_PER_SIG:
+                logger.warning("Hang sig cap reached (sig=%r, total=%d). Skipping.", sig[:60], count_sig)
+                return
+
+            os.makedirs(self.hang_dir, exist_ok=True)
+            ts = int(time.time() * 1000)
+            path = os.path.join(self.hang_dir, f"hang_{ts}.json")
+
+            trig_msgs = trig.get("messages", [])
+            record: Dict[str, Any] = {
+                "timestamp": ts,
+                "target": f"{self.target_host}:{self.target_port}",
+                "protocol": self.adapter.protocol_name,
+                "detection": info.get("response", "timeout"),
+                "hang_signature": sig,
+                "stack_trace": logs,
+                "hang_trigger": {
+                    "fields": trig.get("fields", {}),
+                    "messages": trig_msgs,
+                    "decoded": self._decode_messages(trig_msgs),
+                },
+            }
+            if detection and detection is not trig:
+                det_msgs = detection.get("messages", [])
+                record["detection_action"] = {
+                    "fields": detection.get("fields", {}),
+                    "messages": det_msgs,
+                    "decoded": self._decode_messages(det_msgs),
+                }
+            with open(path, "w") as f:
+                json.dump(record, f, indent=2)
+            logger.warning(
+                "HANG CORPUS saved: %s  (sig=%r  trigger=%s)",
+                path, sig[:80], [m for m, _ in trig_msgs],
+            )
+        except Exception as e:
+            logger.error("Failed to save hang corpus: %s", e)
+
+    def _save_memleak_corpus(self, rss_msg: str):
+        """Save the current action sequence when significant RSS growth is observed.
+
+        Called every RSS_CHECK_INTERVAL steps when the adapter reports growth.
+        Saved to fuzzer/data/memory_leaks/ — replay with replay_crash.py to
+        reproduce and confirm the leak is request-driven rather than baseline growth.
+        """
+        try:
+            import re as _re
+            # Normalize: strip exact MB numbers so 'NRF RSS grew 343 MB (78 → 421 MB)'
+            # and 'NRF RSS grew 350 MB (78 → 428 MB)' both collapse to 'NRF RSS grew'.
+            # Keep just the NF name prefix as dedup key so we save at most 3
+            # representative samples per NF regardless of the exact growth amount.
+            nf_label = _re.sub(r'\s+RSS.*', '', rss_msg).strip() or rss_msg[:30]
+            sig = nf_label
+            count = self._memleak_signatures.get(sig, 0) + 1
+            self._memleak_signatures[sig] = count
+            if count > 3:
+                return  # already have enough leak samples for this NF
+
+            os.makedirs(self.memleak_dir, exist_ok=True)
+            ts = int(time.time() * 1000)
+            path = os.path.join(self.memleak_dir, f"memleak_{ts}.json")
+
+            trig = self._last_action_record or {}
+            trig_msgs = trig.get("messages", [])
+            record: Dict[str, Any] = {
+                "timestamp": ts,
+                "target": f"{self.target_host}:{self.target_port}",
+                "protocol": self.adapter.protocol_name,
+                "rss_growth": rss_msg,
+                "trigger": {
+                    "fields": trig.get("fields", {}),
+                    "messages": trig_msgs,
+                    "decoded": self._decode_messages(trig_msgs),
+                },
+            }
+            if self._prev_action_record:
+                prev_msgs = self._prev_action_record.get("messages", [])
+                record["preceding_action"] = {
+                    "fields": self._prev_action_record.get("fields", {}),
+                    "messages": prev_msgs,
+                    "decoded": self._decode_messages(prev_msgs),
+                }
+            with open(path, "w") as f:
+                json.dump(record, f, indent=2)
+            logger.warning("MEMLEAK CORPUS saved: %s  (%s)", path, rss_msg)
+        except Exception as e:
+            logger.error("Failed to save memleak corpus: %s", e)
 
     # ------------------------------------------------------------------
     # Crash corpus helpers
@@ -1260,6 +1643,11 @@ class GenericFuzzEnv(gym.Env):
             else:
                 logger.warning("SERVER HANG CONFIRMED: process alive but port "
                                "not responding (timeout)")
+            self._save_hang_corpus(
+                info,
+                trigger=self._prev_action_record,
+                detection=self._last_action_record,
+            )
         else:
             info["crash"] = True
             self.counters["crashes"] += 1
@@ -1318,6 +1706,10 @@ class GenericFuzzEnv(gym.Env):
             time.sleep(1.5)
             if self.adapter.check_health(self.target_host, self.target_port, timeout=2.0).is_healthy:
                 logger.info("Server healthy after restart.")
+                # Notify adapter so it can reset any auth state that depends on
+                # the server's restart (e.g. JWT signing-secret rotation).
+                if hasattr(self.adapter, 'notify_server_restarted'):
+                    self.adapter.notify_server_restarted()
                 return
         logger.warning("Server did not become healthy within 45s after restart.")
 
@@ -1468,9 +1860,27 @@ class GenericFuzzEnv(gym.Env):
             self.action_stats[action_key]["crashes"] += 1
 
         self.step_count += 1
+        self._total_steps += 1
+        # Emit a harness-parseable execution count every 100 cumulative steps. This
+        # is the SAME line the --random path prints, but driven from the env so it
+        # works for the RL path too — independent of SB3 rollout boundaries and of
+        # graceful shutdown (a SIGTERM/SIGKILL'd, crash-heavy run still leaves a count
+        # in the log). Without it, run_*_compare.sh scores RL runs at execs=0.
+        if self._total_steps % 100 == 0:
+            print(f"|    total_timesteps      | {self._total_steps:<11} |", flush=True)
         self.episode_reward += reward
         info["episode_reward"] = self.episode_reward
         info["current_fields"] = dict(self.current_fields)
+
+        # Periodic RSS check: every 50 steps, ask the adapter if memory has grown
+        # beyond the warning threshold and save a corpus entry if so.
+        _RSS_CHECK_INTERVAL = 50
+        if self._total_steps % _RSS_CHECK_INTERVAL == 0:
+            _rss_check = getattr(self.adapter, 'check_resource_growth', None)
+            if _rss_check:
+                rss_msg = _rss_check()
+                if rss_msg and not rss_msg.startswith('CRITICAL:'):
+                    self._save_memleak_corpus(rss_msg)
 
         truncated = self.step_count >= self.max_steps
         terminated = info.get("crash", False)

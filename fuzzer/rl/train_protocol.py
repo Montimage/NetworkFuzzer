@@ -93,8 +93,12 @@ Examples:
 
     # Protocol-specific options — SBI (HTTP/2 5G Service-Based Interface)
     parser.add_argument("--nf-type", type=str, default="NRF",
-                        choices=["NRF", "AMF", "SMF", "UDM", "UDR", "PCF", "AUSF"],
+                        choices=["NRF", "AMF", "SMF", "UDM", "UDR", "PCF", "AUSF", "BSF", "NSSF", "SCP"],
                         help="SBI: target NF type (default: NRF)")
+    parser.add_argument("--nf-types", nargs='+', metavar='NF',
+                        help="SBI: fuzz multiple NF types sequentially "
+                             "(e.g. --nf-types NRF SMF PCF). "
+                             "Each runs for --timesteps with its own saved model.")
     parser.add_argument("--nf-log", type=str, default="",
                         help="SBI: override NF log file path for crash/anomaly detection")
     parser.add_argument("--extra-nfs", type=str, default="",
@@ -107,6 +111,10 @@ Examples:
                         help="Fuzzing mode (default: hybrid)")
 
     # Training parameters
+    parser.add_argument("--random", action="store_true",
+                        help="RL-FREE baseline: select actions uniformly at random "
+                             "(no learning). Used with --api fivgee to reproduce a "
+                             "FivGeeFuzz-style schema fuzzer for comparison.")
     parser.add_argument("--algorithm", type=str, default="PPO",
                         choices=["DQN", "PPO"],
                         help="RL algorithm (default: PPO)")
@@ -118,6 +126,9 @@ Examples:
     # Output
     parser.add_argument("--model-out", type=str, default="fuzzer/data/models/rl_fuzzer",
                         help="Model output path")
+    parser.add_argument("--load-model", type=str, default=None,
+                        help="Path to a previously saved model to continue training from "
+                             "(e.g. fuzzer/data/models/rl_fuzzer). Omit the .zip extension.")
     parser.add_argument("--output-dir", type=str, default="fuzzer/data/pcap_output/rl_generated",
                         help="Output directory for generated traffic")
 
@@ -151,7 +162,7 @@ Examples:
 
     # Core selection
     parser.add_argument("--core", type=str, default="open5gs",
-                        choices=["open5gs", "free5gc"],
+                        choices=["open5gs", "free5gc", "ella"],
                         help="5G core implementation to target (default: open5gs)")
     parser.add_argument("--free5gc-dir", type=str, default=None,
                         help="Path to free5GC repo root for binary/log path "
@@ -165,6 +176,11 @@ Examples:
                         dest="gcov_src_dir",
                         help="Path to open5GS source root, used as gcovr --root. "
                              "Example: ~/open5gs  (default: parent of --gcov-gcda-dir)")
+    parser.add_argument("--go-cover-dir", type=str, default=None,
+                        dest="go_cover_dir",
+                        help="GOCOVERDIR of a running -cover free5GC/ella NF "
+                             "(enables Go coverage-guided reward). Auto-derived from "
+                             "/tmp/free5gc-*-cov/<nf> for --core free5gc when unset.")
 
     # Exploration
     parser.add_argument("--exploration-rate", type=float, default=0.15,
@@ -182,8 +198,78 @@ Examples:
                              "Lists available scenarios when used with --list-scenarios.")
     parser.add_argument("--list-scenarios", action="store_true",
                         help="Print all available scenario names for the chosen protocol and exit.")
+    parser.add_argument("--api-token", dest="api_token", type=str, default=None,
+                        help="Bearer token for ella_api protocol (JWT or API token).")
+    parser.add_argument("--learning-rate", dest="learning_rate", type=float, default=None,
+                        help="Override PPO/DQN learning rate (e.g. 0.0001). Default: 3e-4 for PPO.")
+    parser.add_argument("--max-spec-per-op", dest="max_spec_per_op", type=int, default=None,
+                        help="Cap spec scenarios per OpenAPI operation to reduce action-space size "
+                             "for NFs with many operations (e.g. UDM has 73 ops). "
+                             "Recommended: 4-8 for UDM/PCF, None (default) for NRF/AMF/SMF.")
+    parser.add_argument("--skip-probe", action="store_true", default=False,
+                        help="Skip spec endpoint discovery probe (use all spec ops from the spec file). "
+                             "Useful when the server isn't up yet or for offline analysis.")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Logging verbosity (DEBUG shows per-response status codes).")
+    parser.add_argument("--no-seq-reward", dest="seq_reward", action="store_false",
+                        default=True,
+                        help="Disable the sequence-of-states reward (novel per-step "
+                             "state tokens + novel state trajectories). On by default.")
+    # ── RQ2 ablation toggles ──────────────────────────────────────────────────
+    parser.add_argument("--no-spec-mutations", dest="no_spec_mutations",
+                        action="store_true", default=False,
+                        help="ABLATION: drop 3GPP-spec-derived actions — the "
+                             "'semantic' category and 'specsem_*' scenarios mined from "
+                             "the parsed OpenAPI spec. Hand-crafted and 'fivgee_*' "
+                             "schema actions are retained.")
+    parser.add_argument("--no-stateful-chains", dest="no_stateful_chains",
+                        action="store_true", default=False,
+                        help="ABLATION: drop producer→consumer chaining — the "
+                             "seq_payload/seq_mutation/state/combo categories and any "
+                             "scenario with setup_messages (stateful create→operate). "
+                             "Single-shot scenarios and body_fuzz are retained.")
+    parser.add_argument("--anneal-steps", dest="anneal_steps", type=int, default=None,
+                        help="Horizon for setup-step mutation explore→exploit anneal "
+                             "in stateful scenarios. Defaults to --timesteps. Early "
+                             "training mutates setup steps (explore error paths); late "
+                             "training keeps them valid so the resource is created.")
 
     args = parser.parse_args()
+
+    # Multi-NF sequential dispatch: re-invoke once per NF type as a subprocess
+    if getattr(args, 'nf_types', None):
+        import subprocess
+        # Strip --nf-types and its values from argv to build per-NF command
+        base_argv = []
+        skip = 0
+        for i, a in enumerate(sys.argv[1:], 1):
+            if skip:
+                skip -= 1
+                continue
+            if a == '--nf-types':
+                skip = len(args.nf_types)
+                continue
+            if a in args.nf_types and sys.argv[i - 1] == '--nf-types':
+                continue
+            base_argv.append(a)
+        total = len(args.nf_types)
+        for idx, nf in enumerate(args.nf_types, 1):
+            model_out = f"{args.model_out}_{nf.lower()}"
+            cmd = [sys.executable, '-m', 'fuzzer.rl.train_protocol',
+                   '--nf-type', nf, '--model-out', model_out] + base_argv
+            print(f"\n{'=' * 60}")
+            print(f"  NF {idx}/{total}: {nf}")
+            print(f"{'=' * 60}")
+            try:
+                subprocess.run(cmd, check=False)
+            except KeyboardInterrupt:
+                print(f"\nInterrupted — stopping after NF {nf} ({idx}/{total})")
+                break
+        return 0
+
+    # Apply log level before anything else so DEBUG output from imports is captured
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     # Import protocol adapter system
     from fuzzer.rl.base.protocol_adapter import get_protocol_adapter, list_protocols
@@ -215,12 +301,16 @@ Examples:
         },
         'free5gc': {
             'NRF': '127.0.0.10', 'AMF': '127.0.0.18', 'SMF': '127.0.0.2',
-            'UDR': '127.0.0.3',  'UDM': '127.0.0.4',  'AUSF': '127.0.0.9',
+            'UDR': '127.0.0.4',  'UDM': '127.0.0.3',  'AUSF': '127.0.0.9',
             'PCF': '127.0.0.7',  'BSF': '127.0.0.31', 'NSSF': '127.0.0.15',
             'CHF': '127.0.0.113',
         },
+        # ella-core: all NFs behind a single TLS API endpoint (port 5002)
+        'ella': {nf: '127.0.0.1' for nf in
+                 ('NRF', 'AMF', 'SMF', 'UDM', 'UDR', 'PCF', 'AUSF', 'BSF', 'NSSF')},
     }
-    _NGAP_AMF_HOST = {'open5gs': '127.0.0.5', 'free5gc': '127.0.0.18'}
+    _NGAP_AMF_HOST = {'open5gs': '127.0.0.5', 'free5gc': '127.0.0.18',
+                      'ella': '10.3.0.2'}
 
     # Auto-derive log paths before building adapters
     import glob as _glob
@@ -235,18 +325,22 @@ Examples:
         # Fall back to install path
         return f'/home/strongcourage/open5gs/install/var/log/open5gs/{nf_name}.log'
 
-    if args.protocol.lower() == 'ngap' and not args.amf_log:
+    if args.protocol.lower() in ('ngap', 'ngap_nas') and not args.amf_log:
         if args.core == 'free5gc':
             _ld = sorted(_glob.glob('/tmp/free5gc-*-logs'), reverse=True)
             args.amf_log = f'{_ld[0]}/amf.log' if _ld else '/tmp/free5gc-logs/amf.log'
+        elif args.core == 'ella':
+            args.amf_log = '/tmp/ella-logs/cored.log'
         else:
             args.amf_log = _find_open5gs_log('amf')
 
     if args.protocol.lower() == 'sbi' and not args.nf_log:
         if args.core == 'open5gs':
             args.nf_log = _find_open5gs_log(args.nf_type.lower())
+        elif args.core == 'ella':
+            args.nf_log = '/tmp/ella-logs/cored.log'
 
-    # free5GC bin dir for process detection
+    # free5GC bin dir for process detection (not used by ella)
     _free5gc_dir = args.free5gc_dir or os.path.expanduser('~/free5gc')
     _bin_dir = os.path.join(_free5gc_dir, 'bin') if args.core == 'free5gc' else None
 
@@ -258,7 +352,15 @@ Examples:
                 "called_ae": args.called_ae,
                 "calling_ae": args.calling_ae,
             }
-        elif args.protocol.lower() == "ngap":
+        elif args.protocol.lower() in ("ngap", "ngap_nas"):
+            # Go coverage-guided reward for the AMF (free5GC): --go-cover-dir, else
+            # auto-derive /tmp/free5gc-*-cov/amf when a start-cover AMF is running.
+            _go_cover = getattr(args, 'go_cover_dir', None)
+            if not _go_cover and args.core == 'free5gc':
+                _cd = sorted(_glob.glob('/tmp/free5gc-*-cov'), reverse=True)
+                _cand = (os.path.join(_cd[0], 'amf') if _cd else None)
+                if _cand and os.path.isdir(_cand):
+                    _go_cover = _cand
             adapter_kwargs = {
                 "gnb_id":   args.gnb_id,
                 "plmn_mcc": args.plmn_mcc,
@@ -266,6 +368,7 @@ Examples:
                 "amf_log":  args.amf_log,
                 "core":     args.core,
                 "bin_dir":  _bin_dir,
+                "go_cover_dir": _go_cover,
             }
         elif args.protocol.lower() == "sbi":
             extra = [n.strip().upper() for n in args.extra_nfs.split(',')
@@ -276,16 +379,33 @@ Examples:
             if _gcov_gcda and not _gcov_src:
                 import os as _os
                 _gcov_src = _os.path.dirname(_gcov_gcda.rstrip('/'))
+            # Go coverage-guided reward (free5GC): use --go-cover-dir, else
+            # auto-derive from the newest /tmp/free5gc-*-cov/<nf> if it exists
+            # (i.e. a start-cover NF is running).  Inactive otherwise.
+            _go_cover = getattr(args, 'go_cover_dir', None)
+            if not _go_cover and args.core == 'free5gc':
+                _cd = sorted(_glob.glob('/tmp/free5gc-*-cov'), reverse=True)
+                _cand = (os.path.join(_cd[0], args.nf_type.lower()) if _cd else None)
+                if _cand and os.path.isdir(_cand):
+                    _go_cover = _cand
             adapter_kwargs = {
-                "nf_type":       args.nf_type,
-                "plmn_mcc":      args.plmn_mcc,
-                "plmn_mnc":      args.plmn_mnc,
-                "nf_log":        args.nf_log,
-                "extra_nfs":     extra,
-                "core":          args.core,
-                "bin_dir":       _bin_dir,
-                "gcov_gcda_dir": _gcov_gcda,
-                "gcov_src_dir":  _gcov_src,
+                "nf_type":        args.nf_type,
+                "plmn_mcc":       args.plmn_mcc,
+                "plmn_mnc":       args.plmn_mnc,
+                "nf_log":         args.nf_log,
+                "extra_nfs":      extra,
+                "core":           args.core,
+                "bin_dir":        _bin_dir,
+                "gcov_gcda_dir":  _gcov_gcda,
+                "gcov_src_dir":   _gcov_src,
+                "go_cover_dir":   _go_cover,
+                "max_spec_per_op": getattr(args, 'max_spec_per_op', None),
+            }
+        elif args.protocol.lower() == "ella_api":
+            adapter_kwargs = {
+                "log_path":  getattr(args, "amf_log", None) or "/tmp/ella-logs/cored.log",
+                "core":      args.core,
+                "api_token": getattr(args, "api_token", None),
             }
         adapter = get_protocol_adapter(args.protocol, **adapter_kwargs)
     except ValueError as e:
@@ -297,8 +417,10 @@ Examples:
         if args.protocol.lower() == 'sbi':
             args.target_host = _SBI_NF_HOSTS[args.core].get(
                 args.nf_type.upper(), '127.0.0.1')
-        elif args.protocol.lower() == 'ngap':
+        elif args.protocol.lower() in ('ngap', 'ngap_nas'):
             args.target_host = _NGAP_AMF_HOST[args.core]
+        elif args.protocol.lower() == 'ella_api':
+            args.target_host = '10.3.0.2' if args.core == 'ella' else 'localhost'
 
     # Derive --nf-log from --nf-type / --core when not specified
     if args.protocol.lower() == 'sbi' and not args.nf_log:
@@ -315,7 +437,17 @@ Examples:
     # Derive --restart-cmd from the core build tree when not specified
     if not args.amf_restart_cmd:
         nf = args.nf_type.lower() if args.protocol.lower() == 'sbi' else 'amf'
-        if args.core == 'free5gc':
+        if args.core == 'ella':
+            # ella-core: single cored process (snap or ASAN source build)
+            _ella_script = os.path.join(os.getcwd(), 'scripts', 'ella.sh')
+            _ella_asan = os.path.expanduser('~/ella-core/ella-core-asan')
+            if os.path.isfile(_ella_asan):
+                # Source build with ASAN
+                args.amf_restart_cmd = f'sudo {_ella_script} restart-source'
+            else:
+                # Snap deployment
+                args.amf_restart_cmd = f'sudo {_ella_script} restart'
+        elif args.core == 'free5gc':
             nf_bin = os.path.join(_free5gc_dir, 'bin', nf)
             nf_cfg = os.path.join(_free5gc_dir, 'config', f'{nf}cfg.yaml')
             nf_log = args.nf_log or f'/tmp/free5gc-logs/{nf}.log'
@@ -367,7 +499,7 @@ Examples:
         print(f"Target:      {args.target_host}:{target_port}")
         if args.protocol.lower() == "dicom":
             print(f"DICOM AE:    Called={args.called_ae}, Calling={args.calling_ae}")
-        elif args.protocol.lower() == "ngap":
+        elif args.protocol.lower() in ("ngap", "ngap_nas"):
             print(f"NGAP:        gNB-ID={args.gnb_id}  PLMN={args.plmn_mcc}/{args.plmn_mnc}")
             print(f"AMF log:     {args.amf_log}")
         elif args.protocol.lower() == "sbi":
@@ -404,6 +536,18 @@ Examples:
             print(f"  Error:    {health.error}")
         print()
 
+    # Spec endpoint discovery probe (SBI only)
+    if args.protocol.lower() == 'sbi' and args.target_host and not getattr(args, 'skip_probe', False):
+        print("--- Spec Endpoint Discovery ---")
+        probe_results = adapter.probe_spec_endpoints(args.target_host, target_port)
+        kept, pruned = adapter.prune_unimplemented_ops(probe_results)
+        impl    = sum(1 for v in probe_results.values() if v == 'implemented')
+        unknown = sum(1 for v in probe_results.values() if v == 'unknown')
+        print(f"  Probed:    {kept + pruned} spec operations")
+        print(f"  Active:    {kept} kept ({impl} confirmed, {unknown} unknown/state-dependent)")
+        print(f"  Pruned:    {pruned} not implemented (404: unrouted / unsupported method)")
+        print()
+
     # Create environment
     from fuzzer.rl.base.generic_env import GenericFuzzEnv
 
@@ -425,6 +569,11 @@ Examples:
         persistent_conn=args.persistent_conn,
         scenario_filter=scenario_filter,
         api_filter=api_filter,
+        seq_reward=args.seq_reward,
+        anneal_steps=(args.anneal_steps if args.anneal_steps is not None
+                      else args.timesteps),
+        no_spec_mutations=args.no_spec_mutations,
+        no_stateful_chains=args.no_stateful_chains,
     )
 
     if args.amf_restart_cmd:
@@ -434,14 +583,62 @@ Examples:
     print(f"Environment created with {env.n_actions} actions")
     print()
 
-    # Create and train agent
-    from fuzzer.rl.agent import create_agent, train_agent, run_agent
+    # RL-FREE baseline: uniform random action selection (no learning). Reproduces a
+    # FivGeeFuzz-style schema fuzzer when combined with --api fivgee. Prints an SB3-
+    # compatible "total_timesteps N" line so external harnesses parse executions the
+    # same way as the RL path.
+    if args.random:
+        print("RL-FREE mode: uniform random action selection (no model training)")
+        start_time = time.monotonic()
+        steps = 0
+        try:
+            reset_out = env.reset()
+            while steps < args.timesteps:
+                action = env.action_space.sample()
+                step_out = env.step(action)
+                done = (step_out[2] or step_out[3]) if len(step_out) == 5 else step_out[2]
+                steps += 1
+                if steps % 100 == 0:
+                    print(f"| time/                   |             |")
+                    print(f"|    total_timesteps      | {steps:<11} |", flush=True)
+                if done:
+                    env.reset()
+            _print_training_summary(env, None, start_time, adapter,
+                                    args.target_host, target_port)
+        except KeyboardInterrupt:
+            import signal as _signal
+            _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+            _print_training_summary(env, None, start_time, adapter,
+                                    args.target_host, target_port)
+        finally:
+            env.close()
+            print("\nDone.")
+        return 0
 
-    model = create_agent(env, algorithm=args.algorithm)
+    # Create and train agent
+    from fuzzer.rl.agent import create_agent, load_agent, train_agent, run_agent
+
+    if args.load_model:
+        model_path = args.load_model
+        print(f"Loading model from {model_path} (continuing training)...")
+        model = load_agent(model_path, env, algorithm=args.algorithm)
+    else:
+        agent_kwargs = {}
+        if args.learning_rate is not None:
+            agent_kwargs["learning_rate"] = args.learning_rate
+        elif env.n_actions > 4000:
+            # Large action spaces need a smaller learning rate to avoid KL spikes
+            # that cause PPO early stopping and policy divergence (seen with UDM).
+            agent_kwargs["learning_rate"] = 1e-4
+            print(f"Large action space ({env.n_actions} actions) — auto-set lr=1e-4")
+        model = create_agent(env, algorithm=args.algorithm, **agent_kwargs)
     start_time = time.monotonic()
 
     try:
         model = train_agent(model, total_timesteps=args.timesteps, model_path=args.model_out)
+
+        _print_training_summary(env, model, start_time, adapter,
+                                 args.target_host, target_port)
 
         # Test
         if args.test:
@@ -530,13 +727,15 @@ Examples:
                 health = adapter.check_health(args.target_host, target_port)
                 print(f"  Healthy:  {health.is_healthy}")
                 print(f"  Latency:  {health.latency_ms:.1f} ms")
+                if health.details.get('status') is not None:
+                    print(f"  HTTP:     {health.details['status']}  {health.details.get('health_path', '')}")
                 if health.error:
                     print(f"  Error:    {health.error}")
 
     except KeyboardInterrupt:
         import signal as _signal
         _signal.signal(_signal.SIGINT, _signal.SIG_IGN)   # block further Ctrl+C during cleanup
-        _print_interrupt_summary(env, model, start_time, adapter,
+        _print_training_summary(env, model, start_time, adapter,
                                 args.target_host, target_port)
 
     finally:
@@ -546,16 +745,15 @@ Examples:
     return 0
 
 
-def _print_interrupt_summary(env, model, start_time, adapter, target_host, target_port):
-    """Print training summary after Ctrl+C interruption.
-
-    SIGINT is already masked by the caller before this function is entered,
-    so further Ctrl+C presses are ignored for the duration of cleanup.
-    """
+def _print_training_summary(env, model, start_time, adapter, target_host, target_port):
+    """Print training summary after completion or Ctrl+C interruption."""
     elapsed = time.monotonic() - start_time
 
+    interrupted = model is not None and hasattr(model, 'num_timesteps') and \
+                  model.num_timesteps < getattr(model, '_total_timesteps', model.num_timesteps + 1)
+    label = "TRAINING INTERRUPTED (Ctrl+C)" if interrupted else "TRAINING COMPLETE"
     print(f"\n{'=' * 70}")
-    print(f"TRAINING INTERRUPTED (Ctrl+C)")
+    print(f"{label}")
     print(f"{'=' * 70}")
 
     # Duration
@@ -572,11 +770,28 @@ def _print_interrupt_summary(env, model, start_time, adapter, target_host, targe
     if model and hasattr(model, 'num_timesteps'):
         print(f"  Timesteps:      {model.num_timesteps}")
 
+    # Emit a harness-parseable execution count from the env's true cross-mode step
+    # counter (incremented once per message sent, in BOTH RL and --random paths).
+    # SB3's own 'total_timesteps' table only prints after a full rollout, so a
+    # crash-heavy RL run that never completes one would otherwise be scored execs=0.
+    print(f"|    total_timesteps      | {getattr(env, '_total_steps', 0):<11} |", flush=True)
+
     # Environment counters
     print(f"  Hangs:          {env.counters['hangs']}")
     print(f"  Crashes:        {env.counters['crashes']}")
     print(f"  Successes:      {env.counters['successes']}")
     print(f"  Errors:         {env.counters['errors']}")
+
+    # Response type breakdown — shows whether the target is actually responding
+    rt = env.counters.get('response_types', {})
+    total_rt = sum(rt.values())
+    if total_rt:
+        print(f"\n  Response types  ({total_rt} total responses received):")
+        for rtype, cnt in sorted(rt.items(), key=lambda x: -x[1]):
+            bar = "█" * min(cnt * 20 // max(total_rt, 1), 20)
+            print(f"    {rtype:<30} {cnt:>5}  {bar}")
+    else:
+        print(f"\n  Response types: none recorded (target may not be reachable)")
 
     # Top actions
     top_actions = env.get_action_stats(10)
@@ -594,6 +809,8 @@ def _print_interrupt_summary(env, model, start_time, adapter, target_host, targe
             health = adapter.check_health(target_host, target_port, timeout=3.0)
             print(f"  Healthy:  {health.is_healthy}")
             print(f"  Latency:  {health.latency_ms:.1f} ms")
+            if health.details.get('status') is not None:
+                print(f"  HTTP:     {health.details['status']}  {health.details.get('health_path', '')}")
             if health.error:
                 print(f"  Error:    {health.error}")
         except Exception as e:
