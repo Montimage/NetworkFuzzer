@@ -36,7 +36,10 @@ Usage:
         --mode semantic --timesteps 30000
 """
 
+import base64
 import json
+import os
+import re
 import socket
 import struct
 import time
@@ -70,6 +73,8 @@ from .http2_client import (
 from .templates import (build_body, NF_INSTANCE_FUZZ,
                         get_body_fuzz_variants, apply_body_field_mutation)
 from .open5gs_sbi_monitor import Open5GsSbiMonitor  # kept for reference
+from .spec_mutations_loader import SpecMutations
+from .spec_mutator import infer_producer_op
 from fuzzer.rl.monitor import NfMonitor
 
 logger = logging.getLogger(__name__)
@@ -122,6 +127,11 @@ def _score_problem_detail(body: bytes) -> float:
         obj = json.loads(body)
     except Exception:
         return 0.0
+    # SBI success bodies are often JSON arrays (e.g. free5GC SDM sm-data → []) or
+    # scalars; only ProblemDetails objects carry depth keywords.  Guard against
+    # calling .get() on a non-dict, which would raise mid-step.
+    if not isinstance(obj, dict):
+        return 0.0
     text = ' '.join(str(obj.get(k, ''))
                     for k in ('detail', 'title', 'cause', 'invalidParams'))
     for score, kw in _BODY_DEPTH:
@@ -170,6 +180,21 @@ SUPI_VALUES = [
     'suci-0-001-01-0-0-0-0000000001',    # SUCI for open5GS PLMN
     '5g-guti-9990700000000000001',        # 5G-GUTI — triggers #4398 AMF transfer crash
     'imsi-208930000000099\x00',           # null-terminated (#1048 UDM generate-auth-data)
+]
+
+# free5GC depth-tuning subset.  On free5GC the SUPI gates the deep auth-vector
+# path: most SUPI mutations just 404 at the UDR lookup (shallow), so a large SUPI
+# value list spends the agent's action budget on shallow misses.  This trimmed,
+# high-signal set keeps the *valid* baseline (so actions still reach Milenage
+# generation) plus the most productive free5GC-relevant attack values, shifting
+# budget toward body fuzzing of the auth/SDM endpoints.  open5GS keeps the full set.
+FREE5GC_SUPI_VALUES = [
+    'imsi-208930000000001',               # valid free5GC baseline → reaches deep auth path
+    '',                                    # empty — mandatory field missing
+    'imsi-208930000000099\x00',           # null-terminated (#1048-style; Go NUL handling)
+    'imsi-' + '1' * 30,                  # over-long IMSI
+    'supi:' + 'A' * 20,                  # wrong format prefix
+    'suci-0-208-93-0-0-0-',              # SUCI empty scheme-output (#975-979), free5GC PLMN
 ]
 
 # NF instance IDs (UUID format)
@@ -371,6 +396,53 @@ def _ausf_eap_path(supi: str) -> str:
     return f'/nausf-auth/v1/ue-authentications/{supi}/eap-session'
 
 
+def _smf_n1_pdu_session_establishment(session_id: int = 1, pdu_type: int = 1) -> bytes:
+    """Valid 5GSM PDU Session Establishment Request (TS 24.501 §8.3.1).
+
+    Sent as the binary `5gnas-sm` part of the multipart sm-context create so the
+    SMF gets past N1 decoding into the gsm-sm state machine.  Layout:
+      EPD=0x2e, PSI, PTI, msgType=0xc1,
+      Integrity Protection Max Data Rate (2 oct, MANDATORY — full rate 0xff,0xff),
+      PDU session type TV (0x9<type>), SSC mode TV (0xa<mode>).
+    The minimal ngap_nas builder omits the mandatory integrity-rate octets, which
+    makes open5GS misread the next byte as an IE → "[nas] Unknown type(0x1)".
+    """
+    return bytes([
+        0x2e, session_id & 0xFF, 0x01, 0xc1,
+        0xff, 0xff,                       # Integrity protection max data rate
+        0x90 | (pdu_type & 0x0F),         # PDU session type IE (TV): IEI=9, value=type
+        0xa1,                             # SSC mode IE (TV): IEI=0xA, mode=1
+    ])
+
+
+def _wrap_multipart_related(json_body: bytes, n1_bytes: bytes,
+                            boundary: str = 'NfBoundary') -> bytes:
+    """Wrap a JSON SBI body + a binary N1 SM part into a multipart/related body.
+
+    open5GS SMF/AMF context creates require the N1 (5GSM NAS) content as a
+    separate multipart part referenced by contentId '5gnas-sm'; a plain-JSON
+    body 400s at "No N1 SM Content".
+    """
+    crlf = '\r\n'
+    def _part(headers, body):
+        head = ''.join(f'{k}: {v}{crlf}' for k, v in headers)
+        return (f'--{boundary}{crlf}{head}{crlf}').encode() + body + crlf.encode()
+    return (
+        _part([('Content-Type', 'application/json'), ('Content-Id', 'sm-context')], json_body)
+        + _part([('Content-Type', 'application/vnd.3gpp.5gnas'), ('Content-Id', '5gnas-sm')], n1_bytes)
+        + f'--{boundary}--{crlf}'.encode()
+    )
+
+
+# SMF sm-context create-family messages that need a multipart N1 body to reach
+# the gsm-sm state machine (otherwise 400 "No N1 SM Content" at the parse layer).
+_SMF_N1_CREATE_MSGS = frozenset({
+    'smf_ctx_create', 'smf_ctx_create_wrong_plmn', 'smf_ctx_create_no_supi',
+    'smf_ctx_create_empty_supi', 'smf_ctx_create_bad_qos', 'smf_ctx_create_no_dnn',
+    'smf_ctx_create_invalid_pdu_type',
+})
+
+
 def _udm_auth_data_path(supi: str) -> str:
     return f'/nudm-ueau/v1/{supi}/security-information/generate-auth-data'
 
@@ -416,6 +488,70 @@ def _amf_evts_sub_ref_path(sub_id: str) -> str:
 
 def _nrf_sub_path(sub_id: str = '') -> str:
     return f'/nnrf-nfm/v1/subscriptions/{sub_id}'
+
+
+# ── PCF (TS 29.512 / 29.507 / 29.514) ────────────────────────────────────────
+def _pcf_sm_policy_path(pol_id: str = '') -> str:
+    base = '/npcf-smpolicycontrol/v1/sm-policies'
+    return f'{base}/{pol_id}' if pol_id else base
+
+
+def _pcf_sm_policy_delete_path(pol_id: str = '1') -> str:
+    return f'/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/delete'
+
+
+def _pcf_am_policy_path(pol_id: str = '') -> str:
+    base = '/npcf-am-policy-control/v1/policies'
+    return f'{base}/{pol_id}' if pol_id else base
+
+
+def _pcf_am_policy_delete_path(pol_id: str = '1') -> str:
+    return f'/npcf-am-policy-control/v1/policies/{pol_id}/delete'
+
+
+def _pcf_app_session_path(sess_id: str = '') -> str:
+    base = '/npcf-policyauthorization/v1/app-sessions'
+    return f'{base}/{sess_id}' if sess_id else base
+
+
+def _pcf_sm_policy_notify_path(pol_id: str = '1') -> str:
+    return f'/npcf-callback/v1/sm-policy-notify/{pol_id}/update'
+
+
+# ── NSSF (TS 29.531) ──────────────────────────────────────────────────────────
+def _nssf_nsselection_path(nf_type: str = 'AMF', sst: int = 1) -> str:
+    return (f'/nnssf-nsselection/v2/network-slice-information'
+            f'?nf-type={nf_type}&slice-info-request-for-registration='
+            f'%7B%22requestedNssai%22%3A%5B%7B%22sst%22%3A{sst}%7D%5D%7D')
+
+
+def _nssf_nsselection_empty_path() -> str:
+    """Empty S-NSSAI — triggers nil deref in NSSF slice selection."""
+    return '/nnssf-nsselection/v2/network-slice-information?nf-type=AMF'
+
+
+def _nssf_nssai_availability_path(nf_id: str) -> str:
+    return f'/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}'
+
+
+# ── BSF (TS 29.521) ───────────────────────────────────────────────────────────
+def _bsf_binding_path(binding_id: str = '') -> str:
+    base = '/nbsf-management/v1/pcfBindings'
+    return f'{base}/{binding_id}' if binding_id else base
+
+
+def _bsf_binding_query_path(ipv4: str = '10.45.0.1') -> str:
+    return f'/nbsf-management/v1/pcfBindings?ipv4Addr={ipv4}'
+
+
+# ── CHF (TS 29.594) ───────────────────────────────────────────────────────────
+def _chf_charging_path(ref: str = '') -> str:
+    base = '/nchf-convergedcharging/v3/chargingdata'
+    return f'{base}/{ref}' if ref else base
+
+
+def _chf_charging_update_path(ref: str = 'fuzz-ref-1') -> str:
+    return f'/nchf-convergedcharging/v3/chargingdata/{ref}/update'
 
 
 def _amf_ue_ctx_path(ue_id: str) -> str:
@@ -464,7 +600,9 @@ class SbiAdapter(ProtocolAdapter):
                  core:          str = 'open5gs',
                  bin_dir:       Optional[str] = None,
                  gcov_gcda_dir: Optional[str] = None,
-                 gcov_src_dir:  Optional[str] = None):
+                 gcov_src_dir:  Optional[str] = None,
+                 go_cover_dir:  Optional[str] = None,
+                 max_spec_per_op: Optional[int] = None):
         """
         nf_type:       Target NF type ('NRF', 'AMF', 'SMF', 'UDM', 'PCF')
         plmn_mcc:      PLMN Mobile Country Code
@@ -489,22 +627,445 @@ class SbiAdapter(ProtocolAdapter):
             bin_dir=bin_dir,
             gcov_gcda_dir=gcov_gcda_dir,
             gcov_src_dir=gcov_src_dir,
+            go_cover_dir=go_cover_dir,
         )
         # Source subdirectory filter for lcov (only scan the target NF's code)
         self._gcov_nf_filter = f'src/{self._nf_type.lower()}' if gcov_gcda_dir else None
+        # How often to run the (expensive) per-step lcov coverage-reward read.
+        # Higher = less lcov/SIGUSR2 overhead (faster fuzzing) but coarser reward
+        # credit timing. The SIGUSR2 dump is now gated by this too (see
+        # monitor.gcov_new_lines), so this is the single throughput knob for the
+        # gcov reward path. Out-of-band coverage measurement for the paper's
+        # table/plots comes from run_sbi_compare.sh's sampler, NOT this path.
+        self._gcov_eval_every = max(1, int(os.environ.get('GCOV_EVAL_EVERY', '25')))
         # Zero stale .gcda files from previous campaigns so reward signal is clean
         if self._gcov_nf_filter:
             ok = self._monitor.gcov_campaign_reset()
             logger.info("gcov campaign reset: %s", "ok" if ok else "lcov --zerocounters failed (non-fatal)")
+        # Go coverage-guided reward (free5GC/ella).  Active only when a GOCOVERDIR
+        # is given AND a covmeta is present there (i.e. a -cover NF is running).
+        self._go_cover_dir = go_cover_dir
+        # How often to run `go tool covdata` (SIGUSR2 dump still fires every step).
+        # Higher = less covdata overhead (faster) but coarser reward timing.
+        try:
+            self._go_cover_eval_every = max(1, int(os.environ.get('GO_COVER_EVAL_EVERY', '25')))
+        except ValueError:
+            self._go_cover_eval_every = 25
+        if self._go_cover_dir:
+            import glob as _g
+            if _g.glob(os.path.join(self._go_cover_dir, 'covmeta.*')):
+                self._monitor.go_cover_campaign_reset()
+                logger.info("go-cover guided reward ON (GOCOVERDIR=%s, eval_every=%d)",
+                            self._go_cover_dir, self._go_cover_eval_every)
+            else:
+                logger.warning("go-cover dir %s has no covmeta — is a -cover NF "
+                               "running under it? Disabling go-cover reward.",
+                               self._go_cover_dir)
+                self._go_cover_dir = None
         # Persistent-connection state: tracks HTTP/2 stream ID across actions
         self._stream_id: int = 1
         # Per-episode response type set for novelty bonus in compute_reward()
         self._episode_resp_types: set = set()
+        # Spec-driven fuzzing: pre-generated mutation tables + lookup dicts
+        self._spec_mutations: SpecMutations = SpecMutations.load()
+        self._spec_msg_info: Dict[str, Dict] = {}    # 'spec_{op_id}' → {method,path,op_id}
+        self._fivgee_info: Dict[str, Dict] = {}      # 'fivgee_*' → scenario descriptor
+        self._spec_sem_info: Dict[str, Dict] = {}    # 'specsem_*' → semantic mutation descriptor
+        self._xst_info: Dict[str, Dict] = {}         # 'xst_{i}' → cross-service payload
+        # consumer_op_id → producer_op_id (producer→consumer chains for this NF)
+        self._dep_map: Dict[str, str] = {}
+        # Per-operation cap on spec scenarios: limits action-space explosion for
+        # NFs with many OpenAPI operations (e.g. UDM has 73 ops → 1023 scenarios).
+        self._max_spec_per_op: Optional[int] = max_spec_per_op
+        self._build_dependency_map()
+        self._build_spec_msg_tables()
+
+    def _build_dependency_map(self) -> None:
+        """Infer consumer→producer chains for the current NF's spec operations.
+
+        For every operation that references a created resource (GET/PATCH/DELETE
+        on /coll/{id}, or POST /coll/{id}/<verb>), find the POST/PUT on the parent
+        collection that creates it.  Computed at runtime from spec_mutations.json
+        so no regeneration of the JSON is required.  Result populates
+        self._dep_map: {consumer_op_id: producer_op_id}.
+        """
+        sm = self._spec_mutations
+        if not sm.is_available():
+            return
+        op_ids = sm.operations_for_nf(self._nf_type)
+        op_table: Dict[str, Tuple[str, str]] = {}
+        for op_id in op_ids:
+            method, path = sm.method_path(op_id)
+            if method and path:
+                op_table[op_id] = (method, path)
+        for op_id, (method, path) in op_table.items():
+            producer = infer_producer_op(method, path, op_table)
+            if producer and producer != op_id:
+                self._dep_map[op_id] = producer
+        if self._dep_map:
+            logger.info(
+                "producer→consumer chains for %s: %d", self._nf_type, len(self._dep_map)
+            )
+
+    # Producer operationId → hand-crafted create message type.
+    # The generic spec baseline body (valid_body_baseline) is too weak to pass
+    # open5GS validation (e.g. notificationUri='fuzz-value' → Invalid URI; AM
+    # policy missing required suppFeat → 'cannot parse HTTP message').  These
+    # hand-crafted templates send complete, known-good bodies that return
+    # 201 + Location, so the real resource id can be propagated to the consumer.
+    _PRODUCER_VALID_TEMPLATE: Dict[str, str] = {
+        'CreateSMPolicy':                      'pcf_sm_policy_create',
+        'CreateIndividualAMPolicyAssociation': 'pcf_am_policy_create',
+        'PostAppSessions':                     'pcf_app_session_create',
+        'PostSmContexts':                      'smf_ctx_create',
+        'CreatePCFBinding':                    'bsf_pcf_binding_create',
+        'Subscribe':                           'udm_sdm_sub_create',  # UDM SDM subscription
+    }
+
+    def _setup_for_consumer(self, op_id: str) -> Tuple[List[str], bool]:
+        """Return (setup_messages, stateful) for a consumer operation.
+
+        If op_id has an inferred producer, return a single setup step and
+        stateful=True so the real resource id from the create is propagated to
+        the fuzz step's path.  Prefer a hand-crafted create template (valid body
+        → 201) over the generic spec message (whose baseline body usually 4xx's).
+        Otherwise return ([], False).
+        """
+        producer = self._dep_map.get(op_id)
+        if producer:
+            tmpl = self._PRODUCER_VALID_TEMPLATE.get(producer)
+            if tmpl and tmpl in self._MSG_TABLE:
+                return [tmpl], True
+            spec_key = f'spec_{producer}'
+            if spec_key in self._spec_msg_info:
+                return [spec_key], True
+        return [], False
 
     def reset_episode(self) -> None:
         """Reset per-episode state at each RL episode boundary."""
         self._episode_resp_types.clear()
         self._monitor.reset_episode()
+
+    def _build_spec_msg_tables(self) -> None:
+        """Populate _spec_msg_info, _fivgee_info, _xst_info from SpecMutations."""
+        sm = self._spec_mutations
+        if not sm.is_available():
+            return
+
+        cap = self._max_spec_per_op  # None → no cap
+        for op_id in sm.operations_for_nf(self._nf_type):
+            method, path = sm.method_path(op_id)
+            if not method or not path:
+                continue
+            self._spec_msg_info[f'spec_{op_id}'] = {
+                'method': method, 'path': path, 'op_id': op_id,
+            }
+            fivgee_omit = list(sm.fivgee_omit_optional(op_id))
+            fivgee_type = list(sm.fivgee_type_mismatch(op_id))
+            specsem_omit = list(sm.spec_omit_required(op_id))
+            specsem_val  = list(sm.spec_field_value(op_id))
+            if cap is not None:
+                # Evenly divide the cap between the four scenario types
+                per_type = max(1, cap // 4)
+                fivgee_omit  = fivgee_omit[:per_type]
+                fivgee_type  = fivgee_type[:per_type]
+                specsem_omit = specsem_omit[:per_type]
+                specsem_val  = specsem_val[:per_type]
+            for i, sc in enumerate(fivgee_omit):
+                self._fivgee_info[f'fivgee_omit_{op_id}_{i}'] = sc
+            for i, sc in enumerate(fivgee_type):
+                self._fivgee_info[f'fivgee_type_{op_id}_{i}'] = sc
+            for i, sc in enumerate(specsem_omit):
+                self._spec_sem_info[f'specsem_omitreq_{op_id}_{i}'] = sc
+            for i, sc in enumerate(specsem_val):
+                self._spec_sem_info[f'specsem_val_{op_id}_{i}'] = sc
+
+        for i, payload in enumerate(sm.cross_service_token_payloads()):
+            self._xst_info[f'xst_{i}'] = payload
+
+        logger.info(
+            "spec-driven messages: %d spec ops, %d fivgee scenarios, %d xst payloads",
+            len(self._spec_msg_info), len(self._fivgee_info), len(self._xst_info),
+        )
+
+    def _resolve_spec_path(self, path_template: str,
+                           fields: Dict[str, Any]) -> str:
+        """Substitute OpenAPI path params like {supi}, {nfInstanceID} with field values."""
+        supi    = str(fields.get('supi', 'imsi-001010000000001'))
+        nf_id   = str(fields.get('nf_instance_id', NF_INSTANCE_FUZZ))
+        pdu_sid = int(fields.get('pdu_session_id', 1))
+        nf_type = str(fields.get('nf_type', 'AMF'))
+        # Real resource id captured from a prior create's Location header
+        # (set by generic_env after a stateful setup step). When present it
+        # overrides the synthetic ids below for resource-reference params so the
+        # consumer (update/get/delete) targets the resource that was just created.
+        loc_id  = fields.get('__location_id__')
+
+        param_map: Dict[str, str] = {
+            # Identity params
+            'supi':                  supi,
+            'supiOrSuci':            supi,
+            'ueId':                  supi,
+            'gpsi':                  str(fields.get('gpsi', 'msisdn-0001')),
+            # NF instance IDs — both capitalisation variants appear in 3GPP specs
+            'nfInstanceId':          nf_id,
+            'nfInstanceID':          nf_id,
+            'nfId':                  nf_id,
+            # Context / session references
+            'ueContextId':           f'amf-ue-ngap-id-{pdu_sid}',
+            'smContextRef':          f'ctx-{pdu_sid:04d}',
+            'pduSessionRef':         f'ctx-{pdu_sid:04d}',
+            'authCtxId':             supi,
+            'smPolicyId':            f'pol-{pdu_sid}',
+            'polAssoId':             f'pol-am-{pdu_sid}',
+            'appSessionId':          f'app-{pdu_sid}',
+            'subscriptionId':        f'sub-{pdu_sid}',
+            'subscriptionID':        f'sub-{pdu_sid}',
+            'subId':                 f'sub-{pdu_sid}',
+            'n2NotifySubscriptionId': f'n2sub-{pdu_sid}',
+            'pduSessionId':          str(pdu_sid),
+            'bindingId':             f'bind-{pdu_sid}',
+            'searchId':              f'search-{pdu_sid}',
+            'sharedDataId':          f'shared-{pdu_sid}',
+            'authEventId':           f'auth-{pdu_sid}',
+            'hssAuthType':           'EAP_AKA_PRIME',
+            'nwdafRegistrationId':   f'nwdaf-{pdu_sid}',
+            'nfType':                nf_type,
+        }
+
+        # Resource-reference path params: when a real id is available from the
+        # producer step's Location, use it instead of the synthetic value.
+        _RESOURCE_REF_PARAMS = {
+            'polAssoId', 'smPolicyId', 'appSessionId', 'smContextRef',
+            'pduSessionRef', 'subscriptionId', 'subscriptionID', 'subId',
+            'bindingId', 'individualPCFBinding', 'eventsSubscId',
+        }
+        if loc_id:
+            for _p in _RESOURCE_REF_PARAMS:
+                param_map[_p] = str(loc_id)
+
+        def _sub(m: re.Match) -> str:
+            key = m.group(1)
+            return param_map.get(key, f'fuzz-{key}-1')
+
+        return re.sub(r'\{([^}]+)\}', _sub, path_template)
+
+    # ── Spec endpoint discovery ───────────────────────────────────────────
+
+    def probe_spec_endpoints(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 2.0,
+        cache_dir: str = 'fuzzer/data',
+    ) -> Dict[str, str]:
+        """Probe each spec operation with a minimal HTTP/2 request.
+
+        Returns a dict mapping op_id → "implemented" | "not_implemented" | "unknown".
+        Results are cached to {cache_dir}/spec_probe_{nf_type}.json and reused when
+        the spec_mutations.json mtime hasn't changed.
+        """
+        import socket
+        import json as _json
+
+        sm = self._spec_mutations
+        ops = sm.operations_for_nf(self._nf_type)
+
+        # ── Cache handling ──────────────────────────────────────────────
+        cache_path = os.path.join(cache_dir, f'spec_probe_{self._nf_type}.json')
+        spec_mtime: float = 0.0
+        try:
+            spec_mtime = os.path.getmtime('fuzzer/data/spec_mutations.json')
+        except OSError:
+            pass
+
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path) as _f:
+                    cached = _json.load(_f)
+                if cached.get('_spec_mtime') == spec_mtime:
+                    logger.info(
+                        "spec-probe cache hit for %s (%d ops)", self._nf_type, len(ops)
+                    )
+                    return {
+                        op_id: cached[op_id]['result']
+                        for op_id in ops
+                        if op_id in cached
+                    }
+            except Exception:
+                pass
+
+        # ── Probe each operation ────────────────────────────────────────
+        results: Dict[str, str] = {}
+        cache_entries: Dict[str, Any] = {'_spec_mtime': spec_mtime}
+
+        total = len(ops)
+        logger.info("probing %d spec ops for %s at %s:%d", total, self._nf_type, host, port)
+
+        for idx, op_id in enumerate(ops, 1):
+            if idx % 10 == 0 or idx == total:
+                logger.info("  probing %d/%d ...", idx, total)
+
+            # Skip operations that require prior state
+            if sm.depends_on(op_id):
+                results[op_id] = 'unknown'
+                cache_entries[op_id] = {'result': 'unknown', 'status': None}
+                continue
+
+            spec_key = f'spec_{op_id}'
+            if spec_key not in self._spec_msg_info:
+                results[op_id] = 'unknown'
+                cache_entries[op_id] = {'result': 'unknown', 'status': None}
+                continue
+
+            info = self._spec_msg_info[spec_key]
+            method = info['method']
+            path_template = info['path']
+            resolved_path = self._resolve_spec_path(path_template, {})
+
+            # Build baseline body (may be None / empty bytes)
+            baseline = sm.valid_body_baseline(op_id)
+            if isinstance(baseline, dict):
+                import json as _j2
+                body_bytes = _j2.dumps(baseline).encode()
+            elif isinstance(baseline, (bytes, bytearray)):
+                body_bytes = bytes(baseline)
+            elif baseline:
+                body_bytes = str(baseline).encode()
+            else:
+                body_bytes = b''
+
+            try:
+                # build_sbi_request expects `authority=` (not host) and adds
+                # content-type/-length itself for bodied requests, so no
+                # extra_headers are needed here.
+                req = build_sbi_request(
+                    method=method,
+                    path=resolved_path,
+                    authority=f'{host}:{port}',
+                    body=body_bytes,
+                )
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+                sock.sendall(req)
+                raw = recv_h2_response(sock, timeout=timeout)
+                sock.close()
+            except Exception as exc:
+                logger.debug("probe %s connection error: %s", op_id, exc)
+                results[op_id] = 'unknown'
+                cache_entries[op_id] = {'result': 'unknown', 'status': None}
+                continue
+
+            # Parse (parse_h2_response returns a dict, not a tuple)
+            try:
+                parsed = parse_h2_response(raw)
+                status = parsed.get('status')
+                body   = parsed.get('body') or b''
+            except Exception:
+                status, body = None, b''
+
+            if status is None:
+                # Only SETTINGS / no real response
+                result = 'unknown'
+            elif status == 404:
+                # open5GS returns a structured 404 both for genuinely unrouted
+                # paths and for routed-but-unsupported (method, path) pairs.
+                # Distinguish via the ProblemDetails title so the latter get
+                # pruned too; a 200-ish handler-level 4xx (400/403/…) means the
+                # route IS implemented.
+                btext = (body.decode('utf-8', 'replace')
+                         if isinstance(body, (bytes, bytearray)) else str(body)).lower()
+                if (not body or len(body) < 20
+                        or 'unknown resource' in btext
+                        or 'invalid http method' in btext
+                        or 'not found' in btext):
+                    result = 'not_implemented'
+                else:
+                    result = 'implemented'
+            elif status == 501:
+                # 501 Not Implemented: the route is registered but the handler is
+                # a stub (free5GC ships many such stubs — uecm/sdm/pp/…).  Fuzzing
+                # it only ever returns 501 with ~1 line of coverage, so prune it
+                # like a 404 and refocus the agent's budget on real handlers.
+                result = 'not_implemented'
+            else:
+                # 2xx / 400 / 403 / 405-with-body … → handler was reached.
+                result = 'implemented'
+
+            results[op_id] = result
+            cache_entries[op_id] = {
+                'result': result,
+                'status': status,
+            }
+
+        # ── Persist cache ───────────────────────────────────────────────
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_path, 'w') as _f:
+                _json.dump(cache_entries, _f, indent=2)
+        except Exception as exc:
+            logger.debug("could not write probe cache: %s", exc)
+
+        impl = sum(1 for v in results.values() if v == 'implemented')
+        not_impl = sum(1 for v in results.values() if v == 'not_implemented')
+        unknown = sum(1 for v in results.values() if v == 'unknown')
+        logger.info(
+            "spec-probe %s: %d implemented, %d not_implemented, %d unknown",
+            self._nf_type, impl, not_impl, unknown,
+        )
+        return results
+
+    def prune_unimplemented_ops(
+        self, probe_results: Dict[str, str]
+    ) -> 'tuple[int, int]':
+        """Remove 'not_implemented' ops from spec/fivgee/specsem tables.
+
+        Returns (kept, pruned) counts.
+        """
+        not_impl = {op_id for op_id, res in probe_results.items() if res == 'not_implemented'}
+        if not not_impl:
+            kept = len({
+                info['op_id']
+                for info in self._spec_msg_info.values()
+                if 'op_id' in info
+            })
+            return kept, 0
+
+        # Remove from _spec_msg_info
+        to_del_spec = [k for k, v in self._spec_msg_info.items()
+                       if v.get('op_id') in not_impl]
+        for k in to_del_spec:
+            del self._spec_msg_info[k]
+
+        # Remove from _fivgee_info
+        to_del_fivgee = [
+            k for k in self._fivgee_info
+            if any(f'_{op_id}_' in k or k.endswith(f'_{op_id}') for op_id in not_impl)
+        ]
+        for k in to_del_fivgee:
+            del self._fivgee_info[k]
+
+        # Remove from _spec_sem_info
+        to_del_specsem = [
+            k for k in self._spec_sem_info
+            if any(f'_{op_id}_' in k or k.endswith(f'_{op_id}') for op_id in not_impl)
+        ]
+        for k in to_del_specsem:
+            del self._spec_sem_info[k]
+
+        pruned = len(not_impl)
+        kept = len({
+            info['op_id']
+            for info in self._spec_msg_info.values()
+            if 'op_id' in info
+        })
+
+        logger.info(
+            "spec-driven after probe: %d ops active, %d fivgee, %d specsem, %d pruned",
+            kept, len(self._fivgee_info), len(self._spec_sem_info), pruned,
+        )
+        return kept, pruned
 
     # ── ProtocolAdapter identity ──────────────────────────────────────────
 
@@ -514,14 +1075,21 @@ class SbiAdapter(ProtocolAdapter):
 
     @property
     def default_port(self) -> int:
-        # open5GS uses 7777; free5GC uses 8000
-        return 8000 if self._core == 'free5gc' else 7777
+        if self._core == 'free5gc':
+            return 8000
+        if self._core == 'ella':
+            return 5002
+        return 7777
 
     # ── Connection params ─────────────────────────────────────────────────
 
     def get_connection_params(self) -> Dict[str, Any]:
-        # Plain TCP — HTTP/2 framing is handled in build_message()
-        return {'socket_type': 'tcp'}
+        # TCP_NODELAY prevents Nagle's algorithm from holding back small HTTP/2
+        # frames, which would inflate response latency and distort the reward signal.
+        params: Dict[str, Any] = {'socket_type': 'tcp', 'tcp_nodelay': True}
+        if self._core == 'ella':
+            params['use_tls'] = True
+        return params
 
     def recv_data(self, sock: Any, timeout: float, buf_size: int = 4096) -> bytes:
         return recv_h2_response(sock, timeout=timeout, buf_size=max(buf_size, 8192))
@@ -727,9 +1295,12 @@ class SbiAdapter(ProtocolAdapter):
         }.get(field_name)
 
     def get_mutation_values(self, field_name: str) -> List[Any]:
+        # free5GC: use the trimmed SUPI set so fewer actions stall at the shallow
+        # UDR 404 lookup and more land on deep body fuzzing (see FREE5GC_SUPI_VALUES).
+        supi_values = FREE5GC_SUPI_VALUES if self._core == 'free5gc' else SUPI_VALUES
         return {
             'nf_type':           NF_TYPE_VALUES,
-            'supi':              SUPI_VALUES,
+            'supi':              supi_values,
             'nf_instance_id':    NF_INSTANCE_ID_VALUES,
             'pdu_session_id':    PDU_SESSION_ID_VALUES,
             'snssai_sst':        SNSSAI_SST_VALUES,
@@ -823,13 +1394,101 @@ class SbiAdapter(ProtocolAdapter):
             # AMF: event sub modify, restrictedRatList unchecked access
             'amf_evts_sub_modify',          # PATCH /namf-evts/v1/subscriptions/{id} (free5GC #754)
             'amf_ue_ctx_restricted_rat',    # PUT ue-contexts with restrictedRatList (free5GC #756)
-        ]
+            # ── PCF (TS 29.512 / 29.507 / 29.514) — 166 issues ──────────────
+            'pcf_sm_policy_create',         # POST /npcf-smpolicycontrol/v1/sm-policies
+            'pcf_sm_policy_create_no_supi', # POST missing SUPI — nil deref in PCF
+            'pcf_sm_policy_get',            # GET  /npcf-smpolicycontrol/v1/sm-policies/{id}
+            'pcf_sm_policy_delete',         # POST /npcf-smpolicycontrol/v1/sm-policies/{id}/delete
+            'pcf_am_policy_create',         # POST /npcf-am-policy-control/v1/policies
+            'pcf_am_policy_delete',         # POST /npcf-am-policy-control/v1/policies/{id}/delete
+            'pcf_app_session_create',       # POST /npcf-policyauthorization/v1/app-sessions
+            'pcf_sm_policy_update_notify',  # POST /npcf-callback/v1/sm-policy-notify/{id}/update
+            # ── NSSF (TS 29.531) — 93 issues ─────────────────────────────────
+            'nssf_nsselection',             # GET /nnssf-nsselection/v2/network-slice-information
+            'nssf_nsselection_empty_snssai',# GET with empty/missing S-NSSAI (nil deref)
+            'nssf_nsselection_bad_plmn',    # GET with malformed PLMN in query
+            'nssf_nssai_availability',      # PUT /nnssf-nssaiavailability/v1/nssai-availability/{id}
+            'nssf_nssai_availability_delete',# DELETE /nnssf-nssaiavailability/v1/nssai-availability/{id}
+            # ── BSF (TS 29.521) — 36 issues ──────────────────────────────────
+            'bsf_pcf_binding_create',       # POST /nbsf-management/v1/pcfBindings
+            'bsf_pcf_binding_create_no_ip', # POST missing IP — nil deref in binding
+            'bsf_pcf_binding_get',          # GET  /nbsf-management/v1/pcfBindings?ipv4Addr=
+            'bsf_pcf_binding_delete',       # DELETE /nbsf-management/v1/pcfBindings/{id}
+            # ── CHF (TS 29.594) — 24 issues ──────────────────────────────────
+            'chf_charging_create',          # POST /nchf-convergedcharging/v3/chargingdata
+            'chf_charging_create_no_supi',  # POST missing SUPI
+            'chf_charging_update',          # POST /nchf-convergedcharging/v3/chargingdata/{ref}/update
+            'chf_charging_release',         # DELETE /nchf-convergedcharging/v3/chargingdata/{ref}
+            # ── NRF auth-bypass gap-fill (61 issues) ─────────────────────────
+            'nrf_register_no_nf_type',      # PUT — nfType absent → NULL deref
+            'nrf_register_unknown_type',    # PUT — nfType="XYZZY" → enum OOB
+            'nrf_register_self_as_nrf',     # PUT — register as NRF type (confusion)
+            'nrf_register_conflicting_id',  # PUT — spoof NRF bootstrap instance ID
+            'nrf_disc_no_params',           # GET /nnrf-disc with no query params
+            # ── SMF missing-field / bad-value gap-fill ────────────────────────
+            'smf_ctx_create_no_supi',       # POST — supi absent → NULL deref
+            'smf_ctx_create_empty_supi',    # POST — supi="" → ogs_id_get_type NULL
+            'smf_ctx_create_bad_qos',       # POST — QFI=256 → array OOB write
+            'smf_ctx_create_no_dnn',        # POST — dnn absent → DNN lookup NULL
+            'smf_ctx_create_invalid_pdu_type',  # POST — pduSessionType="IPV99"
+            'smf_ctx_modify_no_ctx',        # POST modify to non-existent context ref
+            # ── AUSF gap-fill (14+ severe) ────────────────────────────────────
+            'ausf_auth_bad_suci',           # POST — malformed SUCI format
+            'ausf_auth_empty_suci',         # POST — supiOrSuci="" → type NULL deref
+            'ausf_auth_long_suci',          # POST — 1024-char SUCI → buffer overflow probe
+            'ausf_auth_resynch',            # POST — short AUTS → resynch short-read
+            'ausf_auth_wrong_network',      # POST — mismatched serving network
+            # ── AMF SBI gap-fill (garbage NAS, transfer crashes) ─────────────
+            'amf_n1n2_garbage_nas',         # POST N1N2MessageTransfer — random NAS bytes
+            'amf_n1n2_oversized_nas',       # POST N1N2MessageTransfer — 64 KB NAS PDU
+            'amf_n1n2_empty_nas',           # POST N1N2MessageTransfer — empty NAS PDU
+            'amf_ue_ctx_no_supi',           # PUT ue-contexts — supi absent from body
+            'amf_ue_ctx_bad_plmn',          # PUT ue-contexts — PLMN mismatch vs SUPI
+        ] + list(self._spec_msg_info) + list(self._fivgee_info) \
+          + list(self._spec_sem_info) + list(self._xst_info)
 
     # ── State transitions ─────────────────────────────────────────────────
 
+    # Maps NF type → transition names that are relevant for that target.
+    # Transitions not listed here are dropped before building the action space,
+    # preventing e.g. AMF/SMF sequences being sent to UDR (→ always 404, no signal).
+    # H2 frame-level attacks are valid against every NF and always included.
+    _NF_TRANSITIONS: dict[str, set[str]] = {
+        'NRF':  {
+            'nrf_register_discover', 'discover_before_register',
+            'double_register_same_id', 'deregister_before_register',
+            'flood_subscriptions', 'malformed_then_valid',
+            'h2_frame_attack', 'h2_header_bomb',
+        },
+        'AMF':  {
+            'n1n2_before_ue_ctx', 'amf_bad_supi',
+            'h2_frame_attack', 'h2_header_bomb',
+        },
+        'SMF':  {
+            'smf_full_pdu_session', 'smf_ctx_wrong_plmn',
+            'double_sm_create', 'release_nonexistent_sm',
+            'smf_use_after_release', 'smf_double_release',
+            'h2_frame_attack', 'h2_header_bomb',
+        },
+        'UDR':  {
+            'udr_sub_data_read', 'udr_sub_data_write',
+            'udr_policy_data_read', 'udr_amf_reg_write',
+            'h2_frame_attack', 'h2_header_bomb',
+        },
+        'UDM':  {
+            'udm_sub_lifecycle', 'udm_sub_use_after_delete',
+            'udm_sub_double_delete', 'udm_sub_modify_no_create',
+            'h2_frame_attack', 'h2_header_bomb',
+        },
+        'AUSF': {'h2_frame_attack', 'h2_header_bomb'},
+        'PCF':  {'h2_frame_attack', 'h2_header_bomb'},
+    }
+
     def get_state_transitions(self) -> List[StateTransition]:
-        return [
-            # Valid flows
+        allowed = self._NF_TRANSITIONS.get(self._nf_type)
+
+        all_transitions = [
+            # ── NRF flows ─────────────────────────────────────────────────
             StateTransition(
                 'nrf_register_discover',
                 ['nrf_nf_register', 'nrf_nf_discover'],
@@ -842,8 +1501,6 @@ class SbiAdapter(ProtocolAdapter):
                 'SM Context create → modify → release (complete PDU session lifecycle)',
                 is_valid=True,
             ),
-
-            # Invalid / attack sequences
             StateTransition(
                 'discover_before_register',
                 ['nrf_nf_discover'],
@@ -870,21 +1527,29 @@ class SbiAdapter(ProtocolAdapter):
                 is_valid=False,
             ),
             StateTransition(
+                'malformed_then_valid',
+                ['nrf_nf_register_malformed', 'nrf_nf_register'],
+                'Malformed NF Profile followed by valid registration (state recovery test)',
+                is_valid=False,
+            ),
+            # ── AMF flows ─────────────────────────────────────────────────
+            StateTransition(
                 'n1n2_before_ue_ctx',
                 ['amf_n1n2_msg'],
                 'N1N2MessageTransfer before UE Context exists (context-not-found error path)',
                 is_valid=False,
             ),
             StateTransition(
-                'smf_ctx_wrong_plmn',
-                ['smf_ctx_create_wrong_plmn'],
-                'SM Context create with PLMN not configured in open5GS',
-                is_valid=False,
-            ),
-            StateTransition(
                 'amf_bad_supi',
                 ['amf_ue_ctx_bad_supi'],
                 'UE Context create with malformed SUPI (format validation / IMSI parse error)',
+                is_valid=False,
+            ),
+            # ── SMF flows ─────────────────────────────────────────────────
+            StateTransition(
+                'smf_ctx_wrong_plmn',
+                ['smf_ctx_create_wrong_plmn'],
+                'SM Context create with PLMN not configured in open5GS',
                 is_valid=False,
             ),
             StateTransition(
@@ -900,11 +1565,75 @@ class SbiAdapter(ProtocolAdapter):
                 is_valid=False,
             ),
             StateTransition(
-                'malformed_then_valid',
-                ['nrf_nf_register_malformed', 'nrf_nf_register'],
-                'Malformed NF Profile followed by valid registration (state recovery test)',
+                'smf_use_after_release',
+                ['smf_ctx_create', 'smf_ctx_release', 'smf_ctx_modify'],
+                'Create SM context → release → modify the released ref '
+                '(use-after-free / dangling SmContextRef probe)',
                 is_valid=False,
             ),
+            StateTransition(
+                'smf_double_release',
+                ['smf_ctx_create', 'smf_ctx_release', 'smf_ctx_release'],
+                'Create SM context → release → release same ref (double-free probe)',
+                is_valid=False,
+            ),
+            # ── UDR flows ─────────────────────────────────────────────────
+            StateTransition(
+                'udr_sub_data_read',
+                ['udr_subscription_data_get'],
+                'GET /nudr-dr/v1/subscription-data/{supi}/authentication-data '
+                '(auth subscription read — supi_path_variant fuzzing)',
+                is_valid=True,
+            ),
+            StateTransition(
+                'udr_sub_data_write',
+                ['udr_subscription_data_put'],
+                'PUT /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access '
+                '(AMF registration write — exercises UDR DBI write path)',
+                is_valid=False,
+            ),
+            StateTransition(
+                'udr_policy_data_read',
+                ['udr_policy_data_get'],
+                'GET /nudr-dr/v1/policy-data/ues/{supi}/am-data '
+                '(policy AM data read — supi_path_variant fuzzing #4412 style)',
+                is_valid=True,
+            ),
+            StateTransition(
+                'udr_amf_reg_write',
+                ['udr_subscription_data_put', 'udr_subscription_data_get'],
+                'PUT then GET amf-3gpp-access (write then read — tests state consistency)',
+                is_valid=False,
+            ),
+            # ── UDM SDM subscription lifecycle ────────────────────────────
+            # The create step returns 201 + Location; generic_env captures the
+            # real subscriptionId and propagates it (__location_id__) to the
+            # modify/delete steps so they target the resource just created.
+            StateTransition(
+                'udm_sub_lifecycle',
+                ['udm_sdm_sub_create', 'udm_sdm_sub_modify', 'udm_sdm_sub_delete'],
+                'Create SDM subscription → modify → delete (full lifecycle with real id)',
+                is_valid=True,
+            ),
+            StateTransition(
+                'udm_sub_use_after_delete',
+                ['udm_sdm_sub_create', 'udm_sdm_sub_delete', 'udm_sdm_sub_modify'],
+                'Create → delete → PATCH the deleted subscription (use-after-free / dangling ref)',
+                is_valid=False,
+            ),
+            StateTransition(
+                'udm_sub_double_delete',
+                ['udm_sdm_sub_create', 'udm_sdm_sub_delete', 'udm_sdm_sub_delete'],
+                'Create → delete → delete same subscription (double-free probe)',
+                is_valid=False,
+            ),
+            StateTransition(
+                'udm_sub_modify_no_create',
+                ['udm_sdm_sub_modify'],
+                'PATCH a subscriptionId that was never created (not-found handler path)',
+                is_valid=False,
+            ),
+            # ── H2 frame-level attacks (valid for any NF target) ──────────
             StateTransition(
                 'h2_frame_attack',
                 ['h2_window_amplification', 'nrf_nf_register'],
@@ -919,6 +1648,10 @@ class SbiAdapter(ProtocolAdapter):
             ),
         ]
 
+        if allowed is None:
+            return all_transitions
+        return [t for t in all_transitions if t.name in allowed]
+
     # ── Baseline fields for scenario setup messages ───────────────────────
 
     def get_priority_payload_types(self) -> list:
@@ -931,6 +1664,12 @@ class SbiAdapter(ProtocolAdapter):
         These are applied verbatim so setup steps succeed and establish the
         required server state before the fuzz_message is executed.
         """
+        # Derive the baseline SUPI from the configured PLMN so stateful NFs
+        # (SMF/AMF) target a subscriber whose home PLMN matches the serving
+        # network — a mismatch makes SMF treat the session as HR roaming. The
+        # preflight provisions imsi-<mcc><mnc>0000000001 to match.
+        _msin = '0' * (15 - 3 - len(self._plmn_mnc) - 1) + '1'
+        baseline_supi = f'imsi-{self._plmn_mcc}{self._plmn_mnc}{_msin}'
         return {
             'nf_instance_id': NF_INSTANCE_FUZZ,
             'nf_type':        'AMF',
@@ -939,7 +1678,7 @@ class SbiAdapter(ProtocolAdapter):
             'plmn_mnc':       self._plmn_mnc,
             'snssai_sst':     1,
             'snssai_sd':      '010203',
-            'supi':           'imsi-001010000000001',
+            'supi':           baseline_supi,
             'pdu_session_id': 1,
             'dnn':            'internet',
             'access_type':    '3GPP_ACCESS',
@@ -962,7 +1701,11 @@ class SbiAdapter(ProtocolAdapter):
         'UDM':  ['amf_ue_ctx_create', 'udm_auth_data', 'udm_uecm_amf_reg',
                  'udm_uecm_amf_reg_incomplete'],
         'UDR':  ['udr_malformed_pei'],
-        'PCF':  ['smf_ctx_create'],
+        'PCF':  ['pcf_sm_policy_create', 'pcf_am_policy_create',
+                 'pcf_app_session_create', 'pcf_sm_policy_update_notify'],
+        'NSSF': ['nssf_nssai_availability'],
+        'BSF':  ['bsf_pcf_binding_create'],
+        'CHF':  ['chf_charging_create', 'chf_charging_update'],
         'AUSF': ['ausf_auth_create', 'ausf_eap_session'],
     }
 
@@ -991,6 +1734,21 @@ class SbiAdapter(ProtocolAdapter):
 
     # ── Predefined fuzzing scenarios ──────────────────────────────────────
 
+    # Maps NF type → the target_api prefixes that belong to that NF.
+    # Scenarios whose target_api is NOT in this set are silently dropped when
+    # the adapter is configured for that NF, preventing e.g. AMF messages being
+    # sent to UDR (which would always 404 and give the RL agent no useful signal).
+    _NF_API_MAP: dict[str, set[str]] = {
+        'NRF':  {'NRF_NFM', 'NRF_DISC', 'NRF_CB'},
+        'AMF':  {'AMF_UE', 'AMF_CB', 'AMF_EVTS'},
+        'SMF':  {'SMF_SM', 'SMF_CB'},
+        'UDM':  {'UDM_SDM', 'UDM_UCM', 'UDM_UEAU'},
+        'UDR':  {'UDR_DR'},
+        'AUSF': {'AUSF_AUTH'},
+        'PCF':  {'PCF_AM', 'PCF_SM', 'PCF_UE'},
+        # For NFs with no specific mapping, all scenarios pass through.
+    }
+
     def get_scenarios(self) -> List[FuzzScenario]:
         """Per-API fuzzing scenarios with explicit setup + fuzz target.
 
@@ -998,13 +1756,19 @@ class SbiAdapter(ProtocolAdapter):
           setup_messages  — sent with get_baseline_fields() so they succeed
           fuzz_message    — the API call under test; mutations applied here
           relevant_fields — which semantic fields to cycle through for this API
+
+        Only scenarios whose target_api belongs to the configured NF type are
+        returned.  This prevents the RL agent wasting timesteps sending AMF/SMF/
+        NRF messages to (e.g.) UDR, where they will always 404.
         """
         _nfm = 'NRF_NFM'    # NRF NF Management  (TS 29.510 §6.1)
         _disc = 'NRF_DISC'  # NRF Discovery       (TS 29.510 §6.2)
         _amf  = 'AMF_UE'    # AMF UE Context      (TS 29.518 §6.3)
         _smf  = 'SMF_SM'    # SMF SM Context      (TS 29.502 §5.2)
 
-        return [
+        allowed_apis = self._NF_API_MAP.get(self._nf_type)
+
+        all_scenarios = [
             # ── NRF NF Management ─────────────────────────────────────────
             FuzzScenario(
                 name='nrf_fuzz_register_body',
@@ -1666,6 +2430,66 @@ class SbiAdapter(ProtocolAdapter):
             ),
         ]
 
+        if allowed_apis is not None:
+            all_scenarios = [s for s in all_scenarios if s.target_api in allowed_apis]
+
+        # ── Spec-driven FivGeeFuzz scenarios (filtered to current NF by _build_spec_msg_tables) ──
+        # relevant_fields=[] because build_message already applies the structural mutation
+        # (field omit or type mismatch) at call time — field iteration would only duplicate
+        # the same structural request with different path params, adding noise not signal.
+        for mtype, sc in self._fivgee_info.items():
+            attack = sc.get('attack_class', 'fivgee')
+            detail = sc.get('omitted_field') or sc.get('target_field', '')
+            setup, stateful = self._setup_for_consumer(sc.get('operation_id', ''))
+            all_scenarios.append(FuzzScenario(
+                name=mtype,
+                target_api=f'{self._nf_type}_SPEC',
+                setup_messages=setup,
+                fuzz_message=mtype,
+                description=(
+                    f"{attack}: {sc.get('method', '')} {sc.get('path', '')} "
+                    f"— {detail}" + (f"  [setup: {setup[0]}]" if stateful else "")
+                ),
+                relevant_fields=[],
+                stateful=stateful,
+            ))
+
+        # ── Spec-semantic: required-field omission + per-field value mutations ──
+        for mtype, sc in self._spec_sem_info.items():
+            attack = sc.get('attack_class', 'spec_semantic')
+            field  = sc.get('omitted_field') or sc.get('field', '')
+            val    = sc.get('value', '')
+            detail = f"omit required '{field}'" if attack == 'spec_omit_required' \
+                     else f"field '{field}'={val!r:.40}"
+            setup, stateful = self._setup_for_consumer(sc.get('operation_id', ''))
+            all_scenarios.append(FuzzScenario(
+                name=mtype,
+                target_api=f'{self._nf_type}_SPEC',
+                setup_messages=setup,
+                fuzz_message=mtype,
+                description=f"{attack}: {sc.get('method','')} {sc.get('path','')} — {detail}"
+                            + (f"  [setup: {setup[0]}]" if stateful else ""),
+                relevant_fields=[],
+                stateful=stateful,
+            ))
+
+        # ── FivGeeFuzz Bug 8: cross-service token confusion ───────────────────
+        for mtype, payload in self._xst_info.items():
+            all_scenarios.append(FuzzScenario(
+                name=mtype,
+                target_api=f'{self._nf_type}_SPEC',
+                setup_messages=[],
+                fuzz_message=mtype,
+                description=(
+                    f"FivGeeFuzz Bug 8: scope='{payload.get('scope_in_token','')}' "
+                    f"against {payload.get('reuse_target_nf','')} "
+                    f"{payload.get('reuse_endpoint_prefix','')}"
+                ),
+                relevant_fields=[],
+            ))
+
+        return all_scenarios
+
     # ── Payload targets ───────────────────────────────────────────────────
 
     def get_payload_targets(self) -> List[PayloadTarget]:
@@ -1730,6 +2554,11 @@ class SbiAdapter(ProtocolAdapter):
         'udr_policy_supi_fuzz':     ('GET',    'udr_policy_supi',  'udr_policy_supi_fuzz'),
         'udr_sub_supi_fuzz':        ('GET',    'udr_sub_supi',       'udr_sub_supi_fuzz'),
         'udr_sub_provisioned_fuzz': ('GET',    'udr_sub_provisioned','udr_sub_provisioned_fuzz'),
+        # ── UDR state-transition message types ────────────────────────────
+        # Used by UDR-specific StateTransitions; correct HTTP methods per 3GPP TS 29.505
+        'udr_subscription_data_get': ('GET',  'udr_sub_supi',  'udr_sub_supi_fuzz'),
+        'udr_subscription_data_put': ('PUT',  'udr_ctx_data',  'udr_malformed_pei'),
+        'udr_policy_data_get':       ('GET',  'udr_policy_supi','udr_policy_supi_fuzz'),
         # ── New crash-confirmed endpoints ──────────────────────────────────
         'amf_ue_ctx_transfer':      ('POST',   'amf_ue_ctx_transfer',        'amf_ue_ctx_transfer'),
         'amf_ue_ctx_transfer_update':('POST',  'amf_ue_ctx_transfer_update', 'amf_ue_ctx_transfer_update'),
@@ -1741,6 +2570,10 @@ class SbiAdapter(ProtocolAdapter):
         'ausf_eap_session':         ('POST',   'ausf_eap',                   'ausf_eap_session'),
         'udm_auth_data':            ('POST',   'udm_auth_data',              'udm_auth_data'),
         'udm_uecm_amf_reg':         ('PUT',    'udm_uecm_amf',               'udm_uecm_amf_reg'),
+        # UDM SDM subscription lifecycle (producer→consumer chain)
+        'udm_sdm_sub_create':       ('POST',   'udm_sdm_sub',                'udm_sdm_sub_create'),
+        'udm_sdm_sub_modify':       ('PATCH',  'udm_sdm_sub_ref',            'udm_sdm_sub_modify'),
+        'udm_sdm_sub_delete':       ('DELETE', 'udm_sdm_sub_ref',            'udm_sdm_sub_delete'),
         'smf_policy_notify':        ('POST',   'smf_policy_notify',          'smf_policy_notify'),
         'nrf_status_notify':        ('POST',   'nrf_status_notify',          'nrf_status_notify'),
         # ── Cross-platform messages (free5GC + open5GS) ─────────────────────
@@ -1751,6 +2584,56 @@ class SbiAdapter(ProtocolAdapter):
         'udm_uecm_amf_reg_incomplete':('PUT',   'udm_uecm_amf',               'udm_uecm_amf_reg_incomplete'),
         'amf_evts_sub_modify':        ('PATCH', 'amf_evts_sub_ref',           'amf_evts_sub_modify'),
         'amf_ue_ctx_restricted_rat':  ('PUT',   'amf_ue_ctx',                 'amf_ue_ctx_restricted_rat'),
+        # ── PCF ───────────────────────────────────────────────────────────────
+        'pcf_sm_policy_create':         ('POST',   'pcf_sm_policy',            'pcf_sm_policy_create'),
+        'pcf_sm_policy_create_no_supi': ('POST',   'pcf_sm_policy',            'pcf_sm_policy_create_no_supi'),
+        'pcf_sm_policy_get':            ('GET',    'pcf_sm_policy_ref',        'pcf_sm_policy_get'),
+        'pcf_sm_policy_delete':         ('POST',   'pcf_sm_policy_delete_ref', 'pcf_sm_policy_delete'),
+        'pcf_am_policy_create':         ('POST',   'pcf_am_policy',            'pcf_am_policy_create'),
+        'pcf_am_policy_delete':         ('POST',   'pcf_am_policy_delete_ref', 'pcf_am_policy_delete'),
+        'pcf_app_session_create':       ('POST',   'pcf_app_session',          'pcf_app_session_create'),
+        'pcf_sm_policy_update_notify':  ('POST',   'pcf_sm_policy_notify_ref', 'pcf_sm_policy_update_notify'),
+        # ── NSSF ──────────────────────────────────────────────────────────────
+        'nssf_nsselection':             ('GET',    'nssf_nsselection',         'nssf_nsselection'),
+        'nssf_nsselection_empty_snssai':('GET',    'nssf_nsselection_empty',   'nssf_nsselection_empty_snssai'),
+        'nssf_nsselection_bad_plmn':    ('GET',    'nssf_nsselection_bad_plmn','nssf_nsselection_bad_plmn'),
+        'nssf_nssai_availability':      ('PUT',    'nssf_nssai_avail',         'nssf_nssai_availability'),
+        'nssf_nssai_availability_delete':('DELETE','nssf_nssai_avail',         'nssf_nssai_availability_delete'),
+        # ── BSF ───────────────────────────────────────────────────────────────
+        'bsf_pcf_binding_create':       ('POST',   'bsf_binding',              'bsf_pcf_binding_create'),
+        'bsf_pcf_binding_create_no_ip': ('POST',   'bsf_binding',              'bsf_pcf_binding_no_ip'),
+        'bsf_pcf_binding_get':          ('GET',    'bsf_binding_query',        'bsf_pcf_binding_get'),
+        'bsf_pcf_binding_delete':       ('DELETE', 'bsf_binding_ref',          'bsf_pcf_binding_delete'),
+        # ── CHF ───────────────────────────────────────────────────────────────
+        'chf_charging_create':          ('POST',   'chf_charging',             'chf_charging_create'),
+        'chf_charging_create_no_supi':  ('POST',   'chf_charging',             'chf_charging_create_no_supi'),
+        'chf_charging_update':          ('POST',   'chf_charging_update_ref',  'chf_charging_update'),
+        'chf_charging_release':         ('DELETE', 'chf_charging_ref',         'chf_charging_release'),
+        # ── NRF auth-bypass gap-fill ──────────────────────────────────────────
+        'nrf_register_no_nf_type':      ('PUT',    'nrf_nf_instance_gap',       'nrf_register_no_nf_type'),
+        'nrf_register_unknown_type':    ('PUT',    'nrf_nf_instance_gap',       'nrf_register_unknown_type'),
+        'nrf_register_self_as_nrf':     ('PUT',    'nrf_nf_instance_gap',       'nrf_register_self_as_nrf'),
+        'nrf_register_conflicting_id':  ('PUT',    'nrf_nf_instance_gap',       'nrf_register_conflicting_id'),
+        'nrf_disc_no_params':           ('GET',    'nrf_disc_no_params',        'nrf_disc_no_params'),
+        # ── SMF gap-fill ──────────────────────────────────────────────────────
+        'smf_ctx_create_no_supi':       ('POST',   'smf_ctx',                   'smf_ctx_create_no_supi'),
+        'smf_ctx_create_empty_supi':    ('POST',   'smf_ctx',                   'smf_ctx_create_empty_supi'),
+        'smf_ctx_create_bad_qos':       ('POST',   'smf_ctx',                   'smf_ctx_create_bad_qos'),
+        'smf_ctx_create_no_dnn':        ('POST',   'smf_ctx',                   'smf_ctx_create_no_dnn'),
+        'smf_ctx_create_invalid_pdu_type': ('POST', 'smf_ctx',                  'smf_ctx_create_invalid_pdu_type'),
+        'smf_ctx_modify_no_ctx':        ('POST',   'smf_ctx_modify_no_ctx',     'smf_ctx_modify_no_ctx'),
+        # ── AUSF gap-fill ─────────────────────────────────────────────────────
+        'ausf_auth_bad_suci':           ('POST',   'ausf_auth_gap',             'ausf_auth_bad_suci'),
+        'ausf_auth_empty_suci':         ('POST',   'ausf_auth_gap',             'ausf_auth_empty_suci'),
+        'ausf_auth_long_suci':          ('POST',   'ausf_auth_gap',             'ausf_auth_long_suci'),
+        'ausf_auth_resynch':            ('POST',   'ausf_auth_gap',             'ausf_auth_resynch'),
+        'ausf_auth_wrong_network':      ('POST',   'ausf_auth_gap',             'ausf_auth_wrong_network'),
+        # ── AMF SBI gap-fill ──────────────────────────────────────────────────
+        'amf_n1n2_garbage_nas':         ('POST',   'amf_n1n2_gap',              'amf_n1n2_garbage_nas'),
+        'amf_n1n2_oversized_nas':       ('POST',   'amf_n1n2_gap',              'amf_n1n2_oversized_nas'),
+        'amf_n1n2_empty_nas':           ('POST',   'amf_n1n2_gap',              'amf_n1n2_empty_nas'),
+        'amf_ue_ctx_no_supi':           ('PUT',    'amf_ue_ctx_gap',            'amf_ue_ctx_no_supi'),
+        'amf_ue_ctx_bad_plmn':          ('PUT',    'amf_ue_ctx_gap',            'amf_ue_ctx_bad_plmn'),
     }
 
     def _build_path(self, path_key: str, fields: Dict[str, Any]) -> str:
@@ -1760,9 +2643,17 @@ class SbiAdapter(ProtocolAdapter):
         nf_type   = str(fields.get('nf_type', 'AMF'))
         pdu_sid   = int(fields.get('pdu_session_id', 1))
         # Synthesise a deterministic SM context reference from pdu_session_id
-        sm_ref    = f'ctx-{pdu_sid:04d}'
+        # Prefer the real SmContextRef captured from a prior create's Location
+        # (propagated as __location_id__) so modify/release target the actual
+        # context; fall back to a synthetic ref when there was no create.
+        sm_ref    = str(fields.get('__location_id__') or f'ctx-{pdu_sid:04d}')
         # Inject payload into path if requested
         path_payload = fields.get('_path_payload', None)
+        # Real resource id captured from a prior create's Location header (set by
+        # generic_env after a stateful setup step) — lets a consumer step target
+        # the resource that was just created instead of a synthetic id.
+        loc_id = fields.get('__location_id__')
+        sst = int(fields.get('snssai_sst', 1))
 
         # 13-PLMN list for #4382 — fixed in path so the query string is exact
         plmn_list = ','.join(f'{i:03d}-{i:02d}' for i in range(1, 14))
@@ -1836,6 +2727,14 @@ class SbiAdapter(ProtocolAdapter):
             # UDM (#4418/#1037/#4419/#4420)
             'udm_auth_data':  _udm_auth_data_path(path_payload or supi),
             'udm_uecm_amf':   _udm_uecm_amf_path(path_payload or supi),
+            # UDM SDM subscription lifecycle: collection (POST → 201+Location)
+            # and instance (PATCH/DELETE on the real subscriptionId from the
+            # create's Location, falling back to a synthetic id).
+            'udm_sdm_sub':     f'/nudm-sdm/v2/{supi}/sdm-subscriptions',
+            'udm_sdm_sub_ref': (
+                f'/nudm-sdm/v2/{supi}/sdm-subscriptions/'
+                f'{loc_id or path_payload or f"sub-{pdu_sid}"}'
+            ),
             # SMF callback (#4442/#4453)
             'smf_policy_notify': _smf_policy_notify_path(f'ctx-{pdu_sid}'),
             # NRF status notify (#4406)
@@ -1847,6 +2746,41 @@ class SbiAdapter(ProtocolAdapter):
             'nrf_oauth2':         _nrf_oauth2_path(),
             'udm_sdm_shared_data': _udm_sdm_shared_data_path(),
             'amf_evts_sub_ref':   _amf_evts_sub_ref_path(f'sub-{pdu_sid}'),
+            # ── PCF paths ────────────────────────────────────────────────────
+            'pcf_sm_policy':            _pcf_sm_policy_path(),
+            'pcf_sm_policy_ref':        _pcf_sm_policy_path(f'pol-{pdu_sid}'),
+            'pcf_sm_policy_delete_ref': _pcf_sm_policy_delete_path(f'pol-{pdu_sid}'),
+            'pcf_am_policy':            _pcf_am_policy_path(),
+            'pcf_am_policy_delete_ref': _pcf_am_policy_delete_path(f'pol-am-{pdu_sid}'),
+            'pcf_app_session':          _pcf_app_session_path(),
+            'pcf_sm_policy_notify_ref': _pcf_sm_policy_notify_path(f'pol-{pdu_sid}'),
+            # ── NSSF paths ────────────────────────────────────────────────────
+            'nssf_nsselection':        _nssf_nsselection_path(nf_type, sst),
+            'nssf_nsselection_empty':  _nssf_nsselection_empty_path(),
+            'nssf_nsselection_bad_plmn': (
+                '/nnssf-nsselection/v2/network-slice-information'
+                '?nf-type=AMF&home-plmn-id=%7B%22mcc%22%3Anull%2C%22mnc%22%3Anull%7D'
+            ),
+            'nssf_nssai_avail':        _nssf_nssai_availability_path(nf_id),
+            # ── BSF paths ─────────────────────────────────────────────────────
+            'bsf_binding':             _bsf_binding_path(),
+            'bsf_binding_query':       _bsf_binding_query_path(),
+            'bsf_binding_ref':         _bsf_binding_path(f'bind-{pdu_sid}'),
+            # ── CHF paths ─────────────────────────────────────────────────────
+            'chf_charging':            _chf_charging_path(),
+            'chf_charging_update_ref': _chf_charging_update_path(f'chg-ref-{pdu_sid}'),
+            'chf_charging_ref':        _chf_charging_path(f'chg-ref-{pdu_sid}'),
+            # ── NRF auth-bypass gap-fill paths ────────────────────────────────
+            'nrf_nf_instance_gap':     _nrf_nf_instance_path(nf_id),
+            'nrf_disc_no_params':      '/nnrf-disc/v1/nf-instances',
+            # ── SMF gap-fill paths ────────────────────────────────────────────
+            'smf_ctx_modify_no_ctx':   _smf_sm_ctx_modify_path('ctx-nonexistent-0000'),
+            # ── AUSF gap-fill paths ───────────────────────────────────────────
+            'ausf_auth_gap':           _ausf_auth_path(),
+            'ausf_eap_gap':            _ausf_eap_path(path_payload or supi),
+            # ── AMF gap-fill paths ────────────────────────────────────────────
+            'amf_n1n2_gap':            _amf_n1n2_path(path_payload or supi),
+            'amf_ue_ctx_gap':          _amf_ue_ctx_path(path_payload or supi),
         }
         return table.get(path_key, '/')
 
@@ -1879,6 +2813,136 @@ class SbiAdapter(ProtocolAdapter):
                 authority=authority,
                 body=b'',
                 content_type='multipart/related; boundary=Boundary',
+                include_preface=True,
+            )
+
+        # ── Spec-driven: baseline operation request ────────────────────────
+        if message_type in self._spec_msg_info:
+            info   = self._spec_msg_info[message_type]
+            method = info['method']
+            op_id  = info['op_id']
+            path   = self._resolve_spec_path(info['path'], fields)
+            baseline = dict(self._spec_mutations.valid_body_baseline(op_id))
+            if payloads.get('json_body'):
+                body: Optional[bytes] = payloads['json_body']
+            else:
+                # Apply semantic field overrides into the baseline body
+                for fs_name in self._spec_mutations.required_body_fields(op_id):
+                    if fs_name in fields:
+                        baseline[fs_name] = fields[fs_name]
+                body = json.dumps(baseline).encode() if baseline else None
+            return build_sbi_request(
+                method=method,
+                path=path,
+                authority=self._authority(),
+                body=body if body else None,
+                extra_headers=[('3gpp-sbi-target-nf-type', self._nf_type)],
+                content_type='application/json',
+                include_preface=True,
+            )
+
+        # ── FivGeeFuzz Bug 1/2/5 (omit optional) and Bug 3/6 (type mismatch) ──
+        if message_type in self._fivgee_info:
+            sc     = self._fivgee_info[message_type]
+            method = sc.get('method', 'GET')
+            path   = self._resolve_spec_path(sc.get('path', '/'), fields)
+            op_id  = sc.get('operation_id', '')
+            attack = sc.get('attack_class', '')
+
+            baseline = dict(self._spec_mutations.valid_body_baseline(op_id))
+            if attack in ('fivgee_omit_optional', 'fivgee_omit_query_param'):
+                omit = sc.get('omitted_field', '')
+                baseline.pop(omit, None)
+            elif attack == 'fivgee_type_mismatch':
+                target_field = sc.get('target_field', '')
+                wrong_value  = sc.get('wrong_value')
+                if target_field:
+                    baseline[target_field] = wrong_value
+
+            # A json_body payload injection overrides the structural body so the
+            # request still carries content (open5GS routes POST .../update with
+            # no body to 404; a body reaches the resource handler).
+            if payloads.get('json_body'):
+                body = payloads['json_body']
+            else:
+                body = json.dumps(baseline).encode() if baseline else None
+            return build_sbi_request(
+                method=method,
+                path=path,
+                authority=self._authority(),
+                body=body if body else None,
+                extra_headers=[('3gpp-sbi-target-nf-type', self._nf_type)],
+                content_type='application/json',
+                include_preface=True,
+            )
+
+        # ── Spec-semantic: required-field omission + per-field value mutations ──
+        if message_type in self._spec_sem_info:
+            sc     = self._spec_sem_info[message_type]
+            method = sc.get('method', 'GET')
+            path   = self._resolve_spec_path(sc.get('path', '/'), fields)
+            op_id  = sc.get('operation_id', '')
+            attack = sc.get('attack_class', '')
+
+            baseline = dict(self._spec_mutations.valid_body_baseline(op_id))
+            if attack == 'spec_omit_required':
+                omit = sc.get('omitted_field', '')
+                baseline.pop(omit, None)
+            elif attack == 'spec_field_value':
+                fname = sc.get('field', '')
+                val   = sc.get('value')
+                if fname:
+                    if method in ('GET', 'DELETE') and not baseline:
+                        sep = '&' if '?' in path else '?'
+                        path = f"{path}{sep}{fname}={val}"
+                    else:
+                        baseline[fname] = val
+
+            if payloads.get('json_body'):
+                body = payloads['json_body']
+            else:
+                body = json.dumps(baseline).encode() if baseline else None
+            return build_sbi_request(
+                method=method,
+                path=path,
+                authority=self._authority(),
+                body=body if body else None,
+                extra_headers=[('3gpp-sbi-target-nf-type', self._nf_type)],
+                content_type='application/json',
+                include_preface=True,
+            )
+
+        # ── FivGeeFuzz Bug 8: cross-service token confusion ───────────────
+        if message_type in self._xst_info:
+            payload    = self._xst_info[message_type]
+            scope      = payload.get('scope_in_token', 'nudm-sdm')
+            target_nf  = payload.get('reuse_target_nf', 'NRF')
+            ep_prefix  = payload.get('reuse_endpoint_prefix', '/nnrf-nfm')
+            # Build a minimal fake JWT with the wrong scope
+            hdr = base64.urlsafe_b64encode(
+                json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
+            ).rstrip(b'=').decode()
+            jwt_payload = base64.urlsafe_b64encode(
+                json.dumps({
+                    "sub": "fuzz-nf",
+                    "iss": "NRF",
+                    "scope": scope,
+                    "nfType": payload.get('reuse_target_nf', 'UDM'),
+                }).encode()
+            ).rstrip(b'=').decode()
+            fake_jwt = f"{hdr}.{jwt_payload}.fakesig"
+            # GET to the target NF's base endpoint with the wrong-scoped token
+            xst_path = f'{ep_prefix}/v1/'
+            return build_sbi_request(
+                method='GET',
+                path=xst_path,
+                authority=self._authority(),
+                body=None,
+                extra_headers=[
+                    ('3gpp-sbi-target-nf-type', target_nf),
+                    ('authorization', f'Bearer {fake_jwt}'),
+                ],
+                content_type='application/json',
                 include_preface=True,
             )
 
@@ -1921,8 +2985,26 @@ class SbiAdapter(ProtocolAdapter):
             body_bytes = build_body(template_name, fields)
             body = body_bytes if body_bytes else None
 
+        # SMF sm-context creates need a multipart/related body carrying the N1
+        # (5GSM NAS) content as a '5gnas-sm' part — wrap the JSON body here so the
+        # request reaches the gsm-sm state machine instead of 400'ing at parse.
+        smf_multipart = False
+        if message_type in _SMF_N1_CREATE_MSGS and body:
+            psi = int(fields.get('pdu_session_id', 1))
+            body = _wrap_multipart_related(
+                body, _smf_n1_pdu_session_establishment(psi, 1))
+            smf_multipart = True
+
         # Override Content-Type if mutated
         content_type = str(fields.get('content_type', 'application/json'))
+        if smf_multipart and content_type == 'application/json':
+            content_type = 'multipart/related; boundary=NfBoundary; type="application/json"'
+        # JSON Patch endpoints (PATCH SDM subscription) need the json-patch media
+        # type at the SBI parse layer — otherwise open5GS 400s ("cannot parse HTTP
+        # message") before the subscription-lookup handler runs.  Only apply when
+        # content-type isn't being actively fuzzed away from the default.
+        if message_type == 'udm_sdm_sub_modify' and content_type == 'application/json':
+            content_type = 'application/json-patch+json'
 
         # Override stream ID if mutated (frame-level fuzzing)
         sid_raw = fields.get('stream_id', 1)
@@ -1980,7 +3062,15 @@ class SbiAdapter(ProtocolAdapter):
         # misrepresent the server's response and inflate rewards (+35) for
         # ordinary error replies.  A bare RST_STREAM (no status) is a genuine
         # H2 framing anomaly and keeps its classification.
-        if parsed.get('goaway'):
+        # GOAWAY only takes precedence over the HTTP status when it carries a
+        # real H2 error (h2_error != NO_ERROR) or arrived with no status.  free5GC's
+        # Go net/http2 server emits a *graceful* GOAWAY (h2_error=0/NO_ERROR) on
+        # every connection-per-request close, even alongside a valid 200/404 — so
+        # classifying any GOAWAY as 'goaway' would mask the real status, suppress the
+        # body-depth reward, and pay the 'goaway' anomaly bonus for ordinary replies.
+        # Mirrors the rst_stream rule below.  (open5GS/nghttp2 doesn't GOAWAY on
+        # normal responses, and its error GOAWAYs carry h2_error != 0 — unaffected.)
+        if parsed.get('goaway') and (status is None or parsed.get('h2_error', 0) != 0):
             rtype = 'goaway'
         elif parsed.get('rst_stream') and status is None:
             rtype = 'rst_stream'
@@ -2038,6 +3128,21 @@ class SbiAdapter(ProtocolAdapter):
             'h2_error':     parsed.get('h2_error', 0),
         }
 
+        # Resource location: open5GS returns the created resource's URI in the
+        # Location header (and, for some NFs, an id inside the body).  Capturing
+        # the real id lets a follow-up consumer step (update/get/delete) target
+        # the actual resource instead of a synthetic id that would 404.
+        headers = parsed.get('headers', {}) or {}
+        location = headers.get('location', '')
+        if location:
+            result['location'] = location
+            # resource_id = last non-empty path segment of the Location URI
+            rid = location.rstrip('/').rsplit('/', 1)[-1]
+            # Strip any query/fragment that may trail the id
+            rid = rid.split('?', 1)[0].split('#', 1)[0]
+            if rid:
+                result['resource_id'] = rid
+
         # Parse response body: extract ProblemDetails depth signal + body length
         body = parsed.get('body', b'')
         if body:
@@ -2045,6 +3150,20 @@ class SbiAdapter(ProtocolAdapter):
             result['body_preview'] = body[:200]
             # RFC 7807 ProblemDetails: score how deep the validation error is
             result['body_depth_score'] = _score_problem_detail(body)
+            # Pull a stable problem cause/title (used as a state-token component)
+            # and an id from the created body (SM policies echo their id in body).
+            try:
+                doc = json.loads(body.decode('utf-8', errors='replace'))
+            except (ValueError, TypeError):
+                doc = None
+            if isinstance(doc, dict):
+                cause = doc.get('cause') or doc.get('title') or doc.get('detail')
+                if cause:
+                    result['problem_cause'] = str(cause)[:120]
+                if 'resource_id' not in result:
+                    bid = doc.get('smPolicyId') or doc.get('id') or doc.get('appSessionId')
+                    if bid:
+                        result['resource_id'] = str(bid)
 
         return result
 
@@ -2101,12 +3220,51 @@ class SbiAdapter(ProtocolAdapter):
     def pre_request_snapshot(self) -> int:
         """Snapshot log position before sending a request.
 
-        Also resets gcov counters when gcov mode is active (gcov_gcda_dir set),
-        so coverage collected by compute_reward() reflects only this request.
+        gcov counters are kept CUMULATIVE across requests (no per-request reset).
+        The coverage reward (gcov_new_lines) diffs covered lines against a
+        campaign-cumulative set, so per-request isolation buys nothing — and a
+        reset + full .gcda dump on every request was the dominant throughput
+        cost (~0.5s/step). Cumulative, monotonic counters also let the
+        out-of-band sampler in run_sbi_compare.sh read a clean coverage growth
+        curve while the campaign runs.
         """
-        if self._gcov_nf_filter:
-            self._monitor.gcov_reset()
         return self._monitor.snapshot_log_position()
+
+    def detect_log_panic(self, log_snapshot: int) -> Optional[str]:
+        """Return a panic/fatal signature if the log lines written since
+        *log_snapshot* contain a recovered Go panic (process still alive), else None.
+
+        free5GC's gin Recovery middleware swallows handler panics — the process
+        keeps running, so the env's process-liveness crash check never sees them.
+        The env calls this after each fuzz request to surface them as findings.
+        """
+        if not log_snapshot:
+            return None
+        try:
+            lines = self._monitor.lines_since_snapshot(log_snapshot)
+        except Exception:
+            return None
+        if not lines:
+            return None
+        return self._monitor.detect_panic_in_lines(lines)
+
+    def step_log_signature(self, log_snapshot: int) -> Optional[str]:
+        """Return a stable hash of the source file:line locations emitted since
+        log_snapshot — the log-signature component of a per-step state token.
+
+        Read-only (does not touch episode coverage state), so it is safe to call
+        for every step in a sequence, including setup steps, without affecting
+        the coverage-based reward computed in compute_reward().
+        """
+        if not log_snapshot:
+            return None
+        lines = self._monitor.lines_since_snapshot(log_snapshot)
+        if not lines:
+            return None
+        locs = sorted(set(self._monitor.extract_file_lines(lines)))
+        if not locs:
+            return None
+        return str(hash(tuple(locs)) & 0xFFFFFFFF)
 
     def compute_reward(self, response: Dict[str, Any],
                        response_time_ms: float,
@@ -2157,7 +3315,9 @@ class SbiAdapter(ProtocolAdapter):
         # Both are suppressed for stream_id fuzz (GOAWAY is the expected response).
         if response.get('type') == 'rst_stream' and not stream_id_fuzz:
             reward += 35.0
-        elif response.get('goaway') and not stream_id_fuzz:
+        elif response.get('type') == 'goaway' and not stream_id_fuzz:
+            # type=='goaway' (not the raw flag) so free5GC's graceful per-connection
+            # GOAWAY accompanying a valid 200/404 is not paid the anomaly bonus.
             reward += 20.0
         # Non-zero H2 error code (PROTOCOL_ERROR, COMPRESSION_ERROR, etc.)
         # Suppress for stream_id fuzz — PROTOCOL_ERROR on stream 0 is expected.
@@ -2218,7 +3378,7 @@ class SbiAdapter(ProtocolAdapter):
                 gcov_locs = self._monitor.gcov_new_lines(
                     nf_filter=self._gcov_nf_filter,
                     dump_first=True,
-                    eval_every=5,   # run lcov every 5 steps; SIGUSR2 still sent every step
+                    eval_every=self._gcov_eval_every,  # SIGUSR2 dump + lcov gated together
                 )
                 gcov_bonus = min(len(gcov_locs) * 20.0, 100.0) if gcov_locs else 0.0
                 if gcov_bonus > 0:
@@ -2232,6 +3392,21 @@ class SbiAdapter(ProtocolAdapter):
                     logger.debug(
                         "gcov: no new lines (total covered: %d)",
                         self._monitor.gcov_coverage_count,
+                    )
+
+            # Go coverage-guided bonus (free5GC/ella).  SIGUSR2-dumps the -cover
+            # NF, reads `go tool covdata`, and rewards blocks newly covered this
+            # campaign.  +10 per new block, capped +80; covdata runs every 25
+            # steps (SIGUSR2 still fires each step so the snapshot stays current).
+            if self._go_cover_dir:
+                go_locs = self._monitor.go_cover_new_lines(
+                    dump_first=True, eval_every=self._go_cover_eval_every)
+                if go_locs:
+                    go_bonus = min(len(go_locs) * 10.0, 80.0)
+                    reward += go_bonus
+                    logger.info(
+                        "go-cover +%.0f reward | %d new blocks | %d total covered",
+                        go_bonus, len(go_locs), self._monitor.go_cover_count,
                     )
 
         return reward
@@ -2253,23 +3428,39 @@ class SbiAdapter(ProtocolAdapter):
             result.details['process_alive'] = False
             return result
 
-        # Send a GET /nnrf-nfm/v1/nf-instances?limit=1 request and check for
-        # a valid HTTP/2 response (200, 404, or any framed response is OK).
-        # This mirrors how inject_http2_alloc() verifies connectivity.
-        health_path = {
-            'NRF':  '/nnrf-nfm/v1/nf-instances?limit=1',
-            'AMF':  '/namf-comm/v1/ue-contexts/health-check',
-            'SMF':  '/nsmf-pdusession/v1/sm-contexts',
-            'UDM':  '/nudm-uecm/v1/health-check',
-            'PCF':  '/npcf-am-policy-control/v1/health-check',
-        }.get(self._nf_type, '/')
+        # Send a lightweight GET and check for a valid HTTP/2 response.
+        # For ella: use /api/v1/status (public, returns 200 with JSON).
+        # For open5GS/free5GC: use the standard 3GPP NRF path.
+        if self._core == 'ella':
+            health_path = '/api/v1/status'
+        else:
+            health_path = {
+                'NRF':  '/nnrf-nfm/v1/nf-instances?limit=1',
+                'AMF':  '/namf-comm/v1/ue-contexts/health-check',
+                'SMF':  '/nsmf-pdusession/v1/sm-contexts',
+                'UDM':  '/nudm-uecm/v1/health-check',
+                'PCF':  '/npcf-am-policy-control/v1/policies',
+                'NSSF': '/nnssf-nsselection/v2/network-slice-information?nf-type=AMF',
+                'BSF':  '/nbsf-management/v1/pcfBindings',
+                'CHF':  '/nchf-convergedcharging/v3/chargingdata',
+                'AUSF': '/nausf-auth/v1/ue-authentications',
+                'UDR':  '/nudr-dr/v1/policy-data/ues',
+            }.get(self._nf_type, '/')
 
+        use_tls = self._core == 'ella'
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
 
             t0 = time.monotonic()
             sock.connect((host, port))
+            if use_tls:
+                import ssl as _ssl
+                ctx = _ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                ctx.set_alpn_protocols(['h2'])
+                sock = ctx.wrap_socket(sock, server_hostname=host)
 
             # Build a minimal health-check GET request
             request = build_sbi_request(
@@ -2297,10 +3488,12 @@ class SbiAdapter(ProtocolAdapter):
                     result.is_healthy = True
                     result.details['status'] = status
                     result.details['frame_types'] = frame_types
+                    result.details['health_path'] = health_path
                 elif frame_types:
                     # Only SETTINGS/WINDOW_UPDATE — TCP connected but no response yet
                     result.is_healthy = True
                     result.details['status'] = 'settings_only'
+                    result.details['health_path'] = health_path
 
             sock.close()
 
@@ -2340,6 +3533,20 @@ class SbiAdapter(ProtocolAdapter):
                 result.details['failure_mode'] = 'hang'
 
         return result
+
+    def check_resource_growth(self) -> Optional[str]:
+        """Return RSS growth message if above threshold, else None.
+
+        Callable by GenericFuzzEnv every N steps so memory-leak sequences can
+        be saved to fuzzer/data/memory_leaks/ without waiting for a health-check.
+        Returns None when growth is within the warning threshold or monitor absent.
+        """
+        if self._monitor is None:
+            return None
+        msg = self._monitor.check_resource_growth(self._nf_type)
+        if msg and not msg.startswith('CRITICAL:'):
+            return msg
+        return None
 
     # ── Observation encoding ──────────────────────────────────────────────
 
