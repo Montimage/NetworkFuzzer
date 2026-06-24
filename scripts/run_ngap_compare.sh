@@ -37,6 +37,10 @@ OPEN5GS_VERSION="${OPEN5GS_VERSION:-v2.7.7}"
 AMF_HOST="${AMF_HOST:-127.0.0.5}"
 AMF_PORT="${AMF_PORT:-38412}"
 SEED_PCAP="${SEED_PCAP:-fuzzer/data/5g-sa.pcap}"
+# Which AMF decoder track to fuzz (both terminate at the AMF — the only N2 endpoint):
+#   ngap     -> NF mutates the NGAP/APER structure; 5Greplay rules 6-10.
+#   ngap_nas -> NF mutates the inner NAS-5G PDU (5GMM/5GSM); pair with NGAP_RULES=4.
+PROTOCOL="${PROTOCOL:-ngap}"
 NGAP_RULES="${NGAP_RULES:-6,7,8,9,10}"
 # 1 = each replay pass uses a random non-empty subset of NGAP_RULES (singles +
 #     combinations across the run); 0 = every pass uses all rules at once.
@@ -227,11 +231,11 @@ launch_tool() {
       networkfuzzer)
         # Independent trials: remove any saved RL model so each trial trains a fresh
         # policy (otherwise train_protocol resumes the prior model -> trials correlate).
-        rm -f "${REPO_ROOT}/fuzzer/data/models/rl_ngap_hybrid"* 2>/dev/null
+        rm -f "${REPO_ROOT}/fuzzer/data/models/rl_${PROTOCOL}_hybrid"* 2>/dev/null
         # huge timestep cap so the wall-clock watchdog is what actually stops it,
         # matching 5Greplay's budget. Actual executed steps are read from the log.
         "$NF_BIN" fuzz --mode rl \
-            --protocol ngap \
+            --protocol "$PROTOCOL" \
             --target-host "$AMF_HOST" \
             --target-port "$AMF_PORT" \
             --fuzz-mode hybrid \
