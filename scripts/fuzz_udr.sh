@@ -55,8 +55,7 @@ case "${CORE}" in
         PLMN_MCC="${PLMN_MCC:-999}"
         PLMN_MNC="${PLMN_MNC:-70}"
         RESTART_CMD="${RESTART_CMD:-sudo scripts/open5gs.sh restart main}"
-        # Mix of provisioned-data fuzzing (depth) and the #4411/#4412 PoC probes.
-        SCENARIOS="${SCENARIOS:-udr_fuzz_sub_provisioned_supi,udr_fuzz_policy_supi_variant,udr_fuzz_sub_supi_variant,udr_prefix_sub_provisioned,poc_4412_udr_prefix_supi,poc_4411_udr_malformed_pei,poc_4411_udr_bad_pei_type}"
+        SCENARIOS="${SCENARIOS:-udr_fuzz_sub_provisioned_supi,udr_fuzz_policy_supi_variant,udr_fuzz_sub_supi_variant,udr_prefix_sub_provisioned,udr_fuzz_ctx_pei}"
         ;;
     free5gc)
         FREE5GC_VERSION="${FREE5GC_VERSION:-main}"

@@ -434,8 +434,10 @@ cmd_start() {
         fi
         # UBSan: abort on undefined behaviour so pgrep-based detect_crash() fires.
         # halt_on_error=1 turns UB into SIGABRT; print_stacktrace writes to log.
+        # suppressions: skip the benign MHD alignment false positive that otherwise
+        # kills the metrics-enabled NFs (amf/smf/upf/pcf) at startup. See ubsan.supp.
         unset ASAN_OPTIONS 2>/dev/null || true
-        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=${LOG_DIR}/ubsan"
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:suppressions=${SCRIPT_DIR}/ubsan.supp:log_path=${LOG_DIR}/ubsan"
         # Enable core dumps for post-hoc analysis of any crash
         ulimit -c unlimited 2>/dev/null || true
         echo "  UBSan     : halt_on_error=1 (log: ${LOG_DIR}/ubsan.*)"
@@ -815,7 +817,7 @@ cmd_start_nf() {
             export LD_PRELOAD="${GCOV_SO}${LD_PRELOAD:+:${LD_PRELOAD}}"
         fi
         unset ASAN_OPTIONS 2>/dev/null || true
-        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:log_path=${LOG_DIR}/ubsan"
+        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:suppressions=${SCRIPT_DIR}/ubsan.supp:log_path=${LOG_DIR}/ubsan"
         ulimit -c unlimited 2>/dev/null || true
     else
         export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=0:abort_on_error=0:detect_leaks=0:detect_odr_violation=0:log_path=${LOG_DIR}/asan}"
