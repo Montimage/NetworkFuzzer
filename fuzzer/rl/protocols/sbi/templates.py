@@ -1538,6 +1538,23 @@ def build_body(template_name: str, fields: Dict[str, Any]) -> bytes:
             'pei': 'unknown-1234567890123456',
         }
 
+    elif template_name == 'udr_ctx_data_fuzz':
+        # #4411 generic: same context-data/amf-3gpp-access PUT as udr_malformed_pei,
+        # but the pei value is read from the 'pei' semantic field (default = a
+        # *valid* imeisv). The RL agent sweeps PEI_VALUES and rediscovers the crash
+        # organically instead of replaying the hardcoded "foo" payload.
+        mcc = fields.get('plmn_mcc', '999')
+        mnc = fields.get('plmn_mnc', '70')
+        body_dict = {
+            'amfInstanceId': '00000000-0000-0000-0000-000000000001',
+            'deregCallbackUri': 'http://127.0.0.5:7777/namf-comm/v1/ue-contexts/imsi-001010000000001/deregistration-data',
+            'guami': {'plmnId': {'mcc': str(mcc), 'mnc': str(mnc)},
+                      'amfId': '000001'},
+            'ratType': 'NR',
+            'imsVoPs': 'HOMOGENEOUS_SUPPORTING',
+            'pei': fields.get('pei', 'imeisv-1234567890123456'),
+        }
+
     # ── Generic array-count fuzzing (driven by array_count field) ─────────
     # These use the same shapes as the PoC templates above but read n from
     # the semantic mutation field so the RL agent can sweep [1..32] and learn

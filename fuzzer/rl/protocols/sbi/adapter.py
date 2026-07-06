@@ -354,6 +354,27 @@ GPSI_VALUES = [
     'msisdn-99999999999999999',
 ]
 
+# PEI (Permanent Equipment Identifier) values — TS 29.571.
+# Valid forms: "imeisv-<16 digits>" or "imei-<15 digits>". The UDR AMF-3GPP
+# registration handler parses PEI with ogs_id_get_type()/ogs_id_get_value():
+#   * no "-" separator          → ogs_id_get_value() returns NULL → assert   (#4411)
+#   * valid format, unknown type → strcmp(type,"imeisv") fails → assert_if_reached (#4411 variant)
+# The baseline is a *valid* imeisv so the RL agent starts clean and mutates
+# toward the crash boundary rather than replaying a hardcoded malformed payload.
+PEI_VALUES = [
+    'imeisv-1234567890123456',   # valid IMEISV (16 digits) — clean baseline
+    'imei-123456789012345',      # valid IMEI (15 digits)
+    'foo',                       # no type separator → NULL value (#4411)
+    '',                          # empty
+    'imeisv-',                   # separator present but value empty
+    'unknown-1234567890123456',  # valid format, unknown type (#4411 variant)
+    'imeisv',                    # bare prefix, no separator
+    'imeisv-\x00',               # null-byte value
+    'imeisv-' + '9' * 128,       # oversized value
+    '-1234567890123456',         # empty type
+    '1234567890123456',          # numeric only, no type prefix
+]
+
 
 # ---------------------------------------------------------------------------
 # URI path builders
@@ -1269,6 +1290,20 @@ class SbiAdapter(ProtocolAdapter):
                             'Short values (2-char) trigger free5GC #757 NRF '
                             'buildFilter slice-bounds panic.',
             ),
+            FieldDefinition(
+                name='pei',
+                offset=None,
+                size=None,
+                encoding='string',
+                valid_values=['imeisv-1234567890123456', 'imei-123456789012345'],
+                boundary_values=['foo', '', 'imeisv-', 'unknown-1234567890123456'],
+                description='Permanent Equipment Identifier in the UDR '
+                            'AMF-3GPP-access registration body (TS 29.571). A value '
+                            'with no type separator ("foo") makes ogs_id_get_value() '
+                            'return NULL → assert (open5GS #4411); a valid-format '
+                            'unknown type hits assert_if_reached. RL sweeps from a '
+                            'valid imeisv baseline to rediscover the crash.',
+            ),
         ]
 
     def get_field_message_type(self, field_name: str) -> Optional[str]:
@@ -1292,6 +1327,7 @@ class SbiAdapter(ProtocolAdapter):
             'array_count':       'nrf_scp_array_fuzz',
             'supi_path_variant': 'udr_policy_supi_fuzz',
             'gpsi':              'nrf_disc_gpsi',
+            'pei':               'udr_ctx_data_fuzz',
         }.get(field_name)
 
     def get_mutation_values(self, field_name: str) -> List[Any]:
@@ -1318,6 +1354,7 @@ class SbiAdapter(ProtocolAdapter):
             'array_count':       ARRAY_COUNT_VALUES,
             'supi_path_variant': SUPI_PATH_VARIANT_VALUES,
             'gpsi':              GPSI_VALUES,
+            'pei':               PEI_VALUES,
         }.get(field_name, [])
 
     # ── Message types ─────────────────────────────────────────────────────
@@ -1361,6 +1398,7 @@ class SbiAdapter(ProtocolAdapter):
             'udm_smf_reg_psi_fuzz',      # GET /smf-registrations/{pdu_session_id}
             'udr_policy_supi_fuzz',      # GET /policy-data/ues/{supi_variant}/am-data
             'udr_sub_supi_fuzz',         # GET /subscription-data/{supi_variant}/authentication-data
+            'udr_ctx_data_fuzz',         # PUT context-data/amf-3gpp-access, pei swept from PEI_VALUES (#4411)
             # ── New crash-confirmed endpoints (from issue analysis) ──────────
             # AMF context transfer — #4397/#4399/#4402 null-deref on empty body
             'amf_ue_ctx_transfer',       # POST /namf-comm/v1/ue-contexts/{id}/transfer
@@ -1700,7 +1738,7 @@ class SbiAdapter(ProtocolAdapter):
         'SMF':  ['smf_ctx_create', 'smf_policy_notify'],
         'UDM':  ['amf_ue_ctx_create', 'udm_auth_data', 'udm_uecm_amf_reg',
                  'udm_uecm_amf_reg_incomplete'],
-        'UDR':  ['udr_malformed_pei'],
+        'UDR':  ['udr_ctx_data_fuzz'],
         'PCF':  ['pcf_sm_policy_create', 'pcf_am_policy_create',
                  'pcf_app_session_create', 'pcf_sm_policy_update_notify'],
         'NSSF': ['nssf_nssai_availability'],
@@ -2042,12 +2080,33 @@ class SbiAdapter(ProtocolAdapter):
                             '(bare "imsi" SUPI) → assertion at subscription.c:333',
                 relevant_fields=[],
             ),
+            # Generic PEI sweep — the discovery-facing path for #4411. Starts from
+            # a valid imeisv baseline and lets the RL agent sweep PEI_VALUES; the
+            # malformed values ("foo", unknown type, empty) are learned, not
+            # hardcoded. The poc_4411_* scenarios below are the exact-payload
+            # replays reserved for the reproduction/replay scripts.
+            FuzzScenario(
+                name='udr_fuzz_ctx_pei',
+                target_api='UDR_DR',
+                setup_messages=[],
+                fuzz_message='udr_ctx_data_fuzz',
+                description='PUT /nudr-dr/v1/subscription-data/{supi}/context-data/'
+                            'amf-3gpp-access with a valid SUPI and the "pei" field '
+                            'swept from PEI_VALUES. Baseline pei is a valid imeisv; '
+                            'the RL agent learns the malformed values that make '
+                            'ogs_id_get_value() return NULL → assert. Rediscovers '
+                            'open5GS #4411 without a hardcoded PoC payload.',
+                relevant_fields=['pei'],
+            ),
+            # ── #4411 exact-payload replays (reproduction scripts only) ────────
+            # Kept for deterministic replay/verification; NOT part of the standard
+            # discovery campaign (see run_campaign._UDR_SCENARIOS).
             FuzzScenario(
                 name='poc_4411_udr_malformed_pei',
                 target_api='UDR_DR',
                 setup_messages=[],
                 fuzz_message='udr_malformed_pei',
-                description='#4411: PUT subscription context-data with pei="foo" '
+                description='#4411 replay: PUT subscription context-data with pei="foo" '
                             '(no type separator) → ogs_id_get_value() returns NULL → assert. '
                             'SUPI must be a valid imsi- prefix or the SUPI-type guard returns '
                             '403 before reaching the pei parsing code.',
@@ -2058,7 +2117,7 @@ class SbiAdapter(ProtocolAdapter):
                 target_api='UDR_DR',
                 setup_messages=[],
                 fuzz_message='udr_malformed_pei_bad_type',
-                description='#4411 variant: PUT context-data/amf-3gpp-access with '
+                description='#4411 variant replay: PUT context-data/amf-3gpp-access with '
                             'pei="unknown-1234567890123456" — valid format but unknown '
                             'type. ogs_id_get_type()="unknown", strcmp("unknown","imeisv") '
                             'fails → ogs_fatal + ogs_assert_if_reached() at nudr-handler.c:315. '
@@ -2554,6 +2613,7 @@ class SbiAdapter(ProtocolAdapter):
         'udr_policy_supi_fuzz':     ('GET',    'udr_policy_supi',  'udr_policy_supi_fuzz'),
         'udr_sub_supi_fuzz':        ('GET',    'udr_sub_supi',       'udr_sub_supi_fuzz'),
         'udr_sub_provisioned_fuzz': ('GET',    'udr_sub_provisioned','udr_sub_provisioned_fuzz'),
+        'udr_ctx_data_fuzz':        ('PUT',    'udr_ctx_data',       'udr_ctx_data_fuzz'),
         # ── UDR state-transition message types ────────────────────────────
         # Used by UDR-specific StateTransitions; correct HTTP methods per 3GPP TS 29.505
         'udr_subscription_data_get': ('GET',  'udr_sub_supi',  'udr_sub_supi_fuzz'),

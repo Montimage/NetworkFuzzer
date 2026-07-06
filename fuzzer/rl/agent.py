@@ -54,7 +54,7 @@ def create_agent(env, algorithm="DQN", policy_kwargs=None, **kwargs):
         from stable_baselines3 import PPO
         agent_defaults = {
             "learning_rate": 3e-4,
-            "n_steps": 512,       # 128→512: ~17 episodes/rollout; richer advantage estimates → fixes EV≈0
+            "n_steps": 256,
             "batch_size": 128,    # scale batch with n_steps
             "n_epochs": 10,
             "ent_coef": 0.05,     # 0.01→0.05: prevent policy collapse to single action (seq_payload exploit)
@@ -104,6 +104,7 @@ class ProgressCallback:
         if self.num_timesteps - self.last_log >= self.log_interval:
             progress = self.num_timesteps / self.total_timesteps * 100
             logger.info(f"Progress: {self.num_timesteps}/{self.total_timesteps} ({progress:.1f}%) | "
+                       f"total_timesteps {self.num_timesteps} | "
                        f"Hangs: {self.hangs} | Crashes: {self.crashes}")
             self.last_log = self.num_timesteps
 
@@ -136,9 +137,9 @@ def train_agent(model, total_timesteps=10000, model_path="fuzzer/data/models/rl_
 
     logger.info(f"Training for {total_timesteps} timesteps...")
 
-    # Create progress callback
+    progress_interval = int(os.environ.get('RL_PROGRESS_INTERVAL', '25'))
     callback = ProgressCallback(
-        log_interval=max(500, total_timesteps // 20),  # Log ~20 times during training
+        log_interval=progress_interval,
         total_timesteps=total_timesteps
     )
 
